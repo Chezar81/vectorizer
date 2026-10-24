@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=Vectorizer
+GenericName=Raster to Vector
+Comment=Offline raster-to-vector conversion for Linux
+Exec=vectorizer %F
+TryExec=vectorizer
+Icon=vectorizer
+Terminal=false
+Categories=Graphics;2DGraphics;RasterGraphics;
+MimeType=image/png;image/jpeg;image/bmp;image/gif;image/tiff;image/webp;
+Keywords=vector;svg;trace;logo;vectorize;
+StartupNotify=true
+StartupWMClass=vectorizer
