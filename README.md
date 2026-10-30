@@ -18,6 +18,7 @@ page (currently [v0.4.0](https://github.com/Chezar81/vectorizer/releases/tag/v0.
 | Platform | File | How to install |
 | --- | --- | --- |
 | **macOS** (Apple Silicon) | `Vectorizer-*-macos-arm64.dmg` | Open the DMG and drag **Vectorizer** into Applications. First launch of an unsigned build: right-click → **Open**. |
+| **Windows** (x64) | `Vectorizer-*-windows-x64.zip` | Unzip and run **`Vectorizer.exe`**. Windows may warn about an unrecognized app (unsigned build). |
 | **Linux** (amd64) | `vectorizer_*_amd64.deb` | `sudo apt install ./vectorizer_*_amd64.deb` — remove later with `sudo apt remove vectorizer`. |
 
 The same release also offers a source archive and a pip wheel if you prefer to
@@ -111,6 +112,8 @@ See `docs/PACKAGING.md` for building packages yourself.
   `./scripts/install-user.sh`. AppImage is **not** claimed ready.
 - **macOS:** `./scripts/build-macos-dmg.sh` on a Mac, or the **Build macOS DMG**
   GitHub Action.
+- **Windows:** `.\scripts\build-windows-exe.ps1` on Windows, or the
+  **Build Windows EXE** GitHub Action.
 
 ## License
 
