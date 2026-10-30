@@ -2,12 +2,13 @@
 
 Limitations (documented, not hidden):
 - Units are document pixels treated as DXF drawing units (1 unit = 1 px).
-- Cubic/quadratic curves and elliptical arcs are linearized (default 8 segments).
-- Fills are not represented; only path outlines / polylines are written.
-- Compound holes and transforms other than simple translate are approximated.
+- Lines mode linearizes curves to LWPOLYLINE (default 8 segments per span).
+- Spline mode writes cubic Bezier spans as SPLINE entities (degree 3) and
+  straight spans as LINE. Fills and holes are still not represented.
+- Transforms other than simple translate are approximated.
 - Precision is controlled by `decimals` (default 3).
 
-This is a native ASCII DXF R12 writer — Inkscape is not required for DXF.
+This is a native ASCII DXF writer — Inkscape is not required for DXF.
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ import tempfile
 from pathlib import Path
 
 from vectorizer.domain.document import VectorDocument, VectorPath
+from vectorizer.domain.settings import DxfCurveMode
 from vectorizer.errors import ExportError
 
 _COMMANDS = set("MmLlHhVvCcSsQqTtAaZz")
@@ -31,6 +33,7 @@ def export_dxf(
     curve_segments: int = 8,
     decimals: int = 3,
     flip_y: bool = True,
+    curve_mode: DxfCurveMode | str = DxfCurveMode.LINES,
 ) -> Path:
     path = Path(destination)
     if path.exists() and path.is_dir():
@@ -40,26 +43,41 @@ def export_dxf(
     curve_segments = max(2, min(64, int(curve_segments)))
     decimals = max(0, min(8, int(decimals)))
     height = float(document.height) or 0.0
+    mode = DxfCurveMode(curve_mode)
 
     entities: list[str] = []
     handle = 100
     for group in document.groups:
         for vp in group.paths:
-            points = _path_to_points(vp, curve_segments=curve_segments)
-            if len(points) < 2:
-                continue
-            if flip_y:
-                points = [(x, height - y) for x, y in points]
             tx, ty = _parse_translate(vp.transform)
-            if tx or ty:
-                points = [(x + tx, y + (-ty if flip_y else ty)) for x, y in points]
-            entities.append(_lwpolyline(points, handle=handle, decimals=decimals, closed=_is_closed(vp.d)))
-            handle += 1
+            if mode == DxfCurveMode.SPLINES:
+                chunk, handle = _spline_entities(
+                    vp,
+                    handle=handle,
+                    decimals=decimals,
+                    flip_y=flip_y,
+                    height=height,
+                    translate=(tx, ty),
+                    curve_segments=curve_segments,
+                )
+                entities.extend(chunk)
+            else:
+                points = _path_to_points(vp, curve_segments=curve_segments)
+                if len(points) < 2:
+                    continue
+                if flip_y:
+                    points = [(x, height - y) for x, y in points]
+                if tx or ty:
+                    points = [(x + tx, y + (-ty if flip_y else ty)) for x, y in points]
+                entities.append(
+                    _lwpolyline(points, handle=handle, decimals=decimals, closed=_is_closed(vp.d))
+                )
+                handle += 1
 
     if not entities:
         raise ExportError("No convertible path geometry was found for DXF.")
 
-    payload = _wrap_dxf(entities)
+    payload = _wrap_dxf(entities, version="AC1015" if mode == DxfCurveMode.SPLINES else "AC1009")
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix=".vectorizer-", suffix=".dxf", dir=str(path.parent))
     try:
@@ -91,6 +109,244 @@ def _parse_translate(transform: str | None) -> tuple[float, float]:
 
 def _is_closed(d: str) -> bool:
     return bool(re.search(r"[Zz]\s*$", d.strip()))
+
+
+def _spline_entities(
+    path: VectorPath,
+    *,
+    handle: int,
+    decimals: int,
+    flip_y: bool,
+    height: float,
+    translate: tuple[float, float],
+    curve_segments: int,
+) -> tuple[list[str], int]:
+    """Cubic spans become SPLINE entities. Lines become LINE. Fills are omitted."""
+    entities: list[str] = []
+    tx, ty = translate
+
+    def place(point: tuple[float, float]) -> tuple[float, float]:
+        x, y = point
+        if flip_y:
+            y = height - y
+        x += tx
+        y += -ty if flip_y else ty
+        return x, y
+
+    for kind, pts in _path_primitives(path.d, curve_segments=curve_segments):
+        mapped = [place(point) for point in pts]
+        if kind == "line" and len(mapped) >= 2:
+            entities.append(_line_entity(mapped[0], mapped[1], handle=handle, decimals=decimals))
+            handle += 1
+        elif kind == "cubic" and len(mapped) == 4:
+            entities.append(_spline_entity(mapped, handle=handle, decimals=decimals))
+            handle += 1
+    return entities, handle
+
+
+def _path_primitives(
+    d: str,
+    *,
+    curve_segments: int,
+) -> list[tuple[str, list[tuple[float, float]]]]:
+    tokens = re.findall(r"[MmLlHhVvCcSsQqTtAaZz]|[-+]?(?:\d*\.\d+|\d+)(?:[eE][-+]?\d+)?", d)
+    if not tokens:
+        return []
+    out: list[tuple[str, list[tuple[float, float]]]] = []
+    cx = cy = 0.0
+    start = (0.0, 0.0)
+    last_ctrl: tuple[float, float] | None = None
+    last_cmd = ""
+    i = 0
+
+    def take_float() -> float:
+        nonlocal i
+        value = float(tokens[i])
+        i += 1
+        return value
+
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok in _COMMANDS:
+            cmd = tok
+            i += 1
+        else:
+            cmd = last_cmd
+            if not cmd:
+                break
+        absolute = cmd.isupper()
+        op = cmd.upper()
+        if op == "M":
+            x, y = take_float(), take_float()
+            if not absolute:
+                x += cx
+                y += cy
+            cx, cy = x, y
+            start = (cx, cy)
+            last_cmd = "L" if absolute else "l"
+            last_ctrl = None
+            continue
+        if op == "Z":
+            if abs(cx - start[0]) > 1e-6 or abs(cy - start[1]) > 1e-6:
+                out.append(("line", [(cx, cy), start]))
+            cx, cy = start
+            last_ctrl = None
+            last_cmd = cmd
+            continue
+        if op in {"L", "H", "V"}:
+            if op == "L":
+                x, y = take_float(), take_float()
+                if not absolute:
+                    x += cx
+                    y += cy
+            elif op == "H":
+                x = take_float()
+                if not absolute:
+                    x += cx
+                y = cy
+            else:
+                y = take_float()
+                if not absolute:
+                    y += cy
+                x = cx
+            out.append(("line", [(cx, cy), (x, y)]))
+            cx, cy = x, y
+            last_ctrl = None
+        elif op == "C":
+            x1, y1 = take_float(), take_float()
+            x2, y2 = take_float(), take_float()
+            x, y = take_float(), take_float()
+            if not absolute:
+                x1, y1, x2, y2, x, y = x1 + cx, y1 + cy, x2 + cx, y2 + cy, x + cx, y + cy
+            out.append(("cubic", [(cx, cy), (x1, y1), (x2, y2), (x, y)]))
+            last_ctrl = (x2, y2)
+            cx, cy = x, y
+        elif op == "S":
+            x2, y2 = take_float(), take_float()
+            x, y = take_float(), take_float()
+            if not absolute:
+                x2, y2, x, y = x2 + cx, y2 + cy, x + cx, y + cy
+            if last_ctrl and last_cmd.upper() in {"C", "S"}:
+                x1 = 2 * cx - last_ctrl[0]
+                y1 = 2 * cy - last_ctrl[1]
+            else:
+                x1, y1 = cx, cy
+            out.append(("cubic", [(cx, cy), (x1, y1), (x2, y2), (x, y)]))
+            last_ctrl = (x2, y2)
+            cx, cy = x, y
+        elif op in {"Q", "T"}:
+            if op == "Q":
+                qx, qy = take_float(), take_float()
+                x, y = take_float(), take_float()
+                if not absolute:
+                    qx, qy, x, y = qx + cx, qy + cy, x + cx, y + cy
+            else:
+                x, y = take_float(), take_float()
+                if not absolute:
+                    x, y = x + cx, y + cy
+                if last_ctrl and last_cmd.upper() in {"Q", "T"}:
+                    qx = 2 * cx - last_ctrl[0]
+                    qy = 2 * cy - last_ctrl[1]
+                else:
+                    qx, qy = cx, cy
+            c1 = (cx + 2.0 / 3.0 * (qx - cx), cy + 2.0 / 3.0 * (qy - cy))
+            c2 = (x + 2.0 / 3.0 * (qx - x), y + 2.0 / 3.0 * (qy - y))
+            out.append(("cubic", [(cx, cy), c1, c2, (x, y)]))
+            last_ctrl = (qx, qy)
+            cx, cy = x, y
+        elif op == "A":
+            rx, ry = take_float(), take_float()
+            x_axis = take_float()
+            large = bool(take_float())
+            sweep = bool(take_float())
+            x, y = take_float(), take_float()
+            if not absolute:
+                x, y = x + cx, y + cy
+            samples = _sample_arc((cx, cy), rx, ry, x_axis, large, sweep, (x, y), curve_segments)
+            prev = (cx, cy)
+            for point in samples:
+                out.append(("line", [prev, point]))
+                prev = point
+            cx, cy = x, y
+            last_ctrl = None
+        else:
+            break
+        last_cmd = cmd
+    return out
+
+
+def _line_entity(
+    start: tuple[float, float],
+    end: tuple[float, float],
+    *,
+    handle: int,
+    decimals: int,
+) -> str:
+    return "\n".join(
+        [
+            "0",
+            "LINE",
+            "5",
+            f"{handle:X}",
+            "8",
+            "0",
+            "10",
+            _fmt(start[0], decimals),
+            "20",
+            _fmt(start[1], decimals),
+            "30",
+            "0.0",
+            "11",
+            _fmt(end[0], decimals),
+            "21",
+            _fmt(end[1], decimals),
+            "31",
+            "0.0",
+        ]
+    )
+
+
+def _spline_entity(
+    controls: list[tuple[float, float]],
+    *,
+    handle: int,
+    decimals: int,
+) -> str:
+    """One clamped cubic Bezier as an AutoCAD SPLINE (degree 3, 4 controls)."""
+    knots = (0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0)
+    lines = [
+        "0",
+        "SPLINE",
+        "5",
+        f"{handle:X}",
+        "8",
+        "0",
+        "100",
+        "AcDbEntity",
+        "100",
+        "AcDbSpline",
+        "70",
+        "8",
+        "71",
+        "3",
+        "72",
+        str(len(knots)),
+        "73",
+        str(len(controls)),
+        "74",
+        "0",
+        "42",
+        "0.0000001",
+        "43",
+        "0.0000001",
+        "44",
+        "0.0000001",
+    ]
+    for knot in knots:
+        lines.extend(["40", _fmt(knot, 1)])
+    for x, y in controls:
+        lines.extend(["10", _fmt(x, decimals), "20", _fmt(y, decimals), "30", "0.0"])
+    return "\n".join(lines)
 
 
 def _sample_curve(
@@ -350,6 +606,11 @@ def _path_d_to_points(d: str, *, curve_segments: int) -> list[tuple[float, float
     return points
 
 
+def sample_path_points(d: str, *, curve_segments: int = 8) -> list[tuple[float, float]]:
+    """Flatten an SVG path to points. Shared by hit-testing and DXF export."""
+    return _path_d_to_points(d, curve_segments=curve_segments)
+
+
 def _path_to_points(path: VectorPath, *, curve_segments: int) -> list[tuple[float, float]]:
     return _path_d_to_points(path.d, curve_segments=curve_segments)
 
@@ -382,15 +643,15 @@ def _lwpolyline(
     return "\n".join(lines)
 
 
-def _wrap_dxf(entities: list[str]) -> str:
-    header = """0
+def _wrap_dxf(entities: list[str], *, version: str = "AC1009") -> str:
+    header = f"""0
 SECTION
 2
 HEADER
 9
 $ACADVER
 1
-AC1009
+{version}
 9
 $INSUNITS
 70

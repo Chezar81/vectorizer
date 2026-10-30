@@ -231,7 +231,7 @@ def _process_one(source: Path, job: BatchJob) -> BatchResult:
                 continue
             skipped_all = False
             if fmt == ExportFormat.SVG:
-                export_svg(traced.document, dest)
+                export_svg(traced.document, dest, paint_style=job.settings.svg_paint_style)
             elif fmt == ExportFormat.PDF:
                 export_pdf(traced.document, dest)
             elif fmt == ExportFormat.PNG:
@@ -239,7 +239,7 @@ def _process_one(source: Path, job: BatchJob) -> BatchResult:
             elif fmt == ExportFormat.EPS:
                 export_eps(traced.document, dest)
             elif fmt == ExportFormat.DXF:
-                export_dxf(traced.document, dest)
+                export_dxf(traced.document, dest, curve_mode=job.settings.dxf_curve_mode)
             else:
                 raise ExportError(f"Unsupported format: {fmt}")
             outputs.append(str(dest))

@@ -86,8 +86,14 @@ class ImageCanvas(QGraphicsView):
         self._syncing = False
         self._sample_mode = False
         self._file_drop_enabled = False
+        self._placeholder = ""
         self.horizontalScrollBar().valueChanged.connect(self._emit_view_changed)
         self.verticalScrollBar().valueChanged.connect(self._emit_view_changed)
+
+    def set_placeholder(self, text: str) -> None:
+        """Hint drawn while the canvas has no image. Hidden once content is shown."""
+        self._placeholder = text
+        self.viewport().update()
 
     def set_file_drop_enabled(self, enabled: bool) -> None:
         self._file_drop_enabled = bool(enabled)
@@ -172,18 +178,24 @@ class ImageCanvas(QGraphicsView):
 
     def paintEvent(self, event: QPaintEvent) -> None:  # noqa: N802
         super().paintEvent(event)
-        if not self._file_drop_enabled or not self._content_rect.isNull():
+        if not self._content_rect.isNull():
+            return
+        if self._file_drop_enabled:
+            text = t("Drop an image here\nto open it")
+        elif self._placeholder:
+            text = self._placeholder
+        else:
             return
         painter = QPainter(self.viewport())
         painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
-        painter.setPen(QColor(90, 90, 90))
+        painter.setPen(QColor(111, 111, 111))
         font = painter.font()
         font.setPointSize(12)
         painter.setFont(font)
         painter.drawText(
-            self.viewport().rect(),
-            int(Qt.AlignmentFlag.AlignCenter),
-            t("Drop an image here\nto open it"),
+            self.viewport().rect().adjusted(24, 24, -24, -24),
+            int(Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap),
+            text,
         )
         painter.end()
 

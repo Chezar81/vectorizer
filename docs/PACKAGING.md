@@ -45,6 +45,68 @@ Install the resulting `dist/vectorizer-*.whl` into a venv with `pip install`.
 
 DXF export is native and does **not** require Inkscape.
 
+## Linux .deb
+
+Self-contained amd64 package (PyInstaller onedir under `/opt/vectorizer`):
+
+```bash
+./scripts/build-linux-deb.sh
+```
+
+Output: `dist/vectorizer_<version>_amd64.deb`
+
+```bash
+sudo apt install ./dist/vectorizer_<version>_amd64.deb
+# remove later:
+sudo apt remove vectorizer
+```
+
+Requires `dpkg-deb` (Debian / Ubuntu / Mint). Depends on `libxcb-cursor0` for Qt on
+X11. Inkscape remains optional for EPS only.
+
+## macOS DMG
+
+A self-contained `.app` + installer DMG is built with PyInstaller. **This must run
+on macOS** (PyInstaller does not cross-compile from Linux).
+
+### On a Mac
+
+```bash
+./scripts/build-macos-dmg.sh
+```
+
+Outputs:
+
+- `dist/Vectorizer.app`
+- `dist/Vectorizer-<version>-macos.dmg`
+
+Install by opening the DMG and dragging **Vectorizer** into **Applications**.
+
+Unsigned builds are blocked by Gatekeeper until the user right-clicks the app and
+chooses **Open** once. Apple notarization / Developer ID signing is optional and
+not configured here.
+
+Optional nicer DMG layout: `brew install create-dmg` (the script falls back to
+`hdiutil`).
+
+### From Linux / CI
+
+Push a `v*` tag or run the **Build macOS DMG** GitHub Action
+(`.github/workflows/build-macos-dmg.yml`). Download the arm64 and/or x86_64
+artifacts from the workflow artifacts.
+
+```bash
+# Local check that the script refuses cross-builds:
+./scripts/build-macos-dmg.sh
+# → exits with a clear error on non-Darwin hosts
+```
+
+Regenerate the `.icns` icon anytime with:
+
+```bash
+python scripts/make-icns.py
+```
+
 ## AppImage / Flatpak
 
 **Not claimed ready.** Do not publish an AppImage until an actual artifact is built
@@ -62,3 +124,4 @@ Checklist before claiming AppImage readiness:
 - Do not `sudo pip install`.
 - Do not rename SVG/PDF to `.ai`.
 - Do not ship without `docs/THIRD_PARTY_LICENSES.md`.
+- Do not expect a DMG to build on Linux; use a Mac or the GitHub Action.

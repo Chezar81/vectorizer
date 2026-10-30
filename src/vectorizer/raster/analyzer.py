@@ -16,11 +16,13 @@ from PIL import Image, ImageChops, ImageFilter, ImageStat
 from vectorizer.domain.settings import (
     AutomaticQuality,
     ColorMode,
+    EdgeTreatment,
     HierarchyMode,
     PathFitMode,
     TraceSettings,
     WorkflowMode,
 )
+from vectorizer.raster.palette import suggest_palettes
 
 
 class ContentKind(str, Enum):
@@ -134,6 +136,16 @@ def analyze_image(
     kind = _classify(metrics)
     photo_like = kind in {ContentKind.PHOTO, ContentKind.GRADIENT}
     base = _settings_for_kind(kind, metrics)
+    treatment = _edge_for_kind(kind, metrics)
+    palette: tuple[str, ...] = ()
+    if treatment in {EdgeTreatment.BLENDED, EdgeTreatment.PHOTO}:
+        ignore = metrics.background_rgb if metrics.background_confidence >= 0.7 else None
+        suggestions = suggest_palettes(image, ignore_rgb=ignore)
+        count = suggestions.best
+        if treatment == EdgeTreatment.PHOTO:
+            count = 12 if suggestions.best >= 8 else suggestions.best
+        palette = suggestions.palettes.get(count, ())
+    base = replace(base, edge_treatment=treatment, palette=palette)
     suggested = apply_automatic_quality(
         base, quality, photo_like=photo_like, content_kind=kind
     )
@@ -476,6 +488,19 @@ def _estimate_palette_size(
 # ---------------------------------------------------------------------------
 
 
+def _edge_for_kind(kind: ContentKind, m: ImageMetrics) -> EdgeTreatment:
+    """Blended artwork keeps anti-alias coverage. Hard edges and photos do not."""
+    if kind == ContentKind.PIXEL_ART:
+        return EdgeTreatment.HARD
+    if kind in {ContentKind.PHOTO, ContentKind.GRADIENT}:
+        return EdgeTreatment.PHOTO
+    if kind == ContentKind.BINARY_MARK and m.corner_sharpness >= 0.45:
+        return EdgeTreatment.HARD
+    if kind == ContentKind.LINE_ART and m.corner_sharpness >= 0.55:
+        return EdgeTreatment.HARD
+    return EdgeTreatment.BLENDED
+
+
 def _classify(m: ImageMetrics) -> ContentKind:
     min_side = min(m.width, m.height)
     unique = m.unique_colors
@@ -800,6 +825,17 @@ def _build_notes(
 
     if suggested.hierarchical == HierarchyMode.CUTOUT:
         notes.append("Using cutout hierarchy so holes stay clean.")
+
+    if suggested.palette:
+        notes.append(
+            f"Output colors constrained to a {len(suggested.palette)}-color palette."
+        )
+    if suggested.edge_treatment == EdgeTreatment.BLENDED:
+        notes.append("Edges follow anti-aliased blending inside each boundary pixel.")
+    elif suggested.edge_treatment == EdgeTreatment.HARD:
+        notes.append("Hard edges: shapes snap to flat colors before fitting.")
+    elif suggested.edge_treatment == EdgeTreatment.PHOTO:
+        notes.append("Photograph: posterized to the palette, then traced as regions.")
 
     if suggested.target_colors:
         notes.append(f"Pre-quantizing to {suggested.target_colors} colors for cleaner regions.")

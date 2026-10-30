@@ -37,6 +37,29 @@ class PathFitMode(str, Enum):
     PIXEL = "none"
 
 
+class EdgeTreatment(str, Enum):
+    """How boundary pixels are interpreted before curves are placed."""
+
+    AUTO = "auto"
+    BLENDED = "blended"
+    HARD = "hard"
+    PHOTO = "photo"
+
+
+class SvgPaintStyle(str, Enum):
+    """Export paint. Stroke+fill hides hairline gaps between adjacent fills."""
+
+    FILL = "fill"
+    STROKE_FILL = "stroke_fill"
+
+
+class DxfCurveMode(str, Enum):
+    """DXF geometry. Fills are omitted in both modes."""
+
+    LINES = "lines"
+    SPLINES = "splines"
+
+
 @dataclass(frozen=True)
 class TraceSettings:
     """Parameters that affect VTracer 0.6.x plus app-side preprocessing.
@@ -73,6 +96,13 @@ class TraceSettings:
     # When False, the worker traces the provided raster as-is (used for
     # segmentation retrace so edits are not re-quantized away).
     apply_preprocess: bool = True
+    # Blended artwork keeps anti-aliasing and places curves inside those pixels.
+    # Hard artwork and pixel art snap to flat colors. Photographs posterize.
+    edge_treatment: EdgeTreatment = EdgeTreatment.AUTO
+    # Exact output colors. Empty means the tracer may choose.
+    palette: tuple[str, ...] = ()
+    svg_paint_style: SvgPaintStyle = SvgPaintStyle.FILL
+    dxf_curve_mode: DxfCurveMode = DxfCurveMode.LINES
 
     def background_rgb_tuple(self) -> tuple[int, int, int]:
         return (int(self.background_r), int(self.background_g), int(self.background_b))
@@ -106,6 +136,7 @@ class TraceSettings:
             errors.append("background_tolerance must be between 0 and 255")
         if not (0 <= int(self.target_colors) <= 256):
             errors.append("target_colors must be between 0 and 256 (0 = off)")
+        palette = _normalize_palette(self.palette, errors)
         if errors:
             raise ValueError("; ".join(errors))
         return replace(
@@ -132,6 +163,10 @@ class TraceSettings:
             target_colors=int(self.target_colors),
             smooth_noise=bool(self.smooth_noise),
             apply_preprocess=bool(self.apply_preprocess),
+            edge_treatment=EdgeTreatment(self.edge_treatment),
+            palette=palette,
+            svg_paint_style=SvgPaintStyle(self.svg_paint_style),
+            dxf_curve_mode=DxfCurveMode(self.dxf_curve_mode),
         )
 
     def to_backend_kwargs(self) -> dict[str, Any]:
@@ -157,6 +192,10 @@ class TraceSettings:
         data["colormode"] = self.colormode.value
         data["hierarchical"] = self.hierarchical.value
         data["mode"] = self.mode.value
+        data["edge_treatment"] = self.edge_treatment.value
+        data["svg_paint_style"] = self.svg_paint_style.value
+        data["dxf_curve_mode"] = self.dxf_curve_mode.value
+        data["palette"] = list(self.palette)
         return data
 
     @classmethod
@@ -177,4 +216,39 @@ class TraceSettings:
             kwargs["hierarchical"] = HierarchyMode(kwargs["hierarchical"])
         if "mode" in kwargs:
             kwargs["mode"] = PathFitMode(kwargs["mode"])
+        if "edge_treatment" in kwargs:
+            kwargs["edge_treatment"] = EdgeTreatment(kwargs["edge_treatment"])
+        if "svg_paint_style" in kwargs:
+            kwargs["svg_paint_style"] = SvgPaintStyle(kwargs["svg_paint_style"])
+        if "dxf_curve_mode" in kwargs:
+            kwargs["dxf_curve_mode"] = DxfCurveMode(kwargs["dxf_curve_mode"])
+        if "palette" in kwargs:
+            raw = kwargs["palette"] or ()
+            kwargs["palette"] = tuple(str(item) for item in raw)
         return cls(**kwargs).validated()
+
+
+def _normalize_palette(palette: tuple[str, ...] | list[str], errors: list[str]) -> tuple[str, ...]:
+    if palette is None:
+        return ()
+    if len(palette) > 32:
+        errors.append("palette supports at most 32 colors")
+        return ()
+    normalized: list[str] = []
+    for item in palette:
+        try:
+            normalized.append(normalize_hex(str(item)))
+        except ValueError:
+            errors.append(f"palette color must be #rrggbb, got {item!r}")
+    return tuple(normalized)
+
+
+def normalize_hex(value: str) -> str:
+    text = value.strip().lower()
+    if text.startswith("#"):
+        text = text[1:]
+    if len(text) == 3:
+        text = "".join(ch * 2 for ch in text)
+    if len(text) != 6 or any(ch not in "0123456789abcdef" for ch in text):
+        raise ValueError(f"invalid color {value!r}")
+    return f"#{text}"

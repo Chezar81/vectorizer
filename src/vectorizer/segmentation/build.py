@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from PIL import Image
 
-from vectorizer.domain.settings import TraceSettings
+from vectorizer.domain.settings import EdgeTreatment, TraceSettings
+from vectorizer.raster.palette import snap_image_to_palette
 from vectorizer.raster.preprocess import preprocess_image
 from vectorizer.segmentation.map import SegmentationMap
 
@@ -24,6 +25,17 @@ def build_segmentation(
     The original `source` image is never mutated.
     """
     settings = (settings or TraceSettings()).validated()
+    if settings.edge_treatment == EdgeTreatment.BLENDED:
+        from vectorizer.vectorize.blend_trace import label_regions, labels_to_image
+        from vectorizer.vectorize.dispatch import resolve_palette
+
+        palette = resolve_palette(source, settings, EdgeTreatment.BLENDED)
+        if palette:
+            labels = label_regions(source.convert("RGBA"), palette, settings)
+            return SegmentationMap(labels_to_image(labels, palette))
+    if settings.edge_treatment == EdgeTreatment.PHOTO and settings.palette:
+        working = preprocess_image(source, settings)
+        return SegmentationMap(_harden_alpha(snap_image_to_palette(working, settings.palette)))
     working = preprocess_image(source, settings)
     target = colors
     if target is None:

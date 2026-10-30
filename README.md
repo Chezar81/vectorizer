@@ -1,12 +1,27 @@
 # Vectorizer
 
-Independent, offline raster-to-vector desktop application for Linux Mint.
-It imports a bitmap, traces it into editable SVG paths, lets you inspect and
-correct segmentation, and exports SVG / PDF / PNG / DXF (plus optional EPS).
+Independent, offline raster-to-vector desktop application (primary target:
+Linux Mint; macOS via DMG). It imports a bitmap, traces it into editable SVG
+paths, lets you inspect and correct segmentation, and exports SVG / PDF / PNG /
+DXF (plus optional EPS).
 
 **Author:** Christoph Rupprich.
 
 Current milestone: **4** — batch processing, optional EPS, native DXF, user packaging.
+
+## Download
+
+Pre-built installers are on the
+[**GitHub Releases**](https://github.com/Chezar81/vectorizer/releases/latest)
+page (currently [v0.4.0](https://github.com/Chezar81/vectorizer/releases/tag/v0.4.0)):
+
+| Platform | File | How to install |
+| --- | --- | --- |
+| **macOS** (Apple Silicon) | `Vectorizer-*-macos-arm64.dmg` | Open the DMG and drag **Vectorizer** into Applications. First launch of an unsigned build: right-click → **Open**. |
+| **Linux** (amd64) | `vectorizer_*_amd64.deb` | `sudo apt install ./vectorizer_*_amd64.deb` — remove later with `sudo apt remove vectorizer`. |
+
+The same release also offers a source archive and a pip wheel if you prefer to
+run from a virtualenv (see **Setup** below).
 
 ## Environment
 
@@ -87,9 +102,15 @@ source .venv/bin/activate
 QT_QPA_PLATFORM=offscreen python -m pytest
 ```
 
-## Packaging
+## Packaging (developers)
 
-See `docs/PACKAGING.md`. AppImage is **not** claimed ready.
+See `docs/PACKAGING.md` for building packages yourself.
+
+- **End users:** prefer the [Release downloads](#download) above.
+- **Linux:** `.deb` via `./scripts/build-linux-deb.sh`; user launcher via
+  `./scripts/install-user.sh`. AppImage is **not** claimed ready.
+- **macOS:** `./scripts/build-macos-dmg.sh` on a Mac, or the **Build macOS DMG**
+  GitHub Action.
 
 ## License
 

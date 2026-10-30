@@ -18,6 +18,32 @@ from vectorizer.errors import JobCancelled, TraceError
 from vectorizer.svg.parse import parse_svg_document
 from vectorizer.vectorize.backend import TraceResult
 
+# Re-entered by frozen .app / .exe builds instead of ``python -m …``.
+TRACE_WORKER_FLAG = "--trace-worker"
+
+
+def worker_process_arguments(
+    *,
+    input_path: Path,
+    output_svg: Path,
+    settings_path: Path,
+    result_path: Path,
+) -> list[str]:
+    """Build argv for the tracing subprocess (after ``sys.executable``)."""
+    job_args = [
+        "--input",
+        str(input_path),
+        "--output-svg",
+        str(output_svg),
+        "--settings",
+        str(settings_path),
+        "--result",
+        str(result_path),
+    ]
+    if getattr(sys, "frozen", False):
+        return [TRACE_WORKER_FLAG, *job_args]
+    return ["-m", "vectorizer.jobs.trace_worker", *job_args]
+
 
 @dataclass
 class JobHandle:
@@ -62,25 +88,20 @@ class TraceJobRunner(QObject):
         process = QProcess(self)
         process.setProgram(sys.executable)
         process.setArguments(
-            [
-                "-m",
-                "vectorizer.jobs.trace_worker",
-                "--input",
-                str(input_path),
-                "--output-svg",
-                str(output_svg),
-                "--settings",
-                str(settings_path),
-                "--result",
-                str(result_path),
-            ]
+            worker_process_arguments(
+                input_path=input_path,
+                output_svg=output_svg,
+                settings_path=settings_path,
+                result_path=result_path,
+            )
         )
         env = QProcessEnvironment.systemEnvironment()
-        pythonpath_parts = [p for p in sys.path if p]
-        existing = env.value("PYTHONPATH")
-        if existing:
-            pythonpath_parts.append(existing)
-        env.insert("PYTHONPATH", os.pathsep.join(pythonpath_parts))
+        if not getattr(sys, "frozen", False):
+            pythonpath_parts = [p for p in sys.path if p]
+            existing = env.value("PYTHONPATH")
+            if existing:
+                pythonpath_parts.append(existing)
+            env.insert("PYTHONPATH", os.pathsep.join(pythonpath_parts))
         process.setProcessEnvironment(env)
 
         process.finished.connect(lambda code, status: self._on_finished(token, code, status, workdir, settings))
@@ -178,14 +199,9 @@ class TraceJobRunner(QObject):
 
 def run_trace_sync(image: Image.Image, settings: TraceSettings) -> TraceResult:
     """In-process tracing for CLI and tests. Does not touch Qt."""
-    from vectorizer.raster.preprocess import preprocess_image
-    from vectorizer.vectorize.vtracer_backend import VTracerBackend
+    from vectorizer.vectorize.dispatch import trace_prepared
 
-    if settings.validated().apply_preprocess:
-        working = preprocess_image(image, settings)
-    else:
-        working = image.convert("RGBA")
-    return VTracerBackend().trace(working, settings)
+    return trace_prepared(image, settings)
 
 
 def raise_if_cancelled(cancelled: bool) -> None:

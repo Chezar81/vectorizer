@@ -36,11 +36,12 @@ _DE: dict[str, str] = {
     "&View": "&Ansicht",
     "&Fit to window": "An &Fenster anpassen",
     "&Actual size": "&Originalgröße",
-    "&Dark appearance": "&Dunkles Erscheinungsbild",
+    "&System setting": "&Systemeinstellung",
+    "&Light mode": "&Heller Modus",
+    "&Dark mode": "&Dunkler Modus",
     "&Settings": "&Einstellungen",
     "&Language": "&Sprache",
     "&Preferences…": "&Präferenzen…",
-    "&Reset all preferences…": "Alle &Einstellungen zurücksetzen…",
     "Preferences": "Präferenzen",
     "Defaults": "Vorgaben",
     "Default mode": "Standardmodus",
@@ -68,15 +69,25 @@ _DE: dict[str, str] = {
         "Mindestens ein Standard-Exportformat wählen."
     ),
     "Reset all preferences?": "Alle Einstellungen zurücksetzen?",
-    "Reset app preferences (defaults, export/batch options, history limits, "
-    "Inkscape path) and UI chrome (theme, recent files)? "
-    "Language is kept. This cannot be undone.": (
-        "App-Einstellungen (Vorgaben, Export-/Stapeloptionen, Verlaufslimits, "
-        "Inkscape-Pfad) und UI (Thema, zuletzt geöffnete Dateien) "
-        "zurücksetzen? Die Sprache bleibt erhalten. Dies kann nicht rückgängig "
-        "gemacht werden."
+    "Reset these preferences to their defaults? Theme and recent files are "
+    "cleared when you press OK. Language is kept.": (
+        "Diese Präferenzen auf die Vorgaben zurücksetzen? Thema und zuletzt "
+        "geöffnete Dateien werden mit OK gelöscht. Die Sprache bleibt erhalten."
+    ),
+    "&Reset Preferences": "Präferenzen &zurücksetzen",
+    "Defaults shown. Press OK to apply them.": (
+        "Vorgaben werden angezeigt. OK übernimmt sie."
     ),
     "Preferences reset to defaults.": "Einstellungen auf Vorgaben zurückgesetzt.",
+    "Save preferences": "Präferenzen speichern",
+    "Load preferences": "Präferenzen laden",
+    "&Save to file": "In Datei &speichern",
+    "&Load from file": "Aus Datei &laden",
+    "Vectorizer preferences": "Vectorizer-Präferenzen",
+    "Saved preferences {path}": "Präferenzen gespeichert: {path}",
+    "Loaded {path}. Press OK to apply these values.": (
+        "Geladen: {path}. OK übernimmt diese Werte."
+    ),
     "Requires Inkscape on PATH or a path set in Preferences.": (
         "Inkscape muss im PATH verfügbar sein oder unter Einstellungen hinterlegt werden."
     ),
@@ -99,6 +110,17 @@ _DE: dict[str, str] = {
     "Vectorize": "Vektorisieren",
     "Retrace": "Nachzeichnen",
     "Fit": "Einpassen",
+    "Open an image (Ctrl+O)": "Bild öffnen (Strg+O)",
+    "Save the project (Ctrl+S)": "Projekt speichern (Strg+S)",
+    "Export SVG (Ctrl+E)": "SVG exportieren (Strg+E)",
+    "Export PDF (Ctrl+Shift+E)": "PDF exportieren (Strg+Umschalt+E)",
+    "Batch process (Ctrl+B)": "Stapelverarbeitung (Strg+B)",
+    "Undo (Ctrl+Z)": "Rückgängig (Strg+Z)",
+    "Redo (Ctrl+Shift+Z)": "Wiederholen (Strg+Umschalt+Z)",
+    "Trace the open image (F5)": "Geöffnetes Bild nachzeichnen (F5)",
+    "Retrace the segmentation (F6)": "Segmentierung neu nachzeichnen (F6)",
+    "Fit the preview to the window (Ctrl+0)": "Vorschau an das Fenster anpassen (Strg+0)",
+    "Show actual pixel size (Ctrl+1)": "Echte Pixelgröße zeigen (Strg+1)",
     "No recent files": "Keine kürzlich geöffneten Dateien",
     "Requires Inkscape on PATH.": "Inkscape muss im PATH verfügbar sein.",
     "Undo the last segmentation edit": "Letzte Segmentierungsänderung rückgängig",
@@ -110,7 +132,28 @@ _DE: dict[str, str] = {
     "Vector": "Vektor",
     "Side by side": "Nebeneinander",
     "Split wipe": "Wischvergleich",
+    "Compare": "Vergleich",
     "Segmentation": "Segmentierung",
+    "Turn a bitmap into editable vector paths.": (
+        "Eine Bitmap in bearbeitbare Vektorpfade verwandeln."
+    ),
+    "Open an image, or drop one on this window.": (
+        "Ein Bild öffnen oder auf dieses Fenster ziehen."
+    ),
+    "Vectorize. Automatic mode picks the tracing settings.": (
+        "Vektorisieren. Der Modus Automatisch wählt die Einstellungen."
+    ),
+    "Compare the result, then export SVG, PDF, or DXF.": (
+        "Das Ergebnis vergleichen und als SVG, PDF oder DXF exportieren."
+    ),
+    "Open image…": "Bild öffnen…",
+    "Paste bitmap": "Bitmap einfügen",
+    "PNG, JPEG, WebP, GIF, BMP, TIFF, or a .vproj project.": (
+        "PNG, JPEG, WebP, GIF, BMP, TIFF oder ein .vproj-Projekt."
+    ),
+    "Vectorize (F5) to see the paths here.": (
+        "Vektorisieren (F5), um die Pfade hier zu sehen."
+    ),
     "Drag to wipe between original (left) and vector (right).": (
         "Ziehen, um zwischen Original (links) und Vektor (rechts) zu wischen."
     ),
@@ -150,6 +193,46 @@ _DE: dict[str, str] = {
     "Colors": "Farben",
     "Image type": "Bildtyp",
     "Target color count": "Ziel-Farbanzahl",
+    "Edges": "Kanten",
+    "Automatic edges": "Automatische Kanten",
+    "Artwork with blending": "Grafik mit Übergängen",
+    "Artwork without blending": "Grafik ohne Übergänge",
+    "Photograph": "Fotografie",
+    "Blending uses anti-aliased pixels to place the curve inside the pixel. "
+    "Without blending, shapes snap to flat colors. Photographs are posterized.": (
+        "Übergänge nutzen geglättete Pixel, um die Kurve im Pixel zu platzieren. "
+        "Ohne Übergänge rasten Formen auf flache Farben ein. Fotos werden posterisiert."
+    ),
+    "Trace palette": "Nachzeichnungs-Palette",
+    "Unlimited": "Unbegrenzt",
+    "2 colors": "2 Farben",
+    "4 colors": "4 Farben",
+    "8 colors": "8 Farben",
+    "12 colors": "12 Farben",
+    "Best guess": "Beste Schätzung",
+    "Custom": "Benutzerdefiniert",
+    "Colors the trace must use:": "Farben, die das Nachzeichnen verwenden muss:",
+    "Add from image": "Aus Bild hinzufügen",
+    "Click a pixel on the Original image to add that color to the trace palette.": (
+        "Klicken Sie ein Pixel im Originalbild an, um diese Farbe zur Palette hinzuzufügen."
+    ),
+    "Remove color": "Farbe entfernen",
+    "SVG paint": "SVG-Farbe",
+    "Fill only": "Nur Füllung",
+    "Stroke and fill": "Strich und Füllung",
+    "Fill only is the simpler file. Stroke and fill paints a hairline of the "
+    "same color so viewers do not show thin gaps between shapes.": (
+        "Nur Füllung ergibt die einfachere Datei. Strich und Füllung malt eine Haarlinie "
+        "derselben Farbe, damit Betrachter keine dünnen Lücken zwischen Formen zeigen."
+    ),
+    "DXF curves": "DXF-Kurven",
+    "DXF lines": "DXF-Linien",
+    "DXF splines": "DXF-Splines",
+    "Lines samples curves into polylines. Splines keep cubic curves. "
+    "Neither mode writes fills.": (
+        "Linien tastet Kurven als Polylinien ab. Splines behalten kubische Kurven. "
+        "Keine der beiden Arten schreibt Füllungen."
+    ),
     "Smooth noise before tracing": "Rauschen vor dem Nachzeichnen glätten",
     "Apply a light median filter to RGB before tracing. "
     "Helps JPEG artifacts and photographic noise; keep off for crisp logos.": (
@@ -170,6 +253,8 @@ _DE: dict[str, str] = {
     "Splice threshold (°)": "Spleißschwelle (°)",
     "Path precision": "Pfadgenauigkeit",
     "Presets": "Voreinstellungen",
+    "Output": "Ausgabe",
+    "More preset actions": "Weitere Voreinstellungen",
     "Mode": "Modus",
     "Quality": "Qualität",
     "Automatic classifies the image (logo, line art, photo, …) and "
@@ -240,8 +325,35 @@ _DE: dict[str, str] = {
     # --- Segmentation editor ---
     "Color": "Farbe",
     "Remove small regions": "Kleine Bereiche entfernen",
+    "Zap fringes": "Ränder auflösen",
+    "Merge thin anti-aliased leftovers into the neighboring region "
+    "instead of deleting them.": (
+        "Dünne geglättete Reste in den Nachbarbereich übernehmen, statt sie zu löschen."
+    ),
+    "Find problems": "Probleme finden",
+    "Mark one-pixel gaps and pinched strokes so you can paint them closed.": (
+        "Ein-Pixel-Lücken und eingeschnürte Striche markieren, damit Sie sie schließen können."
+    ),
+    "Fringe regions merged into their neighbors.": (
+        "Randbereiche in ihre Nachbarn übernommen."
+    ),
+    "No pinched gaps found.": "Keine eingeschnürten Lücken gefunden.",
+    "Problem spots are marked. Paint across a pinch or gap, then retrace.": (
+        "Problemstellen sind markiert. Über eine Einschnürung oder Lücke malen, "
+        "dann neu nachzeichnen."
+    ),
     "Retrace from segmentation": "Aus Segmentierung nachzeichnen",
     "Rebuild from source…": "Aus Quelle neu aufbauen…",
+    "Rebuild…": "Neu aufbauen…",
+    "Rebuild the segmentation from the original image. Edits that are not retraced are discarded.": (
+        "Segmentierung aus dem Originalbild neu aufbauen. Noch nicht nachgezeichnete "
+        "Änderungen gehen verloren."
+    ),
+    "Clean up": "Bereinigen",
+    "Smaller than": "Kleiner als",
+    "Regions smaller than this many pixels are removed by Clean up → Remove small regions.": (
+        "Bereiche mit weniger Pixeln entfernt „Bereinigen → Kleine Bereiche entfernen“."
+    ),
     "Pick": "Pipette",
     "Brush": "Pinsel",
     "Fill": "Füllen",
@@ -357,21 +469,29 @@ _DE: dict[str, str] = {
     "Mint Aqua": "Mint Aqua",
     # --- Status / messages ---
     "About Vectorizer": "Über Vectorizer",
-    "Vectorizer is an independent, offline raster-to-vector tool for Linux.\n\n"
-    "Author: Christoph Rupprich.\n\n"
-    "Appearance follows Linux Mint Mint-Y-Aqua colors. "
-    "Tracing uses the open-source VTracer engine. Photograph vectorization "
-    "produces stylized regions, not a lossless replacement of the photo.\n\n"
-    "The Segmentation tab edits a working map that is distinct from the "
-    "original raster. Retrace (F6) vectorizes that map.": (
-        "Vectorizer ist ein unabhängiges Offline-Werkzeug zur Raster-zu-Vektor-Umwandlung "
-        "für Linux.\n\n"
-        "Autor: Christoph Rupprich.\n\n"
-        "Das Erscheinungsbild folgt den Linux-Mint-Mint-Y-Aqua-Farben. "
-        "Das Nachzeichnen nutzt die Open-Source-Engine VTracer. Die Vektorisierung von "
-        "Fotografien erzeugt stilisierte Bereiche, keinen verlustfreien Ersatz des Fotos.\n\n"
-        "Der Segmentierungs-Tab bearbeitet eine Arbeitskarte, die vom Originalraster "
-        "getrennt ist. Nachzeichnen (F6) vektorisiert diese Karte."
+    "<b>Vectorizer {version}</b>"
+    "<p>An independent Linux application that turns bitmap images "
+    "into editable vector paths. It runs entirely on this computer: "
+    "no account, no telemetry, and no network.</p>"
+    "<p>Open an image or a .vproj project and vectorize it (F5). "
+    "On the Segmentation tab you can correct regions; Retrace (F6) "
+    "builds the paths from that map. Export SVG, PDF, PNG, or DXF. "
+    "EPS is available when Inkscape is installed.</p>"
+    "<p>Tracing uses the open-source VTracer engine. Photographs "
+    "become stylized color regions, not a lossless copy of the photo.</p>"
+    "<p>Author: Christoph Rupprich<br>License: MIT</p>": (
+        "<b>Vectorizer {version}</b>"
+        "<p>Eine eigenständige Linux-Anwendung, die Bitmap-Bilder in "
+        "bearbeitbare Vektorpfade umwandelt. Sie läuft vollständig auf "
+        "diesem Rechner: kein Konto, keine Telemetrie und kein Netzwerk.</p>"
+        "<p>Öffnen Sie ein Bild oder ein .vproj-Projekt und vektorisieren "
+        "Sie es (F5). Im Segmentierungs-Tab können Sie Bereiche korrigieren; "
+        "Nachzeichnen (F6) erzeugt die Pfade aus dieser Karte. Export als "
+        "SVG, PDF, PNG oder DXF. EPS ist verfügbar, wenn Inkscape installiert ist.</p>"
+        "<p>Das Nachzeichnen nutzt die Open-Source-Engine VTracer. Fotografien "
+        "werden zu stilisierten Farbflächen, nicht zu einer verlustfreien "
+        "Kopie des Fotos.</p>"
+        "<p>Autor: Christoph Rupprich<br>Lizenz: MIT</p>"
     ),
     "The clipboard does not contain a bitmap.": "Die Zwischenablage enthält kein Bitmap.",
     "Loaded from Vectorizer project.": "Aus Vectorizer-Projekt geladen.",
@@ -402,6 +522,37 @@ _DE: dict[str, str] = {
     "Saved DXF {path} (outlines only; curves linearized)": (
         "DXF gespeichert: {path} (nur Umrisse; Kurven linearisiert)"
     ),
+    "Saved DXF {path} ({note})": "DXF gespeichert: {path} ({note})",
+    "outlines only; curves linearized": "nur Umrisse; Kurven linearisiert",
+    "outlines only; cubics as splines; fills omitted": (
+        "nur Umrisse; Kubiken als Splines; Füllungen ausgelassen"
+    ),
+    "Delete clicked shape": "Angeklickte Form löschen",
+    "Click a filled shape on the vector preview to remove it.": (
+        "Eine gefüllte Form in der Vektorvorschau anklicken, um sie zu entfernen."
+    ),
+    "Remove background shapes": "Hintergrundformen entfernen",
+    "Drop finished paths whose fill matches the background color.": (
+        "Fertige Pfade entfernen, deren Füllung der Hintergrundfarbe entspricht."
+    ),
+    "Open an image first, then pick a color from it.": (
+        "Öffnen Sie zuerst ein Bild und wählen Sie dann eine Farbe daraus."
+    ),
+    "Click a pixel on the Original image to add that color to the palette…": (
+        "Klicken Sie ein Pixel im Originalbild an, um diese Farbe zur Palette hinzuzufügen…"
+    ),
+    "Added {color} to the trace palette.": "{color} zur Nachzeichnungs-Palette hinzugefügt.",
+    "Click a filled shape on the vector preview to delete it.": (
+        "Klicken Sie eine gefüllte Form in der Vektorvorschau an, um sie zu löschen."
+    ),
+    "No filled shape at that point.": "Keine gefüllte Form an dieser Stelle.",
+    "Shape removed from the vector result.": "Form aus dem Vektorergebnis entfernt.",
+    "Delete shape": "Form löschen",
+    "Vectorize an image before removing background shapes.": (
+        "Vektorisieren Sie ein Bild, bevor Sie Hintergrundformen entfernen."
+    ),
+    "No background-colored shapes to remove.": "Keine hintergrundfarbenen Formen zum Entfernen.",
+    "Background-colored shapes removed.": "Hintergrundfarbene Formen entfernt.",
     "EPS export requires Inkscape on PATH.": (
         "EPS-Export erfordert Inkscape im PATH."
     ),
@@ -417,8 +568,14 @@ _DE: dict[str, str] = {
     ),
     "Retracing segmentation…": "Segmentierung wird nachgezeichnet…",
     "Tracing…": "Nachzeichnen…",
-    "{label} (indeterminate; backend has no percent)": (
-        "{label} (unbestimmt; Backend liefert keinen Prozentwert)"
+    "Click a pixel on the original. Press Esc to cancel.": (
+        "Klicken Sie ein Pixel im Original. Esc bricht ab."
+    ),
+    "Click a pixel to add it to the trace palette. Press Esc to cancel.": (
+        "Klicken Sie ein Pixel, um es der Farbpalette hinzuzufügen. Esc bricht ab."
+    ),
+    "Click a filled shape to delete it. Press Esc to cancel.": (
+        "Klicken Sie eine gefüllte Form, um sie zu löschen. Esc bricht ab."
     ),
     "Internal error: unexpected trace result.": (
         "Interner Fehler: unerwartetes Nachzeichnungsergebnis."
@@ -529,3 +686,7 @@ def image_file_filter() -> str:
 
 def project_file_filter() -> str:
     return f"{t('Vectorizer project')} (*.vproj)"
+
+
+def preferences_file_filter() -> str:
+    return f"{t('Vectorizer preferences')} (*.json);;{t('All files')} (*)"

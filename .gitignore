@@ -7,6 +7,8 @@ __pycache__/
 .ruff_cache/
 dist/
 build/
+*.dmg
+packaging/macos/Vectorizer.icns
 .benchmarks/
 benchmark_results/
 tests/fixtures/*.png

@@ -9,15 +9,18 @@ from PySide6.QtWidgets import (
     QColorDialog,
     QComboBox,
     QFormLayout,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
     QInputDialog,
     QLabel,
     QListWidget,
     QListWidgetItem,
+    QMenu,
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -25,10 +28,14 @@ from PySide6.QtWidgets import (
 from vectorizer.domain.settings import (
     AutomaticQuality,
     ColorMode,
+    DxfCurveMode,
+    EdgeTreatment,
     HierarchyMode,
     PathFitMode,
+    SvgPaintStyle,
     TraceSettings,
     WorkflowMode,
+    normalize_hex,
 )
 from vectorizer.gui.i18n import t, tf
 from vectorizer.gui.preferences import update_preferences
@@ -63,13 +70,17 @@ class SettingsPanel(QWidget):
     settings_changed = Signal()
     palette_recolor_requested = Signal(dict)  # old_hex -> new_hex
     pick_background_requested = Signal()  # enter click-to-pick on Original tab
+    pick_trace_color_requested = Signal()
     automatic_quality_changed = Signal()  # re-apply Automatic suggestions
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setObjectName("sidePanel")
         self._updating = False
+        self._ready = False
         self._palette_colors: list[str] = []
+        self._trace_palette: list[str] = []
+        self._palette_suggestions: dict[int, tuple[str, ...]] = {}
         self._notes_en = ""
 
         self.workflow = QComboBox()
@@ -98,6 +109,15 @@ class SettingsPanel(QWidget):
         # --- Always-visible color count ---
         self.target_colors = IntSliderSpin(0, 256)
         self.smooth_noise = QCheckBox()
+        self.edge_treatment = QComboBox()
+        self.palette_choice = QComboBox()
+        self.trace_palette_list = QListWidget()
+        self.trace_palette_list.setObjectName("paletteList")
+        self.trace_palette_list.setMaximumHeight(120)
+        self.trace_add_btn = QPushButton()
+        self.trace_remove_btn = QPushButton()
+        self.svg_style = QComboBox()
+        self.dxf_mode = QComboBox()
 
         self.palette_list = QListWidget()
         self.palette_list.setObjectName("paletteList")
@@ -109,8 +129,10 @@ class SettingsPanel(QWidget):
         self.preset_combo = QComboBox()
         self.preset_save = QPushButton()
         self.preset_load = QPushButton()
-        self.preset_delete = QPushButton()
-        self.preset_dup = QPushButton()
+        self.preset_delete = QPushButton(self)
+        self.preset_dup = QPushButton(self)
+        self.preset_delete.hide()
+        self.preset_dup.hide()
 
         self.notes = QLabel()
         self.notes.setWordWrap(True)
@@ -136,7 +158,7 @@ class SettingsPanel(QWidget):
         self._bg_tolerance_label = _add_slider_row(bg_form, "Color tolerance", self.bg_tolerance)
         self._bg_hint = QLabel()
         self._bg_hint.setWordWrap(True)
-        self._bg_hint.setObjectName("analysisNotes")
+        self._bg_hint.setObjectName("inlineHint")
         bg_form.addRow(self._bg_hint)
         self._preprocess_box = background
 
@@ -149,11 +171,42 @@ class SettingsPanel(QWidget):
             colors_form, "Target color count", self.target_colors
         )
         colors_form.addRow(self.smooth_noise)
+        self._edge_label = QLabel()
+        colors_form.addRow(self._edge_label, self.edge_treatment)
+        self._palette_choice_label = QLabel()
+        colors_form.addRow(self._palette_choice_label, self.palette_choice)
+        self._trace_palette_caption = QLabel()
+        self._trace_editor = QWidget()
+        self._trace_editor.setObjectName("optionBlock")
+        trace_layout = QVBoxLayout(self._trace_editor)
+        trace_layout.setContentsMargins(0, 0, 0, 0)
+        trace_layout.setSpacing(4)
+        trace_layout.addWidget(self._trace_palette_caption)
+        trace_layout.addWidget(self.trace_palette_list)
+        trace_btns = QHBoxLayout()
+        trace_btns.addWidget(self.trace_add_btn)
+        trace_btns.addWidget(self.trace_remove_btn)
+        trace_layout.addLayout(trace_btns)
+        colors_form.addRow(self._trace_editor)
         self._palette_caption = QLabel()
-        colors_form.addRow(self._palette_caption)
-        colors_form.addRow(self.palette_list)
-        colors_form.addRow(self.recolor_btn)
+        self._result_palette = QWidget()
+        self._result_palette.setObjectName("optionBlock")
+        result_layout = QVBoxLayout(self._result_palette)
+        result_layout.setContentsMargins(0, 4, 0, 0)
+        result_layout.setSpacing(4)
+        result_layout.addWidget(self._palette_caption)
+        result_layout.addWidget(self.palette_list)
+        result_layout.addWidget(self.recolor_btn)
+        colors_form.addRow(self._result_palette)
         self._colors_box = colors
+
+        output = QGroupBox()
+        output_form = QFormLayout(output)
+        self._svg_style_label = QLabel()
+        output_form.addRow(self._svg_style_label, self.svg_style)
+        self._dxf_mode_label = QLabel()
+        output_form.addRow(self._dxf_mode_label, self.dxf_mode)
+        self._output_box = output
 
         basic = QGroupBox()
         basic_form = QFormLayout(basic)
@@ -177,15 +230,24 @@ class SettingsPanel(QWidget):
         self._path_precision_label = _add_slider_row(adv_form, "Path precision", self.path_precision)
         self._advanced_box = advanced
 
+        self._preset_menu = QMenu(self)
+        self._preset_dup_act = self._preset_menu.addAction("")
+        self._preset_delete_act = self._preset_menu.addAction("")
+        self._preset_dup_act.triggered.connect(self._duplicate_preset)
+        self._preset_delete_act.triggered.connect(self._delete_preset)
+        self.preset_more = QToolButton()
+        self.preset_more.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.preset_more.setMenu(self._preset_menu)
+        self.preset_more.setText("⋯")
+
         presets = QGroupBox()
         preset_row = QHBoxLayout()
         preset_row.addWidget(self.preset_combo, 1)
-        preset_btns = QHBoxLayout()
-        for btn in (self.preset_load, self.preset_save, self.preset_dup, self.preset_delete):
-            preset_btns.addWidget(btn)
+        preset_row.addWidget(self.preset_load)
+        preset_row.addWidget(self.preset_save)
+        preset_row.addWidget(self.preset_more)
         preset_layout = QVBoxLayout(presets)
         preset_layout.addLayout(preset_row)
-        preset_layout.addLayout(preset_btns)
         self._presets_box = presets
 
         top = QFormLayout()
@@ -202,11 +264,10 @@ class SettingsPanel(QWidget):
         layout.addWidget(self.notes)
         layout.addWidget(background)
         layout.addWidget(colors)
+        layout.addWidget(output)
         layout.addWidget(basic)
         layout.addWidget(advanced)
         layout.addWidget(presets)
-        layout.addWidget(self.vectorize_btn)
-        layout.addWidget(self.cancel_btn)
         layout.addStretch(1)
         self.retranslate_ui()
 
@@ -216,9 +277,23 @@ class SettingsPanel(QWidget):
         scroll.setFrameShape(QScrollArea.Shape.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setWidget(inner)
+        self.vectorize_btn.setMinimumHeight(36)
+        self.cancel_btn.setMinimumHeight(36)
+        self.cancel_btn.setVisible(False)
+        action_row = QHBoxLayout()
+        action_row.setContentsMargins(10, 10, 10, 10)
+        action_row.setSpacing(8)
+        action_row.addWidget(self.vectorize_btn, 1)
+        action_row.addWidget(self.cancel_btn)
+        self._action_bar = QFrame()
+        self._action_bar.setObjectName("actionBar")
+        self._action_bar.setLayout(action_row)
+
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
-        outer.addWidget(scroll)
+        outer.setSpacing(0)
+        outer.addWidget(scroll, 1)
+        outer.addWidget(self._action_bar)
 
         self.workflow.currentIndexChanged.connect(self._on_workflow_changed)
         self.auto_quality.currentIndexChanged.connect(self._on_auto_quality_changed)
@@ -236,6 +311,10 @@ class SettingsPanel(QWidget):
             self.path_precision,
             self.bg_tolerance,
             self.target_colors,
+            self.edge_treatment,
+            self.palette_choice,
+            self.svg_style,
+            self.dxf_mode,
         ):
             if hasattr(widget, "valueChanged"):
                 widget.valueChanged.connect(self._emit_changed)
@@ -246,6 +325,9 @@ class SettingsPanel(QWidget):
         self.remove_background.toggled.connect(self._on_remove_bg_toggled)
         self.bg_color_btn.clicked.connect(self._pick_bg_color)
         self.bg_pick_btn.clicked.connect(self.pick_background_requested.emit)
+        self.trace_add_btn.clicked.connect(self.pick_trace_color_requested.emit)
+        self.trace_remove_btn.clicked.connect(self._remove_trace_color)
+        self.palette_choice.currentIndexChanged.connect(self._apply_palette_choice)
         self.vectorize_btn.clicked.connect(self.vectorize_requested.emit)
         self.cancel_btn.clicked.connect(self.cancel_requested.emit)
         self.recolor_btn.clicked.connect(self._recolor_selected)
@@ -259,6 +341,7 @@ class SettingsPanel(QWidget):
         self._on_workflow_changed()
         self._update_bg_button()
         self._on_remove_bg_toggled(self.remove_background.isChecked())
+        self.set_ready(False)
 
     def preferred_content_height(self) -> int:
         """Full sidebar content height (no scrollbar), for default window sizing."""
@@ -266,7 +349,8 @@ class SettingsPanel(QWidget):
         self._scroll_inner.adjustSize()
         hint = self._scroll_inner.sizeHint()
         minimum = self._scroll_inner.minimumSizeHint()
-        return max(hint.height(), minimum.height(), 1)
+        bar = self._action_bar.sizeHint().height()
+        return max(hint.height(), minimum.height(), 1) + max(bar, 0)
 
     def retranslate_ui(self) -> None:
         """Apply the active language to all sidebar labels and controls."""
@@ -323,6 +407,59 @@ class SettingsPanel(QWidget):
                     ("Pixel-aligned", PathFitMode.PIXEL),
                 ),
             )
+            self._refill_combo(
+                self.edge_treatment,
+                (
+                    ("Automatic edges", EdgeTreatment.AUTO),
+                    ("Artwork with blending", EdgeTreatment.BLENDED),
+                    ("Artwork without blending", EdgeTreatment.HARD),
+                    ("Photograph", EdgeTreatment.PHOTO),
+                ),
+            )
+            self.edge_treatment.setToolTip(
+                t(
+                    "Blending uses anti-aliased pixels to place the curve inside the pixel. "
+                    "Without blending, shapes snap to flat colors. Photographs are posterized."
+                )
+            )
+            self._refill_combo(
+                self.palette_choice,
+                (
+                    ("Unlimited", 0),
+                    ("2 colors", 2),
+                    ("4 colors", 4),
+                    ("8 colors", 8),
+                    ("12 colors", 12),
+                    ("Best guess", -1),
+                    ("Custom", -2),
+                ),
+            )
+            self._refill_combo(
+                self.svg_style,
+                (
+                    ("Fill only", SvgPaintStyle.FILL),
+                    ("Stroke and fill", SvgPaintStyle.STROKE_FILL),
+                ),
+            )
+            self.svg_style.setToolTip(
+                t(
+                    "Fill only is the simpler file. Stroke and fill paints a hairline of the "
+                    "same color so viewers do not show thin gaps between shapes."
+                )
+            )
+            self._refill_combo(
+                self.dxf_mode,
+                (
+                    ("DXF lines", DxfCurveMode.LINES),
+                    ("DXF splines", DxfCurveMode.SPLINES),
+                ),
+            )
+            self.dxf_mode.setToolTip(
+                t(
+                    "Lines samples curves into polylines. Splines keep cubic curves. "
+                    "Neither mode writes fills."
+                )
+            )
 
             self.preserve_transparency.setText(t("Keep existing transparency"))
             self.remove_background.setText(t("Remove background"))
@@ -363,6 +500,10 @@ class SettingsPanel(QWidget):
             self.preset_load.setText(t("Load"))
             self.preset_delete.setText(t("Delete"))
             self.preset_dup.setText(t("Duplicate"))
+            self._preset_dup_act.setText(t("Duplicate"))
+            self._preset_delete_act.setText(t("Delete"))
+            self.preset_more.setToolTip(t("More preset actions"))
+            self.vectorize_btn.setToolTip(t("Trace the open image (F5)"))
             self.notes.setToolTip(t("Hints from Automatic analysis of the opened image."))
             self.vectorize_btn.setText(t("Vectorize"))
             self.cancel_btn.setText(t("Cancel"))
@@ -374,7 +515,18 @@ class SettingsPanel(QWidget):
                 t("Tip: enable Remove background, pick a color, then Vectorize.")
             )
             self._colors_box.setTitle(t("Colors"))
+            self._output_box.setTitle(t("Output"))
             self._image_type_label.setText(t("Image type"))
+            self._edge_label.setText(t("Edges"))
+            self._palette_choice_label.setText(t("Trace palette"))
+            self._trace_palette_caption.setText(t("Colors the trace must use:"))
+            self.trace_add_btn.setText(t("Add from image"))
+            self.trace_add_btn.setToolTip(
+                t("Click a pixel on the Original image to add that color to the trace palette.")
+            )
+            self.trace_remove_btn.setText(t("Remove color"))
+            self._svg_style_label.setText(t("SVG paint"))
+            self._dxf_mode_label.setText(t("DXF curves"))
             self._target_colors_label.setText(t("Target color count"))
             self._palette_caption.setText(t("Result palette (after vectorize):"))
             self._basic_box.setTitle(t("Tracing (Basic)"))
@@ -468,8 +620,15 @@ class SettingsPanel(QWidget):
         if not self._updating and auto:
             self.automatic_quality_changed.emit()
 
+    def set_ready(self, ready: bool) -> None:
+        """Enable Vectorize only after an image is open and no job is running."""
+        self._ready = bool(ready)
+        busy = self.cancel_btn.isVisible()
+        self.vectorize_btn.setEnabled(self._ready and not busy)
+
     def set_busy(self, busy: bool) -> None:
-        self.vectorize_btn.setEnabled(not busy)
+        self.cancel_btn.setVisible(busy)
+        self.vectorize_btn.setEnabled(self._ready and not busy)
         self.cancel_btn.setEnabled(busy)
         self.workflow.setEnabled(not busy)
         self.auto_quality.setEnabled(not busy)
@@ -524,6 +683,7 @@ class SettingsPanel(QWidget):
                 "}"
             )
             self.palette_list.setItemWidget(item, swatch)
+        self._sync_optional_color_rows()
 
     def set_background_color(self, color: QColor, *, enable_removal: bool = True) -> None:
         if not color.isValid():
@@ -534,6 +694,83 @@ class SettingsPanel(QWidget):
         self._update_bg_button()
         self._on_remove_bg_toggled(self.remove_background.isChecked())
         self._emit_changed()
+
+    def set_palette_suggestions(self, suggestions: dict[int, tuple[str, ...]]) -> None:
+        """Counts 2/4/8/12 plus -1 for the analyzer's best palette."""
+        self._palette_suggestions = {int(key): tuple(value) for key, value in suggestions.items()}
+
+    def add_trace_color(self, hex_color: str) -> None:
+        try:
+            color = normalize_hex(hex_color)
+        except ValueError:
+            return
+        if color not in self._trace_palette and len(self._trace_palette) < 32:
+            self._trace_palette.append(color)
+        self._refresh_trace_palette()
+        self._set_combo(self.palette_choice, -2)
+        self._emit_changed()
+
+    def _remove_trace_color(self) -> None:
+        row = self.trace_palette_list.currentRow()
+        if row < 0 or row >= len(self._trace_palette):
+            QMessageBox.information(self, t("Palette"), t("Select a palette color first."))
+            return
+        del self._trace_palette[row]
+        self._refresh_trace_palette()
+        self._set_combo(self.palette_choice, -2 if self._trace_palette else 0)
+        self._emit_changed()
+
+    def _sync_optional_color_rows(self) -> None:
+        """Show the custom palette editor and result swatches only when they have a job."""
+        choice = self.palette_choice.currentData()
+        self._trace_editor.setVisible(choice == -2 or bool(self._trace_palette))
+        self._result_palette.setVisible(self.palette_list.count() > 0)
+
+    def _apply_palette_choice(self) -> None:
+        if self._updating:
+            return
+        choice = self.palette_choice.currentData()
+        if choice == -2:
+            self._sync_optional_color_rows()
+            return
+        if choice in (None,):
+            return
+        if choice == 0:
+            self._trace_palette = []
+        else:
+            colors = self._palette_suggestions.get(int(choice))
+            if not colors:
+                self._sync_optional_color_rows()
+                return
+            self._trace_palette = list(colors)
+        self._refresh_trace_palette()
+        self._sync_optional_color_rows()
+        self._emit_changed()
+
+    def _refresh_trace_palette(self) -> None:
+        self.trace_palette_list.clear()
+        for color in self._trace_palette:
+            item = QListWidgetItem(color)
+            item.setData(Qt.ItemDataRole.UserRole, color)
+            swatch = QLabel(color)
+            swatch.setAutoFillBackground(True)
+            swatch.setStyleSheet(
+                f"QLabel {{ background: {color}; color: {'#000' if QColor(color).lightness() > 140 else '#fff'}; "
+                "padding: 2px 6px; }}"
+            )
+            self.trace_palette_list.addItem(item)
+            self.trace_palette_list.setItemWidget(item, swatch)
+        self._sync_optional_color_rows()
+
+    def _select_palette_choice(self, palette: tuple[str, ...]) -> None:
+        if not palette:
+            self._set_combo(self.palette_choice, 0)
+            return
+        for count, colors in self._palette_suggestions.items():
+            if count > 0 and tuple(colors) == tuple(palette):
+                self._set_combo(self.palette_choice, count)
+                return
+        self._set_combo(self.palette_choice, -2)
 
     def set_settings(self, settings: TraceSettings) -> None:
         self._updating = True
@@ -559,9 +796,16 @@ class SettingsPanel(QWidget):
             )
             self.target_colors.setValue(settings.target_colors)
             self.smooth_noise.setChecked(settings.smooth_noise)
+            self._set_combo(self.edge_treatment, settings.edge_treatment)
+            self._set_combo(self.svg_style, settings.svg_paint_style)
+            self._set_combo(self.dxf_mode, settings.dxf_curve_mode)
+            self._trace_palette = list(settings.palette)
+            self._refresh_trace_palette()
+            self._select_palette_choice(settings.palette)
             self._update_bg_button()
             self._on_workflow_changed()
             self._on_remove_bg_toggled(settings.remove_background)
+            self._sync_optional_color_rows()
         finally:
             self._updating = False
 
@@ -588,6 +832,10 @@ class SettingsPanel(QWidget):
             background_tolerance=self.bg_tolerance.value(),
             target_colors=self.target_colors.value(),
             smooth_noise=self.smooth_noise.isChecked(),
+            edge_treatment=self.edge_treatment.currentData() or EdgeTreatment.AUTO,
+            palette=tuple(self._trace_palette),
+            svg_paint_style=self.svg_style.currentData() or SvgPaintStyle.FILL,
+            dxf_curve_mode=self.dxf_mode.currentData() or DxfCurveMode.LINES,
         ).validated()
 
     def refresh_presets(self) -> None:

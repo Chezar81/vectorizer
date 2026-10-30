@@ -56,15 +56,27 @@ def test_language_persists_across_load(qapp: QApplication, tmp_path, monkeypatch
     set_language(LANG_EN, persist=True)
 
 
-def test_main_window_language_switch(qapp: QApplication, tmp_path_factory) -> None:
+def test_main_window_language_switch(qapp: QApplication, tmp_path, monkeypatch) -> None:
+    from vectorizer.gui import i18n as i18n_mod
     from vectorizer.gui.main_window import MainWindow
     from vectorizer.presets import set_presets_dir_override
 
-    set_presets_dir_override(tmp_path_factory.mktemp("presets-i18n"))
-    set_language(LANG_EN, persist=False)
+    ini = str(tmp_path / "vectorizer-ui.ini")
+
+    def _isolated_settings() -> QSettings:
+        return QSettings(ini, QSettings.Format.IniFormat)
+
+    # MainWindow.load_language() reads QSettings. Keep that off the user config,
+    # which may already be German, and so later switches do not overwrite it.
+    monkeypatch.setattr(i18n_mod, "_ui_settings", _isolated_settings)
+    set_presets_dir_override(tmp_path / "presets-i18n")
+    set_language(LANG_EN, persist=True)
     window = MainWindow()
     assert window.panel.vectorize_btn.text() == "Vectorize"
     assert window._settings_menu.title() == "&Settings"
+    assert window._appearance_actions["system"].text() == "&System setting"
+    assert window._appearance_actions["light"].text() == "&Light mode"
+    assert window._appearance_actions["dark"].text() == "&Dark mode"
     assert any(a.menu() is window.language_menu for a in window._settings_menu.actions())
     assert not any(a.menu() is window.language_menu for a in window._view_menu.actions())
     window._set_ui_language(LANG_DE)
@@ -72,6 +84,9 @@ def test_main_window_language_switch(qapp: QApplication, tmp_path_factory) -> No
     assert window._settings_menu.title() == "&Einstellungen"
     assert window.language_menu.title() == "&Sprache"
     assert window.panel.vectorize_btn.text() == "Vektorisieren"
+    assert window._appearance_actions["system"].text() == "&Systemeinstellung"
+    assert window._appearance_actions["light"].text() == "&Heller Modus"
+    assert window._appearance_actions["dark"].text() == "&Dunkler Modus"
     assert window.preview_tabs.tabText(4) == "Segmentierung"
     window._set_ui_language(LANG_EN)
     assert window.panel.vectorize_btn.text() == "Vectorize"

@@ -4,13 +4,15 @@ from __future__ import annotations
 
 from enum import Enum
 
-from PySide6.QtCore import QPoint, Qt, Signal
+from PySide6.QtCore import QPoint, QRect, Qt, Signal
 from PySide6.QtGui import QColor, QImage, QMouseEvent, QPainter, QPen, QPixmap, QWheelEvent
 from PySide6.QtWidgets import (
     QButtonGroup,
     QColorDialog,
+    QFrame,
     QHBoxLayout,
     QLabel,
+    QMenu,
     QPushButton,
     QSlider,
     QSpinBox,
@@ -26,10 +28,12 @@ from vectorizer.segmentation.history import DEFAULT_MAX_STEPS, SegmentationHisto
 from vectorizer.segmentation.map import SegmentationMap
 from vectorizer.segmentation.ops import (
     brush_stroke,
+    find_problems,
     flood_fill,
     pick_color,
     remove_small_regions,
     separate_with_stroke,
+    zap_fringes,
 )
 
 
@@ -63,6 +67,7 @@ class SegmentationEditor(QWidget):
         self._panning = False
         self._pan_start = QPoint()
         self._show_grid = True
+        self._problems: list[tuple[int, int, str]] = []
 
         self.canvas = _SegCanvas(self)
         self.canvas.request_paint.connect(self._paint_canvas)
@@ -80,8 +85,15 @@ class SegmentationEditor(QWidget):
         self.small_spin = QSpinBox()
         self.small_spin.setRange(2, 5000)
         self.small_spin.setValue(16)
-        self.remove_small_btn = QPushButton()
+        self.remove_small_btn = QPushButton(self)
+        self.remove_small_btn.hide()
         self.remove_small_btn.clicked.connect(self._remove_small)
+        self.zap_btn = QPushButton(self)
+        self.zap_btn.hide()
+        self.zap_btn.clicked.connect(self._zap)
+        self.find_btn = QPushButton(self)
+        self.find_btn.hide()
+        self.find_btn.clicked.connect(self._find_problems)
         self.undo_btn = QPushButton()
         self.redo_btn = QPushButton()
         self.undo_btn.clicked.connect(self.undo)
@@ -93,7 +105,11 @@ class SegmentationEditor(QWidget):
         self.fit_btn = QPushButton()
         self.fit_btn.clicked.connect(self.fit_view)
 
-        tools = QHBoxLayout()
+        tools_frame = QFrame()
+        tools_frame.setObjectName("segTools")
+        tools = QHBoxLayout(tools_frame)
+        tools.setContentsMargins(8, 6, 8, 6)
+        tools.setSpacing(4)
         self._tool_group = QButtonGroup(self)
         self._tool_buttons: dict[SegTool, QToolButton] = {}
         self._tool_label_keys = {
@@ -107,35 +123,56 @@ class SegmentationEditor(QWidget):
         for tool in self._tool_label_keys:
             btn = QToolButton()
             btn.setCheckable(True)
+            btn.setAutoRaise(True)
             self._tool_group.addButton(btn)
             self._tool_buttons[tool] = btn
             tools.addWidget(btn)
             btn.clicked.connect(lambda checked=False, tool_id=tool: self._set_tool(tool_id))
+        tools.addStretch(1)
         self._tool_buttons[SegTool.BRUSH].setChecked(True)
 
+        self._cleanup_menu = QMenu(self)
+        self._remove_small_act = self._cleanup_menu.addAction("")
+        self._zap_act = self._cleanup_menu.addAction("")
+        self._find_act = self._cleanup_menu.addAction("")
+        self._remove_small_act.triggered.connect(self._remove_small)
+        self._zap_act.triggered.connect(self._zap)
+        self._find_act.triggered.connect(self._find_problems)
+        self.cleanup_btn = QToolButton()
+        self.cleanup_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.cleanup_btn.setMenu(self._cleanup_menu)
+
         bar = QHBoxLayout()
+        bar.setContentsMargins(8, 4, 8, 4)
+        bar.setSpacing(6)
         self._radius_label = QLabel()
+        self._small_label = QLabel()
         bar.addWidget(self.color_btn)
         bar.addWidget(self._radius_label)
         bar.addWidget(self.radius)
-        bar.addWidget(self.undo_btn)
-        bar.addWidget(self.redo_btn)
-        bar.addWidget(self.fit_btn)
         bar.addStretch(1)
+        self.undo_btn.hide()
+        self.redo_btn.hide()
+        self.fit_btn.hide()
+        bar.addWidget(self._small_label)
         bar.addWidget(self.small_spin)
-        bar.addWidget(self.remove_small_btn)
+        bar.addWidget(self.cleanup_btn)
         bar.addWidget(self.rebuild_btn)
         bar.addWidget(self.retrace_btn)
 
         self._hint = QLabel()
         self._hint.setWordWrap(True)
-        self._hint.setObjectName("analysisNotes")
+        self._hint.setObjectName("inlineHint")
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.addLayout(tools)
+        layout.setSpacing(0)
+        layout.addWidget(tools_frame)
         layout.addLayout(bar)
-        layout.addWidget(self._hint)
+        hint_wrap = QHBoxLayout()
+        hint_wrap.setContentsMargins(8, 0, 8, 6)
+        hint_wrap.addWidget(self._hint)
+        layout.addLayout(hint_wrap)
         layout.addWidget(self.canvas, 1)
         self.retranslate_ui()
         self._update_color_btn()
@@ -147,12 +184,41 @@ class SegmentationEditor(QWidget):
             btn.setText(t(key))
             btn.setToolTip(self._tool_tip(tool))
         self.remove_small_btn.setText(t("Remove small regions"))
+        self._remove_small_act.setText(t("Remove small regions"))
+        self.zap_btn.setText(t("Zap fringes"))
+        self._zap_act.setText(t("Zap fringes"))
+        zap_tip = t(
+            "Merge thin anti-aliased leftovers into the neighboring region "
+            "instead of deleting them."
+        )
+        self.zap_btn.setToolTip(zap_tip)
+        self._zap_act.setToolTip(zap_tip)
+        self.find_btn.setText(t("Find problems"))
+        self._find_act.setText(t("Find problems"))
+        find_tip = t("Mark one-pixel gaps and pinched strokes so you can paint them closed.")
+        self.find_btn.setToolTip(find_tip)
+        self._find_act.setToolTip(find_tip)
+        self.cleanup_btn.setText(t("Clean up"))
         self.undo_btn.setText(t("Undo"))
         self.redo_btn.setText(t("Redo"))
-        self.retrace_btn.setText(t("Retrace from segmentation"))
-        self.rebuild_btn.setText(t("Rebuild from source…"))
+        self.retrace_btn.setText(t("Retrace"))
+        self.retrace_btn.setToolTip(t("Retrace the segmentation (F6)"))
+        self.rebuild_btn.setText(t("Rebuild…"))
+        self.rebuild_btn.setToolTip(
+            t(
+                "Rebuild the segmentation from the original image. "
+                "Edits that are not retraced are discarded."
+            )
+        )
         self.fit_btn.setText(t("Fit"))
         self._radius_label.setText(t("Radius"))
+        self._small_label.setText(t("Smaller than"))
+        self.small_spin.setToolTip(
+            t(
+                "Regions smaller than this many pixels are removed by "
+                "Clean up → Remove small regions."
+            )
+        )
         self._hint.setText(
             t(
                 "Segmentation is a separate raster from the original. "
@@ -286,7 +352,27 @@ class SegmentationEditor(QWidget):
     def _remove_small(self) -> None:
         if self._map is None:
             return
+        self._problems = []
         self._commit(remove_small_regions(self._map, self.small_spin.value()))
+
+    def _zap(self) -> None:
+        if self._map is None:
+            return
+        updated = zap_fringes(self._map, max_pixels=max(8, self.small_spin.value()))
+        self._problems = []
+        self._commit(updated)
+        self.status_message.emit(t("Fringe regions merged into their neighbors."))
+
+    def _find_problems(self) -> None:
+        if self._map is None:
+            return
+        self._problems = find_problems(self._map)
+        self.canvas.update()
+        self.status_message.emit(
+            t("No pinched gaps found.")
+            if not self._problems
+            else t("Problem spots are marked. Paint across a pinch or gap, then retrace.")
+        )
         self.status_message.emit(t("Removed small regions from the segmentation."))
 
     def fit_view(self) -> None:
@@ -398,9 +484,10 @@ class SegmentationEditor(QWidget):
     def _paint_canvas(self, painter: QPainter, size) -> None:
         painter.fillRect(0, 0, size.width(), size.height(), QColor("#dedee1"))
         if self._map is None:
+            painter.setPen(QColor("#6f6f6f"))
             painter.drawText(
-                20,
-                40,
+                QRect(24, 24, max(size.width() - 48, 1), max(size.height() - 48, 1)),
+                int(Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap),
                 t("No segmentation yet. Open an image and vectorize, or rebuild."),
             )
             return
@@ -444,6 +531,14 @@ class SegmentationEditor(QWidget):
             ]
             for a, b in zip(pts, pts[1:]):
                 painter.drawLine(a, b)
+        if self._problems:
+            painter.setPen(QPen(QColor(252, 65, 56), 2))
+            painter.setBrush(QColor(252, 65, 56, 180))
+            radius = max(3, int(self._zoom * 0.45))
+            for x, y, _kind in self._problems:
+                cx = self._pan.x() + int((x + 0.5) * self._zoom)
+                cy = self._pan.y() + int((y + 0.5) * self._zoom)
+                painter.drawEllipse(QPoint(cx, cy), radius, radius)
 
 
 class _SegCanvas(QWidget):

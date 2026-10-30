@@ -42,6 +42,11 @@ def test_main_window_smoke(qapp: QApplication, fixtures: dict[str, Path]) -> Non
     qapp.processEvents()
     assert window._loaded is not None
     assert window.preview_tabs.count() == 5
+    from vectorizer.gui.i18n import t
+
+    assert window.preview_tabs.tabText(3) == t("Compare")
+    assert window._preview_stack.currentWidget() is window.preview_tabs
+    assert window.panel.vectorize_btn.isEnabled()
     assert window.seg_editor.has_map()
     assert window.undo_act is not None
     assert not window.undo_act.isEnabled()
@@ -56,6 +61,10 @@ def test_empty_canvas_accepts_file_drop(qapp: QApplication) -> None:
     window = MainWindow()
     assert window._loaded is None
     assert window.original_canvas.file_drop_enabled()
+    assert window._preview_stack.currentWidget() is window.welcome
+    assert not window.panel.vectorize_btn.isEnabled()
+    assert not window.vec_act.isEnabled()
+    assert not window.export_svg_act.isEnabled()
     window.close()
 
 
@@ -99,6 +108,7 @@ def test_session_undo_after_apply_result(qapp: QApplication, fixtures: dict[str,
     qapp.processEvents()
     assert window.current_result() is not None
     assert window.undo_act.isEnabled()
+    assert window.export_svg_act.isEnabled()
     window.undo()
     qapp.processEvents()
     assert window.current_result() is None
@@ -109,6 +119,29 @@ def test_session_undo_after_apply_result(qapp: QApplication, fixtures: dict[str,
     window.close()
 
 
+
+
+def test_view_menu_appearance_override(qapp: QApplication, monkeypatch: pytest.MonkeyPatch) -> None:
+    from vectorizer.gui import theme as theme_mod
+
+    saved: list[str] = []
+    monkeypatch.setattr(theme_mod, "appearance_mode", lambda: "system")
+    monkeypatch.setattr(theme_mod, "set_appearance_mode", lambda mode: saved.append(mode) or mode)
+    monkeypatch.setattr(theme_mod, "apply_appearance", lambda _app: saved.append("apply"))
+
+    window = MainWindow()
+    assert window._appearance_actions["system"].isChecked()
+    assert window._appearance_actions["system"].text() == "&System setting"
+    assert window._appearance_actions["light"].text() == "&Light mode"
+    assert window._appearance_actions["dark"].text() == "&Dark mode"
+    assert not window._appearance_actions["light"].isChecked()
+
+    window._appearance_actions["dark"].trigger()
+    qapp.processEvents()
+    assert saved == ["dark", "apply"]
+    assert window._appearance_actions["dark"].isChecked()
+    assert not window._appearance_actions["system"].isChecked()
+    window.close()
 
 
 def test_vector_canvas_renders_real_svg(qapp: QApplication, fixtures: dict[str, Path]) -> None:
