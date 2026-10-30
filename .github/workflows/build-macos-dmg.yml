@@ -1,0 +1,55 @@
+name: Build macOS DMG
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  dmg:
+    name: Build DMG (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            arch: arm64
+          - os: macos-13
+            arch: x86_64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install create-dmg
+        run: brew install create-dmg
+
+      - name: Build DMG
+        run: |
+          chmod +x scripts/build-macos-dmg.sh scripts/make-icns.py
+          ./scripts/build-macos-dmg.sh
+
+      - name: Rename artifact with architecture
+        run: |
+          VERSION="$(sed -n 's/^__version__ = "\(.*\)"/\1/p' src/vectorizer/__init__.py)"
+          SRC="dist/Vectorizer-${VERSION}-macos.dmg"
+          DST="dist/Vectorizer-${VERSION}-macos-${{ matrix.arch }}.dmg"
+          mv "${SRC}" "${DST}"
+          ls -lh "${DST}"
+
+      - name: Upload DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: Vectorizer-macos-${{ matrix.arch }}
+          path: dist/Vectorizer-*-macos-${{ matrix.arch }}.dmg
+          if-no-files-found: error

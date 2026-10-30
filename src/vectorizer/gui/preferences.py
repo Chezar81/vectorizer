@@ -1,14 +1,20 @@
-"""App-level preferences persisted via QSettings (not per-image tracing params)."""
+"""App-level preferences persisted via QSettings (not per-image tracing params).
+
+A preferences file is a portable JSON snapshot of those same fields. It does not
+include window geometry, theme, language, or recent files.
+"""
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, replace
+import json
+from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QSettings, QStandardPaths, Signal
 
 from vectorizer.batch.engine import CollisionPolicy, ExportFormat
 from vectorizer.domain.settings import AutomaticQuality, WorkflowMode
+from vectorizer.errors import VectorizerError
 from vectorizer.gui.session_history import DEFAULT_MAX_STEPS as SESSION_DEFAULT_STEPS
 from vectorizer.segmentation.history import (
     DEFAULT_MAX_BYTES as SEG_DEFAULT_BYTES,
@@ -21,6 +27,13 @@ APP = "Vectorizer"
 # Keys intentionally wiped by "Reset all preferences".
 # Geometry / dark / language / recent stay unless reset_all clears them too.
 PREF_PREFIX = "prefs/"
+
+PREFERENCES_FILE_SCHEMA = 1
+PREFERENCES_FILE_KIND = "vectorizer-preferences"
+
+
+class PreferencesFileError(VectorizerError):
+    """Preferences file load or save failed."""
 
 
 @dataclass
@@ -272,21 +285,26 @@ def update_preferences(**kwargs: object) -> AppPreferences:
     return save_preferences(replace(current_preferences(), **kwargs))
 
 
+def clear_ui_chrome() -> None:
+    """Remove theme, geometry, and recent-file keys. Language stays."""
+    store = _store()
+    for key in list(store.allKeys()):
+        if key.startswith("ui/") or key.startswith("recent/"):
+            if key == "ui/language":
+                continue
+            store.remove(key)
+    store.sync()
+
+
 def reset_all_preferences(*, include_ui: bool = True) -> AppPreferences:
     """Clear preference keys (and optionally UI chrome keys) then restore defaults."""
     store = _store()
     for key in list(store.allKeys()):
         if key.startswith(PREF_PREFIX):
             store.remove(key)
-        elif include_ui and (
-            key.startswith("ui/")
-            or key.startswith("recent/")
-        ):
-            # Keep language so the reset confirmation stays readable; wipe the rest.
-            if key == "ui/language":
-                continue
-            store.remove(key)
     store.sync()
+    if include_ui:
+        clear_ui_chrome()
     return load_preferences()
 
 
@@ -303,3 +321,73 @@ def preferences_as_dict(prefs: AppPreferences | None = None) -> dict[str, object
     data["automatic_quality"] = prefs.automatic_quality.value
     data["batch_collision"] = prefs.batch_collision.value
     return data
+
+
+def preferences_document(prefs: AppPreferences | None = None) -> dict[str, object]:
+    """JSON-ready snapshot of app preferences."""
+    return {
+        "schema": PREFERENCES_FILE_SCHEMA,
+        "kind": PREFERENCES_FILE_KIND,
+        "preferences": preferences_as_dict(prefs),
+    }
+
+
+def preferences_from_document(data: object) -> AppPreferences:
+    """Parse a preferences document without writing it to QSettings."""
+    if not isinstance(data, dict):
+        raise PreferencesFileError("Preferences file root must be a JSON object.")
+    try:
+        schema = int(data.get("schema", PREFERENCES_FILE_SCHEMA))
+    except (TypeError, ValueError) as exc:
+        raise PreferencesFileError(f"Unsupported preferences schema {data.get('schema')}.") from exc
+    if schema != PREFERENCES_FILE_SCHEMA:
+        raise PreferencesFileError(f"Unsupported preferences schema {schema}.")
+    if data.get("kind") != PREFERENCES_FILE_KIND:
+        raise PreferencesFileError("This file is not a Vectorizer preferences file.")
+    raw = data.get("preferences")
+    if not isinstance(raw, dict):
+        raise PreferencesFileError("Preferences file is missing a preferences object.")
+    known = {item.name for item in fields(AppPreferences)}
+    kwargs = {key: value for key, value in raw.items() if key in known}
+    try:
+        return AppPreferences(**kwargs).validated()
+    except (TypeError, ValueError) as exc:
+        raise PreferencesFileError(f"Invalid preferences: {exc}") from exc
+
+
+def write_preferences_file(path: Path, prefs: AppPreferences | None = None) -> Path:
+    """Write the current (or given) preferences to a JSON file."""
+    path = Path(path)
+    payload = json.dumps(preferences_document(prefs), indent=2, ensure_ascii=False) + "\n"
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(payload, encoding="utf-8")
+        tmp.replace(path)
+    except OSError as exc:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        raise PreferencesFileError(f"Could not save preferences: {exc}") from exc
+    return path
+
+
+def parse_preferences_file(path: Path) -> AppPreferences:
+    """Read a preferences file without changing the active preferences."""
+    path = Path(path)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise PreferencesFileError(f"Could not read preferences file: {exc}") from exc
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise PreferencesFileError(f"Preferences file is corrupt: {exc}") from exc
+    return preferences_from_document(data)
+
+
+def read_preferences_file(path: Path) -> AppPreferences:
+    """Load a preferences file, persist it, and activate it."""
+    return save_preferences(parse_preferences_file(path))

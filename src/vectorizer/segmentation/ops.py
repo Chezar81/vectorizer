@@ -160,3 +160,113 @@ def separate_with_stroke(
 
 def pick_color(map_: SegmentationMap, x: int, y: int) -> Color:
     return map_.pixel(x, y)
+
+
+def zap_fringes(map_: SegmentationMap, *, max_pixels: int = 48) -> SegmentationMap:
+    """Split thin leftover regions and merge each pixel into a neighboring color.
+
+    Anti-aliased fringe is a small component sitting between two real colors.
+    Deleting it would punch a hole. Zap assigns every pixel to the neighboring
+    color that already surrounds it.
+    """
+    result = map_.copy()
+    width, height = result.size
+    pixels = result.image.load()
+    assert pixels is not None
+    visited = bytearray(width * height)
+    for y in range(height):
+        for x in range(width):
+            idx = y * width + x
+            if visited[idx]:
+                continue
+            color = pixels[x, y]
+            if color[3] == 0:
+                visited[idx] = 1
+                continue
+            stack = [idx]
+            visited[idx] = 1
+            component: list[int] = []
+            while stack:
+                ci = stack.pop()
+                component.append(ci)
+                cx = ci % width
+                cy = ci // width
+                for nx, ny in ((cx - 1, cy), (cx + 1, cy), (cx, cy - 1), (cx, cy + 1)):
+                    if not (0 <= nx < width and 0 <= ny < height):
+                        continue
+                    ni = ny * width + nx
+                    if visited[ni] or pixels[nx, ny] != color:
+                        continue
+                    visited[ni] = 1
+                    stack.append(ni)
+            if len(component) > max_pixels or not _is_fringe(pixels, component, width, height):
+                continue
+            for ci in component:
+                cx = ci % width
+                cy = ci // width
+                pixels[cx, cy] = _neighbor_color(pixels, cx, cy, width, height, avoid=color)
+    return result
+
+
+def find_problems(map_: SegmentationMap) -> list[tuple[int, int, str]]:
+    """Mark one-pixel pinches and one-pixel gaps between the same color."""
+    width, height = map_.size
+    pixels = map_.image.load()
+    assert pixels is not None
+    found: list[tuple[int, int, str]] = []
+    for y in range(1, height - 1):
+        for x in range(1, width - 1):
+            color = pixels[x, y]
+            if color[3] == 0:
+                left = pixels[x - 1, y]
+                right = pixels[x + 1, y]
+                up = pixels[x, y - 1]
+                down = pixels[x, y + 1]
+                if left[3] and left == right and left != color:
+                    found.append((x, y, "gap"))
+                elif up[3] and up == down and up != color:
+                    found.append((x, y, "gap"))
+                continue
+            horizontal = pixels[x - 1, y] != color and pixels[x + 1, y] != color
+            vertical = pixels[x, y - 1] == color and pixels[x, y + 1] == color
+            if horizontal and vertical:
+                found.append((x, y, "pinch"))
+                continue
+            vertical_cut = pixels[x, y - 1] != color and pixels[x, y + 1] != color
+            horizontal_run = pixels[x - 1, y] == color and pixels[x + 1, y] == color
+            if vertical_cut and horizontal_run:
+                found.append((x, y, "pinch"))
+    return found
+
+
+def _is_fringe(pixels, component: list[int], width: int, height: int) -> bool:
+    if len(component) <= 12:
+        return True
+    # Thin: most pixels have a neighbor of a different color.
+    touched = 0
+    for ci in component:
+        cx = ci % width
+        cy = ci // width
+        color = pixels[cx, cy]
+        for nx, ny in ((cx - 1, cy), (cx + 1, cy), (cx, cy - 1), (cx, cy + 1)):
+            if 0 <= nx < width and 0 <= ny < height and pixels[nx, ny] != color:
+                touched += 1
+                break
+    return touched >= max(1, int(len(component) * 0.65))
+
+
+def _neighbor_color(pixels, x: int, y: int, width: int, height: int, *, avoid: Color) -> Color:
+    counts: dict[Color, int] = {}
+    for ny in range(y - 1, y + 2):
+        for nx in range(x - 1, x + 2):
+            if nx == x and ny == y:
+                continue
+            if not (0 <= nx < width and 0 <= ny < height):
+                continue
+            color = pixels[nx, ny]
+            if color == avoid or color[3] == 0:
+                continue
+            counts[color] = counts.get(color, 0) + 1
+    if not counts:
+        return (avoid[0], avoid[1], avoid[2], 0)
+    return max(counts.items(), key=lambda item: item[1])[0]

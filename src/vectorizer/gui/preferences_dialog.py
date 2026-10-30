@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -26,8 +28,15 @@ from PySide6.QtWidgets import (
 from vectorizer.batch.engine import CollisionPolicy
 from vectorizer.domain.settings import AutomaticQuality, WorkflowMode
 from vectorizer.export.tools import find_inkscape
-from vectorizer.gui.i18n import t
-from vectorizer.gui.preferences import AppPreferences, current_preferences, save_preferences
+from vectorizer.gui.i18n import preferences_file_filter, t, tf
+from vectorizer.gui.preferences import (
+    AppPreferences,
+    PreferencesFileError,
+    current_preferences,
+    parse_preferences_file,
+    save_preferences,
+    write_preferences_file,
+)
 from vectorizer.presets import list_presets
 
 
@@ -214,11 +223,32 @@ class PreferencesDialog(QDialog):
         hist_form.addRow(self._seg_mib_label, self.seg_mib)
         self._history_box = history
 
-        buttons = QDialogButtonBox(
+        self.save_file_btn = QPushButton()
+        self.load_file_btn = QPushButton()
+        self.reset_btn = QPushButton()
+        self.save_file_btn.clicked.connect(self._save_to_file)
+        self.load_file_btn.clicked.connect(self._load_from_file)
+        self.reset_btn.clicked.connect(self._reset_to_defaults)
+        self._file_status = QLabel()
+        self._file_status.setWordWrap(False)
+        self._file_status.setAlignment(
+            Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft
+        )
+        self._file_status.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
+        )
+        self._file_status.hide()
+        self.chrome_reset_requested = False
+
+        self._buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
-        buttons.accepted.connect(self._accept)
-        buttons.rejected.connect(self.reject)
+        self._buttons.accepted.connect(self._accept)
+        self._buttons.rejected.connect(self.reject)
+        self._buttons.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
+        for button in (self.save_file_btn, self.load_file_btn, self.reset_btn):
+            button.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
+        self._loading_form = False
 
         left = QVBoxLayout()
         left.setSpacing(12)
@@ -238,16 +268,31 @@ class PreferencesDialog(QDialog):
         columns.addLayout(left, 3)
         columns.addLayout(right, 2)
 
+        button_bar = QHBoxLayout()
+        button_bar.setContentsMargins(0, 0, 0, 0)
+        box_layout = self._buttons.layout()
+        if box_layout is not None:
+            box_layout.setContentsMargins(0, 0, 0, 0)
+            spacing = box_layout.spacing()
+            button_bar.setSpacing(spacing if spacing >= 0 else 8)
+        button_bar.addWidget(self.save_file_btn)
+        button_bar.addWidget(self.load_file_btn)
+        button_bar.addWidget(self.reset_btn)
+        button_bar.addWidget(self._file_status, 1)
+        button_bar.addStretch(1)
+        button_bar.addWidget(self._buttons)
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(14, 14, 14, 14)
         layout.setSpacing(12)
         layout.addLayout(columns, 1)
         layout.addWidget(tools)
-        layout.addWidget(buttons)
+        layout.addLayout(button_bar)
 
         self._load_values(prefs)
         self.retranslate_ui()
         self._refresh_inkscape_status()
+        self._watch_form_edits()
         self.inkscape_path.textChanged.connect(lambda _t: self._refresh_inkscape_status())
         # Prefer content size, with a roomy floor so labels and spinboxes are not clipped.
         hint = self.sizeHint()
@@ -255,6 +300,9 @@ class PreferencesDialog(QDialog):
 
     def retranslate_ui(self) -> None:
         self.setWindowTitle(t("Preferences"))
+        self.save_file_btn.setText(t("&Save to file"))
+        self.load_file_btn.setText(t("&Load from file"))
+        self.reset_btn.setText(t("&Reset Preferences"))
         self._defaults_box.setTitle(t("Defaults"))
         self._workflow_label.setText(t("Default mode"))
         self._quality_label.setText(t("Default Automatic quality"))
@@ -334,6 +382,13 @@ class PreferencesDialog(QDialog):
         self._seg_mib_label.setText(t("Segmentation undo memory"))
 
     def _load_values(self, prefs: AppPreferences) -> None:
+        self._loading_form = True
+        try:
+            self._apply_values(prefs)
+        finally:
+            self._loading_form = False
+
+    def _apply_values(self, prefs: AppPreferences) -> None:
         self._select_data(self.workflow, prefs.workflow)
         self._select_data(self.auto_quality, prefs.automatic_quality)
         self.export_dir.setText(prefs.export_dir)
@@ -348,6 +403,9 @@ class PreferencesDialog(QDialog):
         self.batch_output.setText(prefs.batch_output_dir)
         self.confirm_overwrite.setChecked(prefs.confirm_overwrite)
         idx = self.last_preset.findData(prefs.last_preset)
+        if prefs.last_preset and idx < 0:
+            self.last_preset.addItem(prefs.last_preset, prefs.last_preset)
+            idx = self.last_preset.count() - 1
         self.last_preset.setCurrentIndex(idx if idx >= 0 else 0)
         self.inkscape_path.setText(prefs.inkscape_path)
         self.png_width.setValue(prefs.png_width)
@@ -361,7 +419,7 @@ class PreferencesDialog(QDialog):
         self.seg_steps.setValue(prefs.segmentation_history_steps)
         self.seg_mib.setValue(prefs.segmentation_history_mib)
 
-    def _accept(self) -> None:
+    def _form_preferences(self) -> AppPreferences | None:
         if not (
             self.fmt_svg.isChecked()
             or self.fmt_pdf.isChecked()
@@ -374,8 +432,8 @@ class PreferencesDialog(QDialog):
                 t("Preferences"),
                 t("Select at least one default export format."),
             )
-            return
-        prefs = AppPreferences(
+            return None
+        return AppPreferences(
             workflow=self.workflow.currentData(),
             automatic_quality=self.auto_quality.currentData(),
             export_dir=self.export_dir.text().strip(),
@@ -397,9 +455,137 @@ class PreferencesDialog(QDialog):
             session_history_steps=self.session_steps.value(),
             segmentation_history_steps=self.seg_steps.value(),
             segmentation_history_mib=self.seg_mib.value(),
-        )
+        ).validated()
+
+    def _accept(self) -> None:
+        prefs = self._form_preferences()
+        if prefs is None:
+            return
         save_preferences(prefs)
         self.accept()
+
+    def _save_to_file(self) -> None:
+        prefs = self._form_preferences()
+        if prefs is None:
+            return
+        start = self._file_dialog_dir() / "vectorizer-preferences.json"
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            t("Save preferences"),
+            str(start),
+            preferences_file_filter(),
+        )
+        if not path:
+            return
+        dest = Path(path)
+        if dest.suffix.lower() != ".json":
+            dest = dest.with_suffix(".json")
+        if dest.exists() and self.confirm_overwrite.isChecked():
+            answer = QMessageBox.question(
+                self,
+                t("Overwrite file?"),
+                tf("{name} already exists. Replace it?", name=dest.name),
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        try:
+            write_preferences_file(dest, prefs)
+        except PreferencesFileError as exc:
+            QMessageBox.warning(self, t("Preferences"), str(exc))
+            return
+        self._set_file_status(tf("Saved preferences {path}", path=dest))
+
+    def _load_from_file(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            t("Load preferences"),
+            str(self._file_dialog_dir()),
+            preferences_file_filter(),
+        )
+        if not path:
+            return
+        try:
+            prefs = parse_preferences_file(Path(path))
+        except PreferencesFileError as exc:
+            QMessageBox.warning(self, t("Preferences"), str(exc))
+            return
+        self.chrome_reset_requested = False
+        self._load_values(prefs)
+        self._refresh_inkscape_status()
+        self._set_file_status(
+            tf("Loaded {path}. Press OK to apply these values.", path=path)
+        )
+
+    def _reset_to_defaults(self) -> None:
+        answer = QMessageBox.question(
+            self,
+            t("Reset all preferences?"),
+            t(
+                "Reset these preferences to their defaults? Theme and recent files are "
+                "cleared when you press OK. Language is kept."
+            ),
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self._load_values(AppPreferences())
+        self._refresh_inkscape_status()
+        self.chrome_reset_requested = True
+        self._set_file_status(t("Defaults shown. Press OK to apply them."))
+
+    def _file_dialog_dir(self) -> Path:
+        text = self.export_dir.text().strip()
+        if text:
+            candidate = Path(text).expanduser()
+            if candidate.is_dir():
+                return candidate
+            if candidate.parent.is_dir():
+                return candidate.parent
+        return current_preferences().resolved_export_dir()
+
+    def _set_file_status(self, text: str) -> None:
+        self._file_status.setText(text)
+        self._file_status.setToolTip(text)
+        self._file_status.setVisible(bool(text))
+
+    def _watch_form_edits(self) -> None:
+        for combo in (
+            self.workflow,
+            self.auto_quality,
+            self.last_preset,
+            self.batch_collision,
+            self.png_bg,
+        ):
+            combo.currentIndexChanged.connect(self._on_form_edited)
+        for box in (
+            self.fmt_svg,
+            self.fmt_pdf,
+            self.fmt_png,
+            self.fmt_dxf,
+            self.fmt_eps,
+            self.batch_continue,
+            self.confirm_overwrite,
+        ):
+            box.toggled.connect(self._on_form_edited)
+        for edit in (
+            self.export_dir,
+            self.batch_input,
+            self.batch_output,
+            self.inkscape_path,
+        ):
+            edit.textChanged.connect(self._on_form_edited)
+        for spin in (
+            self.png_width,
+            self.png_height,
+            self.session_steps,
+            self.seg_steps,
+            self.seg_mib,
+        ):
+            spin.valueChanged.connect(self._on_form_edited)
+
+    def _on_form_edited(self, *_args: object) -> None:
+        if self._loading_form:
+            return
+        self._set_file_status("")
 
     def _browse_export_dir(self) -> None:
         path = QFileDialog.getExistingDirectory(

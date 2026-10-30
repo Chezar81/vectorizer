@@ -5,13 +5,13 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QSettings, Qt
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication
 
 from vectorizer.gui.i18n import load_language
 from vectorizer.gui.main_window import MainWindow, _load_app_icon
 from vectorizer.gui.preferences import load_preferences
-from vectorizer.gui.theme import apply_theme
+from vectorizer.gui.theme import apply_appearance, watch_system_theme
 
 
 def run_app(argv: list[str] | None = None, *, initial_image: Path | None = None) -> int:
@@ -31,11 +31,10 @@ def run_app(argv: list[str] | None = None, *, initial_image: Path | None = None)
     icon = _load_app_icon()
     if not icon.isNull():
         app.setWindowIcon(icon)
-    store = QSettings("Vectorizer", "Vectorizer")
     load_language()
     load_preferences()
-    dark = bool(store.value("ui/dark", False, type=bool))
-    apply_theme(app, dark)
+    apply_appearance(app)
+    watch_system_theme(app)
     window = MainWindow()
     window.show()
     if initial_image is not None:

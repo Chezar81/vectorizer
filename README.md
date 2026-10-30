@@ -1,8 +1,9 @@
 # Vectorizer
 
-Independent, offline raster-to-vector desktop application for Linux Mint.
-It imports a bitmap, traces it into editable SVG paths, lets you inspect and
-correct segmentation, and exports SVG / PDF / PNG / DXF (plus optional EPS).
+Independent, offline raster-to-vector desktop application (primary target:
+Linux Mint; macOS via DMG). It imports a bitmap, traces it into editable SVG
+paths, lets you inspect and correct segmentation, and exports SVG / PDF / PNG /
+DXF (plus optional EPS).
 
 **Author:** Christoph Rupprich.
 
@@ -89,7 +90,11 @@ QT_QPA_PLATFORM=offscreen python -m pytest
 
 ## Packaging
 
-See `docs/PACKAGING.md`. AppImage is **not** claimed ready.
+See `docs/PACKAGING.md`.
+
+- **Linux:** user launcher / wheel — ready. AppImage is **not** claimed ready.
+- **macOS:** `./scripts/build-macos-dmg.sh` on a Mac, or the **Build macOS DMG**
+  GitHub Action. Drag the app from the DMG into Applications.
 
 ## License
 

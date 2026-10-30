@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 from vectorizer import __version__
@@ -21,13 +22,20 @@ from vectorizer.domain.settings import (
     TraceSettings,
 )
 from vectorizer.export.svg import export_svg
-from vectorizer.jobs.runner import run_trace_sync
+from vectorizer.jobs.runner import TRACE_WORKER_FLAG, run_trace_sync
 from vectorizer.presets import load_preset
 from vectorizer.raster.analyzer import analyze_image
 from vectorizer.raster.loader import load_image
 
 
 def main(argv: list[str] | None = None) -> int:
+    raw = list(sys.argv[1:] if argv is None else argv)
+    # Frozen macOS/Windows builds re-invoke the bundled binary as the worker.
+    if raw and raw[0] == TRACE_WORKER_FLAG:
+        from vectorizer.jobs.trace_worker import main as worker_main
+
+        return worker_main(raw[1:])
+
     parser = argparse.ArgumentParser(
         prog="vectorizer",
         description="Offline raster-to-vector conversion. GUI is the default; "
@@ -60,7 +68,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--settings-json", help="Path to TraceSettings JSON")
     parser.add_argument("--stop-on-error", action="store_true")
     parser.add_argument("--version", action="store_true")
-    args = parser.parse_args(argv)
+    args = parser.parse_args(raw)
 
     if args.version:
         print(__version__)

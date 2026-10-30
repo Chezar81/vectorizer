@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "vectorizer"
 version = "0.4.0"
-description = "Offline Linux desktop application for raster-to-vector conversion"
+description = "Offline desktop application for raster-to-vector conversion"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
@@ -14,11 +14,14 @@ keywords = ["vectorization", "svg", "desktop", "qt"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
     "Environment :: X11 Applications :: Qt",
+    "Environment :: MacOS X",
     "License :: OSI Approved :: MIT License",
     "Topic :: Multimedia :: Graphics :: Graphics Conversion",
 ]
 dependencies = [
+    "numpy>=1.26,<3",
     "Pillow>=10.4,<14",
     "PySide6-Essentials>=6.7,<6.13",
     "vtracer==0.6.15",
@@ -27,6 +30,10 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8",
+]
+packaging = [
+    "pyinstaller>=6.10,<8",
+    "Pillow>=10.4,<14",
 ]
 
 [project.scripts]
