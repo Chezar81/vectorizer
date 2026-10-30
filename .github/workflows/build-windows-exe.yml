@@ -1,0 +1,59 @@
+name: Build Windows EXE
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - packaging/macos-dmg
+      - packaging/windows-exe
+    paths:
+      - "packaging/windows/**"
+      - "scripts/build-windows-exe.ps1"
+      - "scripts/make-ico.py"
+      - ".github/workflows/build-windows-exe.yml"
+      - "src/**"
+      - "pyproject.toml"
+
+permissions:
+  contents: read
+
+jobs:
+  exe:
+    name: Build Windows x64
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build EXE zip
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = "Stop"
+          python -m venv .venv
+          .\.venv\Scripts\python.exe -m pip install --upgrade pip
+          .\.venv\Scripts\python.exe -m pip install -e ".[dev,packaging]"
+          .\.venv\Scripts\python.exe scripts\make-ico.py
+          $version = (Select-String -Path src\vectorizer\__init__.py -Pattern '__version__ = "([^"]+)"').Matches[0].Groups[1].Value
+          .\.venv\Scripts\python.exe -m PyInstaller --noconfirm --clean --distpath dist --workpath build packaging\windows\vectorizer.spec
+          if (-not (Test-Path "dist\Vectorizer\Vectorizer.exe")) {
+            throw "Vectorizer.exe was not produced"
+          }
+          $zip = "dist\Vectorizer-$version-windows-x64.zip"
+          if (Test-Path $zip) { Remove-Item $zip -Force }
+          Compress-Archive -Path "dist\Vectorizer" -DestinationPath $zip -Force
+          Get-Item $zip | Format-List FullName, Length
+          "VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Vectorizer-windows-x64
+          path: dist/Vectorizer-*-windows-x64.zip
+          if-no-files-found: error

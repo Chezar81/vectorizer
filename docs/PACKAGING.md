@@ -45,6 +45,19 @@ Install the resulting `dist/vectorizer-*.whl` into a venv with `pip install`.
 
 DXF export is native and does **not** require Inkscape.
 
+## Windows EXE
+
+Self-contained `Vectorizer.exe` (PyInstaller onedir, shipped as a zip). **Must be
+built on Windows.**
+
+```powershell
+.\scripts\build-windows-exe.ps1
+```
+
+Output: `dist/Vectorizer-<version>-windows-x64.zip` (contains `Vectorizer\Vectorizer.exe`).
+
+Or run the **Build Windows EXE** GitHub Action and download the artifact.
+
 ## Linux .deb
 
 Self-contained amd64 package (PyInstaller onedir under `/opt/vectorizer`):

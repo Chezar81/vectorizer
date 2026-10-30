@@ -9,6 +9,8 @@ dist/
 build/
 *.dmg
 packaging/macos/Vectorizer.icns
+packaging/windows/Vectorizer.ico
+*.exe
 .benchmarks/
 benchmark_results/
 tests/fixtures/*.png
