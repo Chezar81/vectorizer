@@ -3,6 +3,8 @@ name: Build macOS DMG
 on:
   workflow_dispatch:
   push:
+    branches:
+      - packaging/macos-dmg
     tags:
       - "v*"
 
