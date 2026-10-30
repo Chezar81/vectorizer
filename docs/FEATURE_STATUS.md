@@ -40,6 +40,7 @@ comparison views, presets, PDF/PNG, segmentation editor, `.vproj` projects are
 | SVG stroke and fill | implemented | Optional same-color hairline so viewers do not draw gaps between shapes |
 | User packaging (venv, wheel, `.desktop`) | implemented | `scripts/install-user.sh`, `build-wheel.sh` |
 | macOS DMG | partial | Spec + `build-macos-dmg.sh` + GitHub Action; must build on macOS; unsigned |
+| Linux .deb | partial | `build-linux-deb.sh` (PyInstaller → `/opt/vectorizer`); GitHub Release asset |
 | AppImage | planned | Not claimed ready until built+launched on Mint |
 | Native Adobe `.ai` | unsupported | Will not rename SVG/PDF to `.ai` |
 | GPU / cloud | unsupported | Offline CPU-only |

@@ -45,6 +45,25 @@ Install the resulting `dist/vectorizer-*.whl` into a venv with `pip install`.
 
 DXF export is native and does **not** require Inkscape.
 
+## Linux .deb
+
+Self-contained amd64 package (PyInstaller onedir under `/opt/vectorizer`):
+
+```bash
+./scripts/build-linux-deb.sh
+```
+
+Output: `dist/vectorizer_<version>_amd64.deb`
+
+```bash
+sudo apt install ./dist/vectorizer_<version>_amd64.deb
+# remove later:
+sudo apt remove vectorizer
+```
+
+Requires `dpkg-deb` (Debian / Ubuntu / Mint). Depends on `libxcb-cursor0` for Qt on
+X11. Inkscape remains optional for EPS only.
+
 ## macOS DMG
 
 A self-contained `.app` + installer DMG is built with PyInstaller. **This must run

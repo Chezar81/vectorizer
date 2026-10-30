@@ -92,9 +92,11 @@ QT_QPA_PLATFORM=offscreen python -m pytest
 
 See `docs/PACKAGING.md`.
 
-- **Linux:** user launcher / wheel — ready. AppImage is **not** claimed ready.
+- **Linux:** user launcher / wheel — ready. `.deb` via `./scripts/build-linux-deb.sh`.
+  AppImage is **not** claimed ready.
 - **macOS:** `./scripts/build-macos-dmg.sh` on a Mac, or the **Build macOS DMG**
   GitHub Action. Drag the app from the DMG into Applications.
+- **GitHub Releases:** macOS `.dmg` and Linux `.deb` attach to version tags.
 
 ## License
 
