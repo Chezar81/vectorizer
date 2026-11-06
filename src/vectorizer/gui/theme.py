@@ -271,20 +271,25 @@ def mint_stylesheet(colors: ThemeColors) -> str:
         padding: 6px 8px;
     }}
     QToolButton {{
-        background: transparent;
-        border: 1px solid transparent;
+        background-color: {base};
+        border: 1px solid {border};
         border-radius: 6px;
         padding: 5px 10px;
         color: {text};
     }}
     QToolButton:hover {{
         background: {panel};
-        border-color: {border};
+        border-color: {accent_hover};
     }}
     QToolButton:pressed, QToolButton:checked {{
         background: {accent};
         color: {on_accent};
         border-color: {accent_pressed};
+    }}
+    QToolButton:disabled {{
+        color: {muted};
+        background: {panel};
+        border-color: {border_soft};
     }}
     QToolButton#primaryTool {{
         background-color: {accent};
@@ -304,7 +309,8 @@ def mint_stylesheet(colors: ThemeColors) -> str:
     QToolButton#primaryTool:disabled {{
         background: {panel};
         color: {muted};
-        border-color: {border};
+        border-color: {border_soft};
+        font-weight: 600;
     }}
     QStatusBar {{
         background-color: {bg};
@@ -449,14 +455,16 @@ def mint_stylesheet(colors: ThemeColors) -> str:
         border-radius: 5px;
     }}
     QScrollBar:vertical {{
-        background: {bg};
+        background: {panel};
         width: 12px;
         margin: 0;
+        border: none;
     }}
     QScrollBar::handle:vertical {{
         background: {border};
         border-radius: 5px;
-        min-height: 24px;
+        min-height: 28px;
+        margin: 2px;
     }}
     QScrollBar::handle:vertical:hover {{
         background: {accent};
@@ -465,6 +473,38 @@ def mint_stylesheet(colors: ThemeColors) -> str:
     QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{
         background: none;
         height: 0;
+        border: none;
+    }}
+    QScrollBar:horizontal {{
+        background: {panel};
+        height: 12px;
+        margin: 0;
+        border: none;
+    }}
+    QScrollBar::handle:horizontal {{
+        background: {border};
+        border-radius: 5px;
+        min-width: 28px;
+        margin: 2px;
+    }}
+    QScrollBar::handle:horizontal:hover {{
+        background: {accent};
+    }}
+    QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal,
+    QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {{
+        background: none;
+        width: 0;
+        border: none;
+    }}
+    QGraphicsView {{
+        background: {base};
+        border: none;
+    }}
+    QGraphicsView QScrollBar:horizontal {{
+        height: 12px;
+    }}
+    QGraphicsView QScrollBar:vertical {{
+        width: 12px;
     }}
     QSplitter::handle {{
         background: {border};
@@ -536,6 +576,45 @@ def mint_stylesheet(colors: ThemeColors) -> str:
         padding: 8px 14px;
         font-weight: 600;
     }}
+    QWidget#traceProgressOverlay {{
+        background-color: rgba(20, 22, 28, 170);
+    }}
+    QFrame#traceProgressCard {{
+        background: {base};
+        border: 1px solid {border};
+        border-radius: 16px;
+        min-width: 320px;
+        max-width: 440px;
+    }}
+    QLabel#traceProgressTitle {{
+        font-size: 18px;
+        font-weight: 600;
+        background: transparent;
+        color: {text};
+    }}
+    QLabel#traceProgressStage {{
+        font-size: 13px;
+        background: transparent;
+        color: {text};
+    }}
+    QLabel#traceProgressEta, QLabel#traceProgressHint {{
+        font-size: 12px;
+        background: transparent;
+        color: {muted};
+    }}
+    QProgressBar#traceProgressBar {{
+        min-height: 18px;
+        max-height: 18px;
+        border: 1px solid {border};
+        border-radius: 9px;
+        background: {panel};
+        text-align: center;
+        color: {text};
+    }}
+    QProgressBar#traceProgressBar::chunk {{
+        background-color: {accent};
+        border-radius: 8px;
+    }}
     QFrame#welcomeCard {{
         background: {base};
         border: 1px solid {border};
@@ -580,6 +659,12 @@ def mint_stylesheet(colors: ThemeColors) -> str:
     QFrame#segTools QToolButton {{
         padding: 6px 12px;
         border-radius: 6px;
+        background-color: {base};
+        border: 1px solid {border};
+    }}
+    QFrame#segTools QToolButton:hover {{
+        background: {panel};
+        border-color: {accent_hover};
     }}
     QFrame#segTools QToolButton:checked {{
         background: {accent};
@@ -587,9 +672,10 @@ def mint_stylesheet(colors: ThemeColors) -> str:
         border-color: {accent};
         font-weight: 600;
     }}
-    QGraphicsView {{
-        background: {base};
-        border: none;
+    QFrame#segTools QToolButton:disabled {{
+        color: {muted};
+        background: {panel};
+        border-color: {border_soft};
     }}
     """
 

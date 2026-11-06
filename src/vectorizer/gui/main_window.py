@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import replace
 from pathlib import Path
 
-from PySide6.QtCore import QByteArray, QEvent, QSettings, QSize, Qt
+from PySide6.QtCore import QByteArray, QEvent, QSettings, QSize, Qt, QTimer
 from PySide6.QtGui import (
     QAction,
     QActionGroup,
@@ -79,6 +79,7 @@ from vectorizer.gui.qtutil import pil_to_qpixmap, qimage_to_png_bytes
 from vectorizer.gui.seg_editor import SegmentationEditor
 from vectorizer.gui.session_history import SessionHistory, SessionSnapshot
 from vectorizer.gui.settings_panel import SettingsPanel
+from vectorizer.gui.trace_progress import TraceProgressOverlay
 from vectorizer.gui.welcome import WelcomeView
 from vectorizer.jobs.runner import TraceJobRunner
 from vectorizer.project.io import ProjectData, load_project, save_project
@@ -99,6 +100,8 @@ SIDEBAR_WIDTH = 420
 GOLDEN_RATIO = (1.0 + 5.0**0.5) / 2.0
 SCREEN_MARGIN = 24
 MIN_CANVAS_WIDTH = 480
+_TIMING_ELAPSED_KEY = "timing/last_elapsed_seconds"
+_TIMING_MEGAPIXELS_KEY = "timing/last_megapixels"
 
 
 def _load_app_icon() -> QIcon:
@@ -139,6 +142,8 @@ class MainWindow(QMainWindow):
         self._history = SessionHistory(max_steps=prefs.session_history_steps)
         self._export_dir = prefs.resolved_export_dir()
         self._persist_sidebar = False
+        self._last_content_kind: str | None = None
+        self._pending_seg_rebuild: object | None = None
 
         self.panel = SettingsPanel()
         self.original_canvas = ImageCanvas()
@@ -182,18 +187,23 @@ class MainWindow(QMainWindow):
         central_layout.setSpacing(0)
         central_layout.addWidget(self.panel)
         stage = QWidget()
+        stage.setObjectName("previewStage")
         stage_layout = QVBoxLayout(stage)
         stage_layout.setContentsMargins(0, 0, 0, 0)
         stage_layout.setSpacing(0)
         stage_layout.addWidget(self._mode_banner)
         stage_layout.addWidget(self._preview_stack, 1)
+        # Floating overlay (not layout-managed) so it can cover the preview.
+        self._trace_overlay = TraceProgressOverlay(stage)
         central_layout.addWidget(stage, 1)
         self.setCentralWidget(central)
         self.setMinimumSize(640, 360)
 
         self._progress = QProgressBar()
         self._progress.setMaximumWidth(180)
-        self._progress.setRange(0, 0)
+        self._progress.setRange(0, 1000)
+        self._progress.setValue(0)
+        self._progress.setTextVisible(False)
         self._progress.hide()
         self._status_info = QLabel()
         self.statusBar().addWidget(self._status_info, 1)
@@ -201,6 +211,7 @@ class MainWindow(QMainWindow):
 
         self.runner = TraceJobRunner(self)
         self.runner.started.connect(self._on_job_started)
+        self.runner.progress.connect(self._on_job_progress)
         self.runner.succeeded.connect(self._on_job_succeeded)
         self.runner.failed.connect(self._on_job_failed)
         self.runner.cancelled.connect(self._on_job_cancelled)
@@ -492,6 +503,7 @@ class MainWindow(QMainWindow):
         self.seg_editor.retranslate_ui()
         self.side_by_side.retranslate_ui()
         self.split_compare.retranslate_ui()
+        self._trace_overlay.retranslate_ui()
         self._apply_recent_menu()
         self._update_undo_actions()
         self.original_canvas.viewport().update()
@@ -743,6 +755,8 @@ class MainWindow(QMainWindow):
         self.vec_act.setEnabled(has_image and not busy)
         self.retrace_act.setEnabled(has_image and self.seg_editor.has_map() and not busy)
         self.rebuild_act.setEnabled(has_image and not busy)
+        self.fit_act.setEnabled(has_image)
+        self.actual_act.setEnabled(has_image)
         self.panel.set_ready(has_image)
         for action in (
             self.export_svg_act,
@@ -795,17 +809,21 @@ class MainWindow(QMainWindow):
         if image.isNull():
             self._error(t("The clipboard does not contain a bitmap."))
             return
+        self._begin_image_loading(stage="Reading image…")
         try:
             loaded = load_image_from_bytes(qimage_to_png_bytes(image), source_path=None)
         except ImageLoadError as exc:
+            self._end_image_loading()
             self._error(str(exc))
             return
         self._adopt_loaded(loaded)
 
     def open_path(self, path: Path) -> None:
+        self._begin_image_loading(stage="Reading image…")
         try:
             loaded = load_image(path)
         except ImageLoadError as exc:
+            self._end_image_loading()
             self._error(str(exc))
             return
         self._settings_store.setValue("ui/last_dir", str(path.parent))
@@ -839,7 +857,8 @@ class MainWindow(QMainWindow):
             frame_index=0,
         )
         self.panel.set_settings(data.settings)
-        self._adopt_loaded(loaded, auto_vectorize=False)
+        self._begin_image_loading(stage="Opening project…")
+        self._adopt_loaded(loaded)
         if data.segmentation is not None:
             self.seg_editor.set_map(data.segmentation)
         if data.result_svg:
@@ -904,52 +923,107 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"Vectorizer — {dest.name}")
         self.statusBar().showMessage(tf("Saved project {path}", path=dest), 4000)
 
-    def _adopt_loaded(self, loaded: LoadedImage, *, auto_vectorize: bool = True) -> None:
-        self._clear_pointer_modes()
-        self._loaded = loaded
-        self._result = None
-        self._history.clear()
-        self._retrace_from_segmentation = False
-        self._update_undo_actions()
-        self._update_file_drop_enabled()
-        pixmap = pil_to_qpixmap(loaded.image)
-        self._original_pixmap = pixmap
-        self.original_canvas.show_pixmap(pixmap)
-        self.side_by_side.left.show_pixmap(pixmap)
-        self.vector_canvas.clear_content()
-        self.side_by_side.right.clear_content()
-        self.split_compare.set_images(pixmap, None)
-        self.panel.set_palette([])
-        quality = self.panel.settings().automatic_quality
-        self._refresh_palette_suggestions()
-        analysis = analyze_image(loaded.image, quality=quality)
-        notes = list(loaded.notes) + list(analysis.notes)
-        if loaded.source_path and loaded.source_format != "PROJECT":
-            self.setWindowTitle(f"Vectorizer — {loaded.source_path.name}")
-        elif loaded.source_format != "PROJECT":
-            self.setWindowTitle(t("Vectorizer — clipboard"))
-        current = self.panel.settings()
-        will_auto = auto_vectorize and current.workflow == WorkflowMode.AUTOMATIC
-        if will_auto:
-            self._apply_suggested_automatic(analysis.suggested, preserve_preprocess=False)
-        # Skip an immediate segmentation build when auto-vectorize will rebuild
-        # it after the job finishes (avoids double quantize on every open).
-        if not will_auto:
-            self.seg_editor.set_map(
-                build_segmentation(loaded.image, self.panel.settings()),
-                reset_history=True,
-            )
-        else:
-            self.seg_editor.clear_map()
-        self.panel.set_notes("\n".join(notes) if notes else "")
-        self._idle_status = False
-        self._status_info.setText(
-            f"{analysis.width}×{analysis.height}  ·  mode {loaded.original_mode}  ·  "
-            f"{loaded.source_format}"
+    def _begin_image_loading(self, *, stage: str) -> None:
+        """Show the info overlay while a file is opened / analyzed."""
+        if self.runner.busy:
+            return
+        self._preview_stack.setCurrentWidget(self.preview_tabs)
+        self._trace_overlay.begin_busy(
+            title="Loading image…",
+            stage=stage,
+            hint="Please wait while the image is prepared.",
+            indeterminate=True,
+            show_eta=False,
         )
-        self.preview_tabs.setCurrentIndex(0)
-        if will_auto:
-            self.vectorize()
+        self._progress.setRange(0, 0)
+        self._progress.show()
+        self._idle_status = False
+        self._status_info.setText(t(stage))
+        QApplication.processEvents()
+
+    def _update_image_loading(self, stage: str, *, fraction: float | None = None) -> None:
+        if self.runner.busy:
+            return
+        if not self._trace_overlay.isVisible():
+            self._begin_image_loading(stage=stage)
+            return
+        if fraction is None:
+            self._trace_overlay.set_stage(stage)
+            self._progress.setRange(0, 0)
+        else:
+            # Determinate steps once analysis/segmentation progress is known.
+            self._progress.setRange(0, 1000)
+            self._progress.setValue(int(round(max(0.0, min(1.0, fraction)) * 1000)))
+            self._trace_overlay.set_stage(stage, fraction=fraction)
+        self._status_info.setText(t(stage))
+        QApplication.processEvents()
+
+    def _end_image_loading(self) -> None:
+        if self.runner.busy:
+            return
+        self._trace_overlay.finish()
+        self._progress.hide()
+        self._progress.setValue(0)
+
+    def _adopt_loaded(self, loaded: LoadedImage) -> None:
+        # Loading chrome may already be visible from open_path / paste.
+        if not self._trace_overlay.isVisible():
+            self._begin_image_loading(stage="Preparing preview…")
+        try:
+            self._clear_pointer_modes()
+            self._loaded = loaded
+            self._result = None
+            self._history.clear()
+            self._retrace_from_segmentation = False
+            self._update_undo_actions()
+            self._update_file_drop_enabled()
+            self._update_image_loading("Preparing preview…", fraction=0.15)
+            pixmap = pil_to_qpixmap(loaded.image)
+            self._original_pixmap = pixmap
+            self.original_canvas.show_pixmap(pixmap)
+            self.side_by_side.left.show_pixmap(pixmap)
+            self.vector_canvas.clear_content()
+            self.side_by_side.right.clear_content()
+            self.split_compare.set_images(pixmap, None)
+            self.panel.set_palette([])
+            self.preview_tabs.setCurrentIndex(0)
+            quality = self.panel.settings().automatic_quality
+            self._refresh_palette_suggestions()
+            self._update_image_loading("Analyzing image…", fraction=0.35)
+            analysis = analyze_image(loaded.image, quality=quality)
+            self._last_content_kind = analysis.content_kind.value
+            notes = list(loaded.notes) + list(analysis.notes)
+            if loaded.source_path and loaded.source_format != "PROJECT":
+                self.setWindowTitle(f"Vectorizer — {loaded.source_path.name}")
+            elif loaded.source_format != "PROJECT":
+                self.setWindowTitle(t("Vectorizer — clipboard"))
+            # Apply Automatic suggestions so settings are ready, but do not start
+            # tracing — the user can tweak parameters first, then press Vectorize.
+            if self.panel.settings().workflow == WorkflowMode.AUTOMATIC:
+                self._apply_suggested_automatic(
+                    analysis.suggested, preserve_preprocess=False
+                )
+            self._update_image_loading("Building segmentation…", fraction=0.65)
+            try:
+                self.seg_editor.set_map(
+                    build_segmentation(loaded.image, self.panel.settings()),
+                    reset_history=True,
+                )
+            except Exception:
+                self.seg_editor.clear_map()
+            self.panel.set_notes("\n".join(notes) if notes else "")
+            self._idle_status = False
+            self._status_info.setText(
+                f"{analysis.width}×{analysis.height}  ·  mode {loaded.original_mode}  ·  "
+                f"{loaded.source_format}"
+            )
+            self.statusBar().showMessage(
+                t("Image loaded. Adjust settings, then press Vectorize."),
+                5000,
+            )
+            self._sync_document_actions()
+        finally:
+            self._end_image_loading()
 
     def _apply_suggested_automatic(
         self,
@@ -1002,6 +1076,7 @@ class MainWindow(QMainWindow):
         quality = self.panel.settings().automatic_quality
         self._refresh_palette_suggestions()
         analysis = analyze_image(self._loaded.image, quality=quality)
+        self._last_content_kind = analysis.content_kind.value
         notes = list(self._loaded.notes) + list(analysis.notes)
         self.panel.set_notes("\n".join(notes) if notes else "")
         self._apply_suggested_automatic(analysis.suggested, preserve_preprocess=True)
@@ -1018,7 +1093,7 @@ class MainWindow(QMainWindow):
             3000,
         )
 
-    def vectorize(self) -> None:
+    def vectorize(self, *, preview_preprocess: bool = True) -> None:
         if self._loaded is None:
             self._error(t("Open an image before vectorizing."))
             return
@@ -1032,7 +1107,11 @@ class MainWindow(QMainWindow):
         # Optional preprocess preview — only for modest images so the UI thread
         # does not freeze on megapixel knock-out/quantize (worker still does it).
         width, height = self._loaded.image.size
-        if (settings.remove_background or settings.target_colors) and width * height <= 1_500_000:
+        if (
+            preview_preprocess
+            and (settings.remove_background or settings.target_colors)
+            and width * height <= 1_500_000
+        ):
             try:
                 working = preprocess_image(self._loaded.image, settings)
                 self.side_by_side.left.show_pixmap(pil_to_qpixmap(working))
@@ -1040,7 +1119,11 @@ class MainWindow(QMainWindow):
                 pass
         self._retrace_from_segmentation = False
         try:
-            handle = self.runner.start(self._loaded.image, settings)
+            handle = self.runner.start(
+                self._loaded.image,
+                settings,
+                content_kind=self._last_content_kind,
+            )
         except TraceError as exc:
             self._error(str(exc))
             return
@@ -1081,13 +1164,31 @@ class MainWindow(QMainWindow):
         if self.runner.busy:
             return
         try:
-            settings = replace(self.panel.settings(), apply_preprocess=False)
+            settings = replace(
+                self.panel.settings(),
+                apply_preprocess=False,
+                remove_background=False,
+            )
+            # Keep the edited hard palette so Automatic mode does not re-guess.
+            palette = tuple(seg.opaque_palette(max_colors=32))
+            if palette and not settings.palette:
+                settings = replace(settings, palette=palette)
+            # Retrace should stay on the blend path when a soft sidecar exists.
+            if seg.soft_source is not None and settings.edge_treatment.value == "auto":
+                from vectorizer.domain.settings import EdgeTreatment
+
+                settings = replace(settings, edge_treatment=EdgeTreatment.BLENDED)
         except ValueError as exc:
             self._error(str(exc))
             return
         self._retrace_from_segmentation = True
         try:
-            handle = self.runner.start(seg.image, settings)
+            handle = self.runner.start(
+                seg.image,
+                settings,
+                soft_source=seg.soft_source or self._loaded.image,
+                content_kind=self._last_content_kind,
+            )
         except TraceError as exc:
             self._error(str(exc))
             return
@@ -1384,10 +1485,38 @@ class MainWindow(QMainWindow):
         ):
             canvas.zoom_actual()
 
+    def _timing_seed_seconds(self) -> float | None:
+        if self._loaded is None:
+            return None
+        last_elapsed = self._settings_store.value(_TIMING_ELAPSED_KEY, None)
+        last_mp = self._settings_store.value(_TIMING_MEGAPIXELS_KEY, None)
+        try:
+            elapsed = float(last_elapsed)
+            prior_mp = float(last_mp)
+        except (TypeError, ValueError):
+            return None
+        if elapsed <= 0 or prior_mp <= 0:
+            return None
+        width, height = self._loaded.image.size
+        megapixels = max(0.05, (width * height) / 1_000_000.0)
+        # Scale prior runtime roughly with area; clamp so the ETA stays sane.
+        scale = megapixels / prior_mp
+        return max(1.0, min(180.0, elapsed * (0.55 + 0.45 * scale)))
+
+    def _remember_timing(self, elapsed: float) -> None:
+        if self._loaded is None or elapsed <= 0:
+            return
+        width, height = self._loaded.image.size
+        megapixels = max(0.05, (width * height) / 1_000_000.0)
+        self._settings_store.setValue(_TIMING_ELAPSED_KEY, float(elapsed))
+        self._settings_store.setValue(_TIMING_MEGAPIXELS_KEY, float(megapixels))
+
     def _on_job_started(self, token: int) -> None:
         if token != self._current_token:
             return
         self.panel.set_busy(True)
+        self._progress.setRange(0, 1000)
+        self._progress.setValue(0)
         self._progress.show()
         self._idle_status = False
         label = (
@@ -1396,17 +1525,36 @@ class MainWindow(QMainWindow):
             else t("Tracing…")
         )
         self._status_info.setText(label)
+        self._trace_overlay.begin(
+            retrace=self._retrace_from_segmentation,
+            seed_seconds=self._timing_seed_seconds(),
+        )
         self._sync_document_actions()
+
+    def _on_job_progress(self, token: int, fraction: float, stage: str) -> None:
+        if token != self._current_token:
+            return
+        self._progress.setRange(0, 1000)
+        self._progress.setValue(int(round(max(0.0, min(1.0, fraction)) * 1000)))
+        self._trace_overlay.update_progress(fraction, stage)
+        self._idle_status = False
+        self._status_info.setText(t(stage) if stage else t("Tracing…"))
+
+    def _finish_job_chrome(self) -> None:
+        self.panel.set_busy(False)
+        self._progress.hide()
+        self._progress.setValue(0)
+        self._trace_overlay.finish()
 
     def _on_job_succeeded(self, token: int, result: object) -> None:
         if token != self._current_token:
             return
-        self.panel.set_busy(False)
-        self._progress.hide()
+        self._finish_job_chrome()
         self._sync_document_actions()
         if not isinstance(result, TraceResult):
             self._error(t("Internal error: unexpected trace result."))
             return
+        self._remember_timing(result.elapsed_seconds)
         rebuild = not self._retrace_from_segmentation
         label = "Retrace" if self._retrace_from_segmentation else "Vectorize"
         self._apply_result(result, rebuild_segmentation=rebuild, history_label=label)
@@ -1448,12 +1596,27 @@ class MainWindow(QMainWindow):
             if group.palette_key and group.palette_key.startswith("#")
         ]
         self.panel.set_palette(palette)
+        # Show the SVG immediately; rebuild segmentation on the next event-loop
+        # tick so large label/quantize passes do not delay the result view.
         if rebuild_segmentation and self._loaded is not None:
-            try:
-                seg = build_segmentation(self._loaded.image, result.settings)
-                self.seg_editor.set_map(seg, reset_history=True)
-            except Exception:
-                pass
+            image = self._loaded.image
+            settings = result.settings
+            token = self._current_token
+            self._pending_seg_rebuild = token
+
+            def _rebuild() -> None:
+                if self._pending_seg_rebuild != token or self._loaded is None:
+                    return
+                try:
+                    seg = build_segmentation(image, settings)
+                    self.seg_editor.set_map(seg, reset_history=True)
+                except Exception:
+                    pass
+                finally:
+                    if self._pending_seg_rebuild == token:
+                        self._pending_seg_rebuild = None
+
+            QTimer.singleShot(0, _rebuild)
         seconds = result.elapsed_seconds
         paths = result.document.path_count
         size = result.document.byte_size
@@ -1609,8 +1772,7 @@ class MainWindow(QMainWindow):
     def _on_job_failed(self, token: int, message: str) -> None:
         if token != self._current_token:
             return
-        self.panel.set_busy(False)
-        self._progress.hide()
+        self._finish_job_chrome()
         self._idle_status = False
         self._status_info.setText(t("Tracing failed."))
         # Auto-open skips the initial seg build; restore one so the tab stays usable.
@@ -1628,8 +1790,7 @@ class MainWindow(QMainWindow):
     def _on_job_cancelled(self, token: int) -> None:
         if token != self._current_token:
             return
-        self.panel.set_busy(False)
-        self._progress.hide()
+        self._finish_job_chrome()
         self._idle_status = False
         self._status_info.setText(t("Tracing cancelled."))
         if self._loaded is not None and not self.seg_editor.has_map():

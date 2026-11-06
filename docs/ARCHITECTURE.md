@@ -85,7 +85,8 @@ Tracing runs in `python -m vectorizer.jobs.trace_worker` so:
 - Cancel can terminate the process
 - a generation token drops stale results
 
-The backend does not report percent complete. The UI uses an indeterminate bar.
+Workers emit NDJSON progress lines on stdout (`{"type":"progress",…}`).
+The GUI shows a determinate overlay with stage text and an ETA estimate.
 
 ## Coordinates
 

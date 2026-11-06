@@ -568,6 +568,35 @@ _DE: dict[str, str] = {
     ),
     "Retracing segmentation…": "Segmentierung wird nachgezeichnet…",
     "Tracing…": "Nachzeichnen…",
+    "Vectorizing…": "Vektorisierung läuft…",
+    "Loading image…": "Bild wird geladen…",
+    "Reading image…": "Bild wird gelesen…",
+    "Opening project…": "Projekt wird geöffnet…",
+    "Preparing preview…": "Vorschau wird vorbereitet…",
+    "Building segmentation…": "Segmentierung wird aufgebaut…",
+    "Please wait while the image is prepared.": (
+        "Bitte warten, das Bild wird vorbereitet."
+    ),
+    "Image loaded. Adjust settings, then press Vectorize.": (
+        "Bild geladen. Einstellungen anpassen, dann Vektorisieren drücken."
+    ),
+    "Preparing…": "Vorbereitung…",
+    "Analyzing image…": "Bild wird analysiert…",
+    "Preparing colors…": "Farben werden vorbereitet…",
+    "Tracing contours…": "Konturen werden nachgezeichnet…",
+    "Fitting curves…": "Kurven werden angepasst…",
+    "Building SVG…": "SVG wird erzeugt…",
+    "Finishing…": "Abschluss…",
+    "Estimating time…": "Zeit wird geschätzt…",
+    "Almost done…": "Gleich fertig…",
+    "About {seconds}s remaining": "Noch ca. {seconds} s",
+    "About {minutes} min remaining": "Noch ca. {minutes} Min.",
+    "About {minutes} min {seconds}s remaining": (
+        "Noch ca. {minutes} Min. {seconds} s"
+    ),
+    "Press Cancel in the sidebar to stop.": (
+        "Zum Abbrechen in der Seitenleiste auf Abbrechen klicken."
+    ),
     "Click a pixel on the original. Press Esc to cancel.": (
         "Klicken Sie ein Pixel im Original. Esc bricht ab."
     ),
@@ -598,6 +627,56 @@ _DE: dict[str, str] = {
     "color regions, not a lossless stand-in for the photograph.": (
         "Dieses Bild wirkt fotografisch. Die Vektorisierung erzeugt stilisierte "
         "Farbbereiche, keinen verlustfreien Ersatz für das Foto."
+    ),
+    "Detected cel / cartoon art with ink outlines; preserving flat fills "
+    "and dark line work.": (
+        "Cel-/Cartoon-Grafik mit Tuschelinien erkannt; flächige Füllungen und "
+        "dunkle Konturen werden erhalten."
+    ),
+    "Detected an illustration with a moderate palette.": (
+        "Illustration mit begrenzter Palette erkannt."
+    ),
+    "Detected a flat-color logo or icon.": (
+        "Flächiges Logo oder Icon erkannt."
+    ),
+    "Detected a binary mark / stencil.": (
+        "Binäre Markierung / Schablone erkannt."
+    ),
+    "Detected small pixel-art / limited palette art.": (
+        "Pixel-Art / Grafik mit begrenzter Palette erkannt."
+    ),
+    "Detected line art; preserving thin strokes.": (
+        "Strichzeichnung erkannt; dünne Linien werden erhalten."
+    ),
+    "Smooth gradients detected. Colors will be posterized into editable regions.": (
+        "Sanfte Verläufe erkannt. Farben werden in bearbeitbare Bereiche "
+        "posterisiert."
+    ),
+    "Edges follow anti-aliased blending inside each boundary pixel.": (
+        "Kanten folgen dem Anti-Aliasing innerhalb jedes Randpixels."
+    ),
+    "Hard edges: shapes snap to flat colors before fitting.": (
+        "Harte Kanten: Formen rasten vor dem Anpassen auf flache Farben ein."
+    ),
+    "Photograph: posterized to the palette, then traced as regions.": (
+        "Fotografie: auf die Palette posterisiert, dann als Regionen nachgezeichnet."
+    ),
+    "Cel outlines solidified before tracing so ink stays continuous.": (
+        "Cel-Konturen vor dem Nachzeichnen verfestigt, damit die Tusche "
+        "durchgängig bleibt."
+    ),
+    "Cel scene: palette-snapped regions with solidified ink outlines.": (
+        "Cel-Szene: auf die Palette eingerastete Flächen mit verfestigten "
+        "Tuschekonturen."
+    ),
+    "Light noise smoothing enabled before tracing.": (
+        "Leichte Rauschglättung vor dem Nachzeichnen aktiv."
+    ),
+    "Source transparency will be preserved.": (
+        "Vorhandene Transparenz wird beibehalten."
+    ),
+    "Using cutout hierarchy so holes stay clean.": (
+        "Cutout-Hierarchie, damit Löcher sauber bleiben."
     ),
     "Few unique colors detected; using binary tracing.": (
         "Wenige eindeutige Farben erkannt; binäres Nachzeichnen wird verwendet."

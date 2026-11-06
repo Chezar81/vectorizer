@@ -16,6 +16,7 @@ from vectorizer.batch.engine import CollisionPolicy, ExportFormat
 from vectorizer.domain.settings import AutomaticQuality, WorkflowMode
 from vectorizer.errors import VectorizerError
 from vectorizer.gui.session_history import DEFAULT_MAX_STEPS as SESSION_DEFAULT_STEPS
+from vectorizer.hardware.policy import ComputeMode
 from vectorizer.segmentation.history import (
     DEFAULT_MAX_BYTES as SEG_DEFAULT_BYTES,
     DEFAULT_MAX_STEPS as SEG_DEFAULT_STEPS,
@@ -43,6 +44,9 @@ class AppPreferences:
     # 1 — default workflow / quality (also auto-updated when the sidebar changes)
     workflow: WorkflowMode = WorkflowMode.AUTOMATIC
     automatic_quality: AutomaticQuality = AutomaticQuality.BALANCED
+
+    # 1b — compute device preference (hardware probe resolves Auto at runtime)
+    compute_mode: ComputeMode = ComputeMode.AUTO
 
     # 2 — default export folder
     export_dir: str = ""
@@ -122,6 +126,12 @@ class AppPreferences:
                 quality = AutomaticQuality(str(quality))
             except ValueError:
                 quality = AutomaticQuality.BALANCED
+        compute = self.compute_mode
+        if not isinstance(compute, ComputeMode):
+            try:
+                compute = ComputeMode(str(compute))
+            except ValueError:
+                compute = ComputeMode.AUTO
         collision = self.batch_collision
         if not isinstance(collision, CollisionPolicy):
             try:
@@ -137,6 +147,7 @@ class AppPreferences:
             self,
             workflow=workflow,
             automatic_quality=quality,
+            compute_mode=compute,
             batch_collision=collision,
             png_width=png_w,
             png_height=png_h,
@@ -205,6 +216,7 @@ def load_preferences() -> AppPreferences:
         automatic_quality=_read_str(
             store, f"{PREF_PREFIX}automatic_quality", AutomaticQuality.BALANCED.value
         ),
+        compute_mode=_read_str(store, f"{PREF_PREFIX}compute_mode", ComputeMode.AUTO.value),
         export_dir=_read_str(store, f"{PREF_PREFIX}export_dir"),
         export_svg=_read_bool(store, f"{PREF_PREFIX}export_svg", True),
         export_pdf=_read_bool(store, f"{PREF_PREFIX}export_pdf", False),
@@ -249,6 +261,7 @@ def save_preferences(prefs: AppPreferences, *, emit: bool = True) -> AppPreferen
     store = _store()
     store.setValue(f"{PREF_PREFIX}workflow", prefs.workflow.value)
     store.setValue(f"{PREF_PREFIX}automatic_quality", prefs.automatic_quality.value)
+    store.setValue(f"{PREF_PREFIX}compute_mode", prefs.compute_mode.value)
     store.setValue(f"{PREF_PREFIX}export_dir", prefs.export_dir)
     store.setValue(f"{PREF_PREFIX}export_svg", prefs.export_svg)
     store.setValue(f"{PREF_PREFIX}export_pdf", prefs.export_pdf)
@@ -310,8 +323,10 @@ def reset_all_preferences(*, include_ui: bool = True) -> AppPreferences:
 
 def _apply_runtime_side_effects(prefs: AppPreferences) -> None:
     from vectorizer.export.tools import set_inkscape_override
+    from vectorizer.hardware.policy import apply_compute_preference
 
     set_inkscape_override(prefs.inkscape_path or None)
+    apply_compute_preference(prefs.compute_mode)
 
 
 def preferences_as_dict(prefs: AppPreferences | None = None) -> dict[str, object]:
@@ -319,6 +334,7 @@ def preferences_as_dict(prefs: AppPreferences | None = None) -> dict[str, object
     data = asdict(prefs)
     data["workflow"] = prefs.workflow.value
     data["automatic_quality"] = prefs.automatic_quality.value
+    data["compute_mode"] = prefs.compute_mode.value
     data["batch_collision"] = prefs.batch_collision.value
     return data
 

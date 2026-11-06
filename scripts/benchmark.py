@@ -96,17 +96,35 @@ def main() -> int:
     seg = build_segmentation(large, knock_settings)
     build_s = time.perf_counter() - t0
     seed = next(
-        (x, y)
-        for y in range(0, seg.size[1], 17)
-        for x in range(0, seg.size[0], 17)
-        if seg.pixel(x, y)[3] > 0
+        (
+            (x, y)
+            for y in range(0, seg.size[1], 17)
+            for x in range(0, seg.size[0], 17)
+            if seg.pixel(x, y)[3] > 0
+        ),
+        None,
     )
-    t0 = time.perf_counter()
-    flooded = flood_fill(seg, seed[0], seed[1], (255, 0, 0, 255))
-    flood_s = time.perf_counter() - t0
-    t0 = time.perf_counter()
-    remove_small_regions(flooded, min_pixels=32)
-    clean_s = time.perf_counter() - t0
+    if seed is None:
+        seed = next(
+            (
+                (x, y)
+                for y in range(seg.size[1])
+                for x in range(seg.size[0])
+                if seg.pixel(x, y)[3] > 0
+            ),
+            None,
+        )
+    if seed is None:
+        flooded = seg
+        flood_s = 0.0
+        clean_s = 0.0
+    else:
+        t0 = time.perf_counter()
+        flooded = flood_fill(seg, seed[0], seed[1], (255, 0, 0, 255))
+        flood_s = time.perf_counter() - t0
+        t0 = time.perf_counter()
+        remove_small_regions(flooded, min_pixels=32)
+        clean_s = time.perf_counter() - t0
 
     heavy = {
         "input": "synthetic_1600x1200",

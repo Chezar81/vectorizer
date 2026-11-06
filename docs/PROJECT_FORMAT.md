@@ -9,6 +9,7 @@ A Vectorizer project is a ZIP archive (not pickle) with a fixed member set.
 | `manifest.json` | yes | Schema, settings, asset names |
 | `source.png` | yes | Original RGBA source (immutable copy) |
 | `segmentation.png` | no | Working segmentation RGBA |
+| `soft_source.png` | no | Anti-aliased colour sidecar for F6 retrace |
 | `result.svg` | no | Current vector SVG |
 
 ## Manifest
@@ -20,6 +21,7 @@ A Vectorizer project is a ZIP archive (not pickle) with a fixed member set.
   "source_name": "logo.png",
   "source": "source.png",
   "segmentation": "segmentation.png",
+  "soft_source": "soft_source.png",
   "result": "result.svg",
   "settings": { "...": "TraceSettings.to_json()" },
   "notes": [],
@@ -37,5 +39,6 @@ A Vectorizer project is a ZIP archive (not pickle) with a fixed member set.
 ## Distinctions
 
 - **Source** is never overwritten by segmentation edits.
-- **Segmentation** is what Retrace (F6) feeds to VTracer with preprocess off.
+- **Segmentation** is the hard-label map Retrace (F6) feeds to the tracer with preprocess off.
+- **Soft source** keeps the anti-aliased original colours so F6 iso-contours still follow coverage after label edits.
 - **Result SVG** is the last successful vector document.

@@ -25,17 +25,23 @@ def build_segmentation(
     The original `source` image is never mutated.
     """
     settings = (settings or TraceSettings()).validated()
+    soft = source.convert("RGBA").copy()
     if settings.edge_treatment == EdgeTreatment.BLENDED:
         from vectorizer.vectorize.blend_trace import label_regions, labels_to_image
         from vectorizer.vectorize.dispatch import resolve_palette
 
         palette = resolve_palette(source, settings, EdgeTreatment.BLENDED)
         if palette:
-            labels = label_regions(source.convert("RGBA"), palette, settings)
-            return SegmentationMap(labels_to_image(labels, palette))
+            labels, _pixels_lab, _palette_lab, _bg_lab = label_regions(
+                source.convert("RGBA"), palette, settings
+            )
+            return SegmentationMap(labels_to_image(labels, palette), soft_source=soft)
     if settings.edge_treatment == EdgeTreatment.PHOTO and settings.palette:
         working = preprocess_image(source, settings)
-        return SegmentationMap(_harden_alpha(snap_image_to_palette(working, settings.palette)))
+        return SegmentationMap(
+            _harden_alpha(snap_image_to_palette(working, settings.palette)),
+            soft_source=soft,
+        )
     working = preprocess_image(source, settings)
     target = colors
     if target is None:
@@ -53,7 +59,7 @@ def build_segmentation(
         quantized = _harden_alpha(working)
     else:
         quantized = _quantize_keep_alpha(working, target)
-    return SegmentationMap(quantized)
+    return SegmentationMap(quantized, soft_source=soft)
 
 
 def _auto_colors(settings: TraceSettings) -> int:

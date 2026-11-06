@@ -10,6 +10,7 @@ from PIL import Image
 
 from vectorizer.domain.settings import TraceSettings
 from vectorizer.errors import TraceError
+from vectorizer.jobs.progress import STAGE_CONTOURS, STAGE_SVG, ProgressCallback
 from vectorizer.svg.parse import parse_svg_document
 from vectorizer.vectorize.backend import TraceResult
 
@@ -53,7 +54,14 @@ class VTracerBackend:
         "No segmentation map is returned."
     )
 
-    def trace(self, image: Image.Image, settings: TraceSettings) -> TraceResult:
+    def trace(
+        self,
+        image: Image.Image,
+        settings: TraceSettings,
+        *,
+        on_progress: ProgressCallback | None = None,
+    ) -> TraceResult:
+        report = on_progress or (lambda _stage, _fraction: None)
         if _vtracer is None:
             raise TraceError(f"vtracer is not available: {_VTRACER_IMPORT_ERROR}")
         validated = settings.validated()
@@ -61,6 +69,9 @@ class VTracerBackend:
             raise TraceError("Cannot trace an empty image.")
         kwargs: dict[str, Any] = validated.to_backend_kwargs()
         started = time.perf_counter()
+        # VTracer itself is opaque; park mid-range so the UI can show ETA from
+        # prior jobs while the native call runs.
+        report(STAGE_CONTOURS, 0.15)
         try:
             if hasattr(_vtracer, "convert_raw_image_to_svg"):
                 svg_text = _vtracer.convert_raw_image_to_svg(
@@ -76,10 +87,12 @@ class VTracerBackend:
                 )
         except Exception as exc:
             raise TraceError(f"VTracer failed: {exc}") from exc
+        report(STAGE_SVG, 0.85)
         elapsed = time.perf_counter() - started
         if not isinstance(svg_text, str) or "<svg" not in svg_text.lower():
             raise TraceError("VTracer did not return SVG markup.")
         document = parse_svg_document(svg_text, backend_name=self.name)
+        report(STAGE_SVG, 1.0)
         warnings: list[str] = []
         if validated.colormode.value == "color" and document.path_count == 0:
             warnings.append("Tracing produced no paths.")
