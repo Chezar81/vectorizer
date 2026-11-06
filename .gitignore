@@ -11,6 +11,9 @@ build/
 packaging/macos/Vectorizer.icns
 packaging/windows/Vectorizer.ico
 *.exe
+vectorizer-preferences.json
+test_pictures/
+/json
 .benchmarks/
 benchmark_results/
 tests/fixtures/*.png

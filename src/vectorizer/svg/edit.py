@@ -8,7 +8,6 @@ from dataclasses import replace
 from vectorizer.domain.document import VectorDocument
 from vectorizer.domain.settings import SvgPaintStyle, normalize_hex
 from vectorizer.errors import SvgParseError
-from vectorizer.export.dxf import sample_path_points
 from vectorizer.raster.color import hex_to_rgb, nearest_oklab, rgb_to_hex, srgb_u8_to_oklab
 from vectorizer.svg.parse import parse_svg_document
 
@@ -105,18 +104,34 @@ def apply_paint_style(document: VectorDocument, style: SvgPaintStyle) -> VectorD
 
 
 def _hit_path_index(document: VectorDocument, x: float, y: float) -> int | None:
+    # Lazy import: export.__init__ pulls export.svg → edit; a top-level dxf import cycles.
+    from vectorizer.export.dxf import sample_path_subpaths
+
+    # Groups are keyed by fill color, not paint order — pick the highest
+    # source_order among hits so the visually topmost path is deleted.
     best: int | None = None
     for group in document.groups:
         for path in group.paths:
             if path.fill is None:
                 continue
-            points = sample_path_points(path.d, curve_segments=6)
-            if _contains(points, x, y):
+            rings = [ring for ring, _closed in sample_path_subpaths(path.d, curve_segments=6)]
+            if not _contains_evenodd(rings, x, y):
+                continue
+            if best is None or path.source_order > best:
                 best = path.source_order
     return best
 
 
-def _contains(points: list[tuple[float, float]], x: float, y: float) -> bool:
+def _contains_evenodd(rings: list[list[tuple[float, float]]], x: float, y: float) -> bool:
+    """Even-odd fill: each closed subpath toggles inside, so holes stay hollow."""
+    inside = False
+    for points in rings:
+        if _ring_contains(points, x, y):
+            inside = not inside
+    return inside
+
+
+def _ring_contains(points: list[tuple[float, float]], x: float, y: float) -> bool:
     if len(points) < 3:
         return False
     inside = False

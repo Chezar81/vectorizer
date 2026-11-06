@@ -62,17 +62,20 @@ def export_dxf(
                 )
                 entities.extend(chunk)
             else:
-                points = _path_to_points(vp, curve_segments=curve_segments)
-                if len(points) < 2:
-                    continue
-                if flip_y:
-                    points = [(x, height - y) for x, y in points]
-                if tx or ty:
-                    points = [(x + tx, y + (-ty if flip_y else ty)) for x, y in points]
-                entities.append(
-                    _lwpolyline(points, handle=handle, decimals=decimals, closed=_is_closed(vp.d))
-                )
-                handle += 1
+                # One LWPOLYLINE per subpath. Flattening every M..Z into a single
+                # ring used to bridge disconnected shapes with a spurious segment.
+                for points, closed in _path_subpaths(vp.d, curve_segments=curve_segments):
+                    if len(points) < 2:
+                        continue
+                    mapped = points
+                    if flip_y:
+                        mapped = [(x, height - y) for x, y in mapped]
+                    if tx or ty:
+                        mapped = [(x + tx, y + (-ty if flip_y else ty)) for x, y in mapped]
+                    entities.append(
+                        _lwpolyline(mapped, handle=handle, decimals=decimals, closed=closed)
+                    )
+                    handle += 1
 
     if not entities:
         raise ExportError("No convertible path geometry was found for DXF.")
@@ -476,15 +479,35 @@ def _sample_arc(
     return pts
 
 
-def _path_d_to_points(d: str, *, curve_segments: int) -> list[tuple[float, float]]:
+def sample_path_points(d: str, *, curve_segments: int = 8) -> list[tuple[float, float]]:
+    """Flatten an SVG path to points. Prefer `sample_path_subpaths` for holes."""
+    points: list[tuple[float, float]] = []
+    for ring, _closed in _path_subpaths(d, curve_segments=curve_segments):
+        points.extend(ring)
+    return points
+
+
+def sample_path_subpaths(
+    d: str, *, curve_segments: int = 8
+) -> list[tuple[list[tuple[float, float]], bool]]:
+    """Return (ring, closed) pairs for each M..Z subpath."""
+    return _path_subpaths(d, curve_segments=curve_segments)
+
+
+def _path_subpaths(
+    d: str, *, curve_segments: int
+) -> list[tuple[list[tuple[float, float]], bool]]:
+    """Split path data on every moveto so disconnected shapes stay separate."""
     tokens = re.findall(r"[MmLlHhVvCcSsQqTtAaZz]|[-+]?(?:\d*\.\d+|\d+)(?:[eE][-+]?\d+)?", d)
     if not tokens:
         return []
+    rings: list[tuple[list[tuple[float, float]], bool]] = []
     points: list[tuple[float, float]] = []
     cx = cy = 0.0
     start = (0.0, 0.0)
     last_ctrl: tuple[float, float] | None = None
     last_cmd = ""
+    closed = False
     i = 0
 
     def take_float() -> float:
@@ -492,6 +515,13 @@ def _path_d_to_points(d: str, *, curve_segments: int) -> list[tuple[float, float
         value = float(tokens[i])
         i += 1
         return value
+
+    def flush() -> None:
+        nonlocal points, closed
+        if len(points) >= 2:
+            rings.append((points, closed or _same_point(points[0], points[-1])))
+        points = []
+        closed = False
 
     while i < len(tokens):
         tok = tokens[i]
@@ -505,6 +535,7 @@ def _path_d_to_points(d: str, *, curve_segments: int) -> list[tuple[float, float
         absolute = cmd.isupper()
         op = cmd.upper()
         if op == "M":
+            flush()
             x, y = take_float(), take_float()
             if not absolute:
                 x += cx
@@ -514,6 +545,14 @@ def _path_d_to_points(d: str, *, curve_segments: int) -> list[tuple[float, float
             points.append((cx, cy))
             last_cmd = "L" if absolute else "l"
             last_ctrl = None
+            # Implicit lineto pairs after a moveto belong to this subpath.
+            while i < len(tokens) and tokens[i] not in _COMMANDS:
+                x, y = take_float(), take_float()
+                if not absolute:
+                    x += cx
+                    y += cy
+                cx, cy = x, y
+                points.append((cx, cy))
             continue
         if op == "L":
             x, y = take_float(), take_float()
@@ -599,20 +638,22 @@ def _path_d_to_points(d: str, *, curve_segments: int) -> list[tuple[float, float
         elif op == "Z":
             points.append(start)
             cx, cy = start
+            closed = True
             last_ctrl = None
+            flush()
         else:
             break
         last_cmd = cmd
-    return points
+    flush()
+    return rings
 
 
-def sample_path_points(d: str, *, curve_segments: int = 8) -> list[tuple[float, float]]:
-    """Flatten an SVG path to points. Shared by hit-testing and DXF export."""
-    return _path_d_to_points(d, curve_segments=curve_segments)
+def _same_point(a: tuple[float, float], b: tuple[float, float]) -> bool:
+    return abs(a[0] - b[0]) < 1e-6 and abs(a[1] - b[1]) < 1e-6
 
 
 def _path_to_points(path: VectorPath, *, curve_segments: int) -> list[tuple[float, float]]:
-    return _path_d_to_points(path.d, curve_segments=curve_segments)
+    return sample_path_points(path.d, curve_segments=curve_segments)
 
 
 def _fmt(value: float, decimals: int) -> str:

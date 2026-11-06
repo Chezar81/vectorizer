@@ -11,10 +11,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from PIL import Image
-from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, Signal
+from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, QTimer, Signal
 
 from vectorizer.domain.settings import TraceSettings
 from vectorizer.errors import JobCancelled, TraceError
+from vectorizer.jobs.progress import parse_progress_line
 from vectorizer.svg.parse import parse_svg_document
 from vectorizer.vectorize.backend import TraceResult
 
@@ -28,6 +29,8 @@ def worker_process_arguments(
     output_svg: Path,
     settings_path: Path,
     result_path: Path,
+    soft_path: Path | None = None,
+    meta_path: Path | None = None,
 ) -> list[str]:
     """Build argv for the tracing subprocess (after ``sys.executable``)."""
     job_args = [
@@ -40,6 +43,10 @@ def worker_process_arguments(
         "--result",
         str(result_path),
     ]
+    if soft_path is not None:
+        job_args.extend(["--soft-source", str(soft_path)])
+    if meta_path is not None:
+        job_args.extend(["--meta", str(meta_path)])
     if getattr(sys, "frozen", False):
         return [TRACE_WORKER_FLAG, *job_args]
     return ["-m", "vectorizer.jobs.trace_worker", *job_args]
@@ -56,6 +63,8 @@ class TraceJobRunner(QObject):
     succeeded = Signal(int, object)
     failed = Signal(int, str)
     cancelled = Signal(int)
+    # token, fraction 0..1, stage key (English i18n source string)
+    progress = Signal(int, float, str)
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -64,26 +73,48 @@ class TraceJobRunner(QObject):
         self._workdir: Path | None = None
         self._active_token: int | None = None
         self._cancel_requested = False
+        self._stdout_buffer = ""
 
     @property
     def busy(self) -> bool:
         return self._process is not None and self._process.state() != QProcess.ProcessState.NotRunning
 
-    def start(self, image: Image.Image, settings: TraceSettings) -> JobHandle:
+    def start(
+        self,
+        image: Image.Image,
+        settings: TraceSettings,
+        *,
+        soft_source: Image.Image | None = None,
+        content_kind: str | None = None,
+    ) -> JobHandle:
         if self.busy:
             raise TraceError("A tracing job is already running.")
         self._token += 1
         token = self._token
         self._cancel_requested = False
+        self._stdout_buffer = ""
         workdir = Path(tempfile.mkdtemp(prefix="vectorizer-job-"))
         input_path = workdir / "input.png"
         output_svg = workdir / "output.svg"
         settings_path = workdir / "settings.json"
         result_path = workdir / "result.json"
+        meta_path: Path | None = None
+        soft_path: Path | None = None
         rgba = image.convert("RGBA")
         # Fast temp encode: worker reloads immediately; size vs CPU favors level 1.
         rgba.save(input_path, format="PNG", compress_level=1, optimize=False)
+        if soft_source is not None:
+            soft_path = workdir / "soft_source.png"
+            soft_source.convert("RGBA").save(
+                soft_path, format="PNG", compress_level=1, optimize=False
+            )
         settings_path.write_text(json.dumps(settings.to_json()), encoding="utf-8")
+        if content_kind:
+            meta_path = workdir / "meta.json"
+            meta_path.write_text(
+                json.dumps({"content_kind": str(content_kind)}),
+                encoding="utf-8",
+            )
 
         process = QProcess(self)
         process.setProgram(sys.executable)
@@ -93,6 +124,8 @@ class TraceJobRunner(QObject):
                 output_svg=output_svg,
                 settings_path=settings_path,
                 result_path=result_path,
+                soft_path=soft_path,
+                meta_path=meta_path,
             )
         )
         env = QProcessEnvironment.systemEnvironment()
@@ -102,8 +135,12 @@ class TraceJobRunner(QObject):
             if existing:
                 pythonpath_parts.append(existing)
             env.insert("PYTHONPATH", os.pathsep.join(pythonpath_parts))
+        # Force line-buffered worker progress even when stdout is a pipe.
+        env.insert("PYTHONUNBUFFERED", "1")
         process.setProcessEnvironment(env)
+        process.setProcessChannelMode(QProcess.ProcessChannelMode.SeparateChannels)
 
+        process.readyReadStandardOutput.connect(lambda: self._on_stdout(token))
         process.finished.connect(lambda code, status: self._on_finished(token, code, status, workdir, settings))
         process.errorOccurred.connect(lambda err: self._on_error(token, err, workdir))
         self._process = process
@@ -114,8 +151,15 @@ class TraceJobRunner(QObject):
             self._cleanup(workdir)
             self._process = None
             raise TraceError("Could not start the tracing worker process.")
-        self.started.emit(token)
+        # Emit on the next event-loop tick so callers can store the handle token
+        # before _on_job_started runs (DirectConnection would race).
+        QTimer.singleShot(0, lambda t=token: self._emit_started(t))
         return JobHandle(token=token, workdir=workdir)
+
+    def _emit_started(self, token: int) -> None:
+        if token != self._active_token or not self.busy:
+            return
+        self.started.emit(token)
 
     def cancel(self) -> None:
         if not self.busy or self._process is None:
@@ -125,6 +169,21 @@ class TraceJobRunner(QObject):
         if not self._process.waitForFinished(800):
             self._process.kill()
             self._process.waitForFinished(800)
+
+    def _on_stdout(self, token: int) -> None:
+        if token != self._active_token or self._process is None:
+            return
+        chunk = bytes(self._process.readAllStandardOutput()).decode("utf-8", errors="replace")
+        if not chunk:
+            return
+        self._stdout_buffer += chunk
+        while "\n" in self._stdout_buffer:
+            line, self._stdout_buffer = self._stdout_buffer.split("\n", 1)
+            parsed = parse_progress_line(line)
+            if parsed is None:
+                continue
+            stage, fraction = parsed
+            self.progress.emit(token, fraction, stage)
 
     def _on_error(self, token: int, error: QProcess.ProcessError, workdir: Path) -> None:
         if token != self._active_token:
@@ -146,6 +205,8 @@ class TraceJobRunner(QObject):
         if token != self._active_token:
             self._cleanup(workdir)
             return
+        # Drain any trailing progress lines before teardown.
+        self._on_stdout(token)
         cancel = self._cancel_requested
         result_path = workdir / "result.json"
         svg_path = workdir / "output.svg"
@@ -191,17 +252,26 @@ class TraceJobRunner(QObject):
         self._process = None
         self._active_token = None
         self._cancel_requested = False
+        self._stdout_buffer = ""
 
     @staticmethod
     def _cleanup(workdir: Path) -> None:
         shutil.rmtree(workdir, ignore_errors=True)
 
 
-def run_trace_sync(image: Image.Image, settings: TraceSettings) -> TraceResult:
+def run_trace_sync(
+    image: Image.Image,
+    settings: TraceSettings,
+    *,
+    soft_source: Image.Image | None = None,
+    content_kind: str | None = None,
+) -> TraceResult:
     """In-process tracing for CLI and tests. Does not touch Qt."""
     from vectorizer.vectorize.dispatch import trace_prepared
 
-    return trace_prepared(image, settings)
+    return trace_prepared(
+        image, settings, soft_source=soft_source, content_kind=content_kind
+    )
 
 
 def raise_if_cancelled(cancelled: bool) -> None:

@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from enum import Enum
 
+import numpy as np
 from PIL import Image, ImageChops, ImageFilter, ImageStat
 
 from vectorizer.domain.settings import (
@@ -56,6 +57,11 @@ class ImageMetrics:
     palette_estimate: int
     minority_ratio: float
     foreground_coverage: float
+    # Share of pixels that sit near a small solid palette (anti-aliased logos
+    # have huge unique-color counts but still score high here).
+    flat_mass: float
+    # Dark ink-like outline energy — high for cel cartoons, low for photos.
+    ink_outline_score: float
 
 
 @dataclass(frozen=True)
@@ -103,8 +109,7 @@ def apply_automatic_quality(
         )
         if kind in {ContentKind.PHOTO, ContentKind.GRADIENT} and tuned.target_colors == 0:
             tuned = replace(tuned, target_colors=20)
-        elif kind == ContentKind.ILLUSTRATION and tuned.target_colors == 0:
-            tuned = replace(tuned, target_colors=min(32, max(8, tuned.color_precision * 4)))
+        # Illustrations already constrain via palette — do not double-posterize.
         return tuned.validated()
 
     # High detail — preserve structure; spend more fitting budget.
@@ -124,6 +129,15 @@ def apply_automatic_quality(
     if kind in {ContentKind.PHOTO, ContentKind.GRADIENT} and tuned.target_colors:
         # High detail: allow a richer palette before tracing.
         tuned = replace(tuned, target_colors=min(64, tuned.target_colors + 12))
+    if kind == ContentKind.ILLUSTRATION and tuned.palette and len(tuned.palette) < 24:
+        # Prefer the analyzer's richer suggestion when High detail is chosen.
+        # Palette expansion itself happens in analyze_image; here we only
+        # tighten geometry further for ink-heavy cartoons.
+        tuned = replace(
+            tuned,
+            corner_threshold=max(0, tuned.corner_threshold - 4),
+            path_precision=min(12, tuned.path_precision + 1),
+        )
     return tuned.validated()
 
 
@@ -132,6 +146,11 @@ def analyze_image(
     *,
     quality: AutomaticQuality = AutomaticQuality.BALANCED,
 ) -> ImageAnalysis:
+    # Match preprocess: near-black transparent mattes become opaque black so
+    # icons classify as logos/binary instead of sparse transparent illustrations.
+    from vectorizer.raster.preprocess import solidify_black_matte
+
+    image = solidify_black_matte(image)
     metrics = _compute_metrics(image)
     kind = _classify(metrics)
     photo_like = kind in {ContentKind.PHOTO, ContentKind.GRADIENT}
@@ -139,12 +158,135 @@ def analyze_image(
     treatment = _edge_for_kind(kind, metrics)
     palette: tuple[str, ...] = ()
     if treatment in {EdgeTreatment.BLENDED, EdgeTreatment.PHOTO}:
-        ignore = metrics.background_rgb if metrics.background_confidence >= 0.7 else None
+        # Only drop the paper color from the palette when knock-out will clear it;
+        # otherwise white must stay so the blend tracer can keep paper as a fill.
+        ignore = (
+            metrics.background_rgb
+            if base.remove_background and metrics.background_confidence >= 0.7
+            else None
+        )
         suggestions = suggest_palettes(image, ignore_rgb=ignore)
         count = suggestions.best
-        if treatment == EdgeTreatment.PHOTO:
-            count = 12 if suggestions.best >= 8 else suggestions.best
+        ink_heavy = metrics.ink_outline_score >= 0.008
+        # Cel / multi-fill scenes need more than 16 inks so teal phones and
+        # orange chairs stay distinct; photos stay capped lower for editability.
+        palette_cap = 32 if (kind == ContentKind.ILLUSTRATION and ink_heavy) else 16
+        if treatment == EdgeTreatment.PHOTO and not (
+            kind == ContentKind.ILLUSTRATION and ink_heavy
+        ):
+            # True photos/gradients: keep the posterize budget editable.
+            # Never hard-cap at 12 — that merges walls/floors into white/olive.
+            ink_budget = max(suggestions.best, min(16, max(12, metrics.palette_estimate)))
+            count = min(16, ink_budget)
+            if count not in suggestions.palettes:
+                count = min(
+                    suggestions.palettes,
+                    key=lambda n: (abs(n - count), -n),
+                )
+        elif treatment == EdgeTreatment.PHOTO and kind == ContentKind.ILLUSTRATION:
+            # Cel scenes routed to VTracer still need the rich illustration
+            # palette (walls, furniture, accents, ink) — the photo 16-cap
+            # merged couch shadows and purple tables into muddy midtones.
+            ink_budget = max(
+                2,
+                metrics.palette_estimate,
+                min(palette_cap, max(16 if ink_heavy else 8, suggestions.best)),
+            )
+            count = min(palette_cap, max(count, ink_budget))
+            if count not in suggestions.palettes:
+                count = min(
+                    suggestions.palettes,
+                    key=lambda n: (abs(n - count), -n),
+                )
+        else:
+            # Blended artwork: prefer the solid-ink estimate over AA fringe colors.
+            ink_budget = max(2, metrics.palette_estimate)
+            if base.remove_background and metrics.background_rgb is not None:
+                # Paper is knocked out, so it should not consume a palette slot.
+                ink_budget = max(2, ink_budget - 1)
+            # Illustrations need headroom so large scene colours survive.
+            if kind == ContentKind.ILLUSTRATION:
+                scene_floor = 16 if ink_heavy else 8
+                ink_budget = max(
+                    ink_budget,
+                    min(palette_cap, max(scene_floor, suggestions.best)),
+                )
+            # Flat logos with hard left/right shading need more than 3 inks
+            # (light + dark orange, white + off-white, black). Soft app icons
+            # with gradients need a richer posterize budget than `best` alone.
+            if kind == ContentKind.FLAT_LOGO:
+                soft_logo = metrics.flat_mass < 0.85
+                logo_floor = 12 if soft_logo else (8 if metrics.flat_mass < 0.92 else 5)
+                if soft_logo:
+                    ink_budget = max(
+                        ink_budget,
+                        min(16, max(logo_floor, metrics.palette_estimate // 2)),
+                    )
+                else:
+                    ink_budget = max(ink_budget, min(16, max(suggestions.best, logo_floor)))
+            count = (
+                min(count, ink_budget)
+                if kind != ContentKind.ILLUSTRATION
+                else min(palette_cap, max(count, ink_budget))
+            )
+            if kind == ContentKind.FLAT_LOGO:
+                soft_logo = metrics.flat_mass < 0.85
+                logo_floor = 12 if soft_logo else (8 if metrics.flat_mass < 0.92 else 5)
+                target = (
+                    min(16, max(logo_floor, metrics.palette_estimate // 2))
+                    if soft_logo
+                    else min(16, max(suggestions.best, logo_floor))
+                )
+                count = max(count, target)
+            # Snap to a palette we actually built.
+            if count not in suggestions.palettes:
+                count = min(
+                    suggestions.palettes,
+                    key=lambda n: (abs(n - count), -n),
+                )
         palette = suggestions.palettes.get(count, ())
+        cel_flats = False
+        if (
+            treatment == EdgeTreatment.PHOTO
+            and kind == ContentKind.ILLUSTRATION
+            and ink_heavy
+        ):
+            # Cel scenes on the VTracer path: pick inks from flat interiors so
+            # small distinct fills (white sails, gold frames) keep a slot and
+            # brown outline fringe does not.
+            from vectorizer.raster.palette import cel_fill_palette
+
+            flats = cel_fill_palette(image, max_colors=28)
+            if len(flats) >= 6:
+                cel_flats = True
+                palette = (
+                    flats if base.remove_background else _fold_background_into(flats, metrics)
+                )
+                palette_cap = 30
+        # When the scene fill stays in the output, pin the exact detected
+        # background colour so walls/skies cannot collapse to near-white.
+        if (
+            palette
+            and not cel_flats
+            and not base.remove_background
+            and metrics.background_rgb is not None
+            and metrics.background_confidence >= 0.45
+        ):
+            from vectorizer.domain.settings import normalize_hex
+            from vectorizer.raster.color import rgb_to_hex
+
+            bg_hex = normalize_hex(rgb_to_hex(metrics.background_rgb))
+            if bg_hex not in palette:
+                palette = (bg_hex, *palette)[:palette_cap]
+            else:
+                # Move it to the front so underlays / paint order prefer it.
+                palette = (bg_hex, *[c for c in palette if c != bg_hex])
+        # Keep a dedicated dark ink slot for cel outlines when present.
+        if kind == ContentKind.ILLUSTRATION and ink_heavy and palette:
+            palette = _ensure_dark_ink(palette, image, max_colors=palette_cap)
+        # Do not median-refine the whole palette here: averaging JPEG shadow
+        # into orange couches turns them muddy brown. Chroma-aware snap at
+        # label time is enough to keep pink walls off salmon fills.
     base = replace(base, edge_treatment=treatment, palette=palette)
     suggested = apply_automatic_quality(
         base, quality, photo_like=photo_like, content_kind=kind
@@ -194,7 +336,8 @@ def _compute_metrics(image: Image.Image) -> ImageMetrics:
     )
     corner_sharpness = _corner_sharpness(rgb)
     minority_ratio = _minority_color_ratio(rgb, unique)
-    palette_estimate = _estimate_palette_size(rgb, unique, exact)
+    flat_mass, palette_estimate = _flat_mass_and_palette(rgb, unique, exact)
+    ink_outline_score = _ink_outline_score(rgb)
 
     return ImageMetrics(
         width=width,
@@ -214,6 +357,8 @@ def _compute_metrics(image: Image.Image) -> ImageMetrics:
         palette_estimate=palette_estimate,
         minority_ratio=minority_ratio,
         foreground_coverage=foreground_coverage,
+        flat_mass=flat_mass,
+        ink_outline_score=ink_outline_score,
     )
 
 
@@ -234,12 +379,8 @@ def _estimate_unique_colors(rgb: Image.Image) -> tuple[int | None, bool]:
     quantized = probe.quantize(
         colors=128, method=Image.Quantize.MEDIANCUT, dither=Image.Dither.NONE
     )
-    palette_pixels = (
-        quantized.get_flattened_data()
-        if hasattr(quantized, "get_flattened_data")
-        else quantized.getdata()
-    )
-    approx = len(set(palette_pixels))
+    # Histogram over palette indices avoids materializing a Python set of every pixel.
+    approx = sum(1 for freq in quantized.histogram() if freq > 0)
     # If we saturated the 128-slot palette, treat as "many".
     if approx >= 120:
         return None, False
@@ -362,10 +503,50 @@ def _corner_sharpness(rgb: Image.Image) -> float:
     return max(0.0, min(1.0, strong / (strong + mid + 1e-6)))
 
 
+def _ink_outline_score(rgb: Image.Image) -> float:
+    """Share of dark outline pixels abutting much brighter fills.
+
+    Cel cartoons score high (brown/black ink between flat colours). Photographs
+    with large dark regions score near zero because their dark neighbours are
+    also dark.
+    """
+    gray = rgb.convert("L")
+    w, h = gray.size
+    if max(w, h) > 512:
+        scale = 512 / float(max(w, h))
+        gray = gray.resize(
+            (max(1, int(w * scale)), max(1, int(h * scale))),
+            Image.Resampling.BOX,
+        )
+    arr = np.asarray(gray, dtype=np.int16)
+    padded = np.pad(arr, 1, mode="edge")
+    neigh_max = np.maximum.reduce(
+        [
+            padded[:-2, 1:-1],
+            padded[2:, 1:-1],
+            padded[1:-1, :-2],
+            padded[1:-1, 2:],
+            padded[:-2, :-2],
+            padded[:-2, 2:],
+            padded[2:, :-2],
+            padded[2:, 2:],
+        ]
+    )
+    contrast = neigh_max - arr
+    # Dark-ish ink (including brown) with a substantially brighter neighbour.
+    outline = (arr <= 100) & (contrast >= 45)
+    return float(outline.mean())
+
+
 def _detect_background(
     rgba: Image.Image,
 ) -> tuple[tuple[int, int, int] | None, float, float]:
-    """Consensus background from corner patches + border agreement."""
+    """Consensus background from corners, with border-mode fallback for scenes.
+
+    Living-room / cel scenes often put a floor colour in the bottom corners
+    while the wall (true scene fill) dominates the top and side borders. When
+    corner agreement is weak, prefer the dominant opaque border colour.
+    """
     w, h = rgba.size
     if w < 4 or h < 4:
         return None, 0.0, 0.0
@@ -399,22 +580,66 @@ def _detect_background(
     gs = sorted(p[1] for p in samples)
     bs = sorted(p[2] for p in samples)
     mid = len(samples) // 2
-    bg = (rs[mid], gs[mid], bs[mid])
+    corner_bg = (rs[mid], gs[mid], bs[mid])
 
     # Corner consensus: fraction of samples near the median.
     tol = 18
     near = sum(
         1
         for r, g, b in samples
-        if abs(r - bg[0]) <= tol and abs(g - bg[1]) <= tol and abs(b - bg[2]) <= tol
+        if abs(r - corner_bg[0]) <= tol
+        and abs(g - corner_bg[1]) <= tol
+        and abs(b - corner_bg[2]) <= tol
     )
     corner_agreement = near / float(len(samples))
-
-    border_match = _border_match_ratio(rgba, bg, tol=tol)
+    border_match = _border_match_ratio(rgba, corner_bg, tol=tol)
     confidence = 0.55 * corner_agreement + 0.45 * border_match
+
+    if corner_agreement >= 0.72 and border_match >= 0.35:
+        return corner_bg, confidence, border_match
+
+    # Scene fallback: dominant colour along the full border ring (walls beat
+    # floors that only occupy the bottom edge).
+    border_bg = _dominant_border_color(rgba, tol=tol)
+    if border_bg is not None:
+        border_match_b = _border_match_ratio(rgba, border_bg, tol=tol)
+        if border_match_b >= max(border_match, 0.28):
+            # Mild confidence: enough to pin the palette / underlay, not enough
+            # to auto-knock the fill out of a cel scene.
+            return border_bg, min(0.82, 0.4 + 0.5 * border_match_b), border_match_b
+
     if corner_agreement < 0.72:
-        return bg, confidence * 0.5, border_match
-    return bg, confidence, border_match
+        return corner_bg, confidence * 0.5, border_match
+    return corner_bg, confidence, border_match
+
+
+def _dominant_border_color(
+    rgba: Image.Image,
+    *,
+    tol: int,
+) -> tuple[int, int, int] | None:
+    """Mode of quantized opaque border pixels."""
+    w, h = rgba.size
+    step = max(1, max(w, h) // 256)
+    arr = np.asarray(rgba, dtype=np.uint8)
+    xs = list(range(0, w, step))
+    ys = list(range(step, h - step, step))
+    samples: list[np.ndarray] = [arr[0, xs], arr[h - 1, xs]]
+    if ys:
+        samples.append(arr[ys, 0])
+        samples.append(arr[ys, w - 1])
+    ring = np.concatenate(samples, axis=0)
+    opaque = ring[:, 3] >= 128
+    if not np.any(opaque):
+        return None
+    pixels = ring[opaque, :3].astype(np.int16)
+    # Bucket to keep JPEG fringe from splitting one wall colour into many bins.
+    buckets = (pixels // 8) * 8 + 4
+    # Count unique rows.
+    flat = buckets[:, 0].astype(np.int32) * 65536 + buckets[:, 1].astype(np.int32) * 256 + buckets[:, 2]
+    values, counts = np.unique(flat, return_counts=True)
+    key = int(values[int(np.argmax(counts))])
+    return ((key >> 16) & 255, (key >> 8) & 255, key & 255)
 
 
 def _border_match_ratio(
@@ -425,62 +650,122 @@ def _border_match_ratio(
 ) -> float:
     w, h = rgba.size
     tr, tg, tb = color
-    matched = 0
-    total = 0
     # Sample the outer ring without walking every pixel on huge images.
     step = max(1, max(w, h) // 256)
-
-    def _consider(x: int, y: int) -> None:
-        nonlocal matched, total
-        r, g, b, a = rgba.getpixel((x, y))
-        if a < 128:
-            return
-        total += 1
-        if abs(r - tr) <= tol and abs(g - tg) <= tol and abs(b - tb) <= tol:
-            matched += 1
-
-    for x in range(0, w, step):
-        _consider(x, 0)
-        _consider(x, h - 1)
-    for y in range(step, h - step, step):
-        _consider(0, y)
-        _consider(w - 1, y)
-
-    if total == 0:
+    arr = np.asarray(rgba, dtype=np.uint8)
+    xs = list(range(0, w, step))
+    ys = list(range(step, h - step, step))
+    samples: list[np.ndarray] = [
+        arr[0, xs],
+        arr[h - 1, xs],
+    ]
+    if ys:
+        samples.append(arr[ys, 0])
+        samples.append(arr[ys, w - 1])
+    ring = np.concatenate(samples, axis=0)
+    opaque = ring[:, 3] >= 128
+    if not np.any(opaque):
         return 0.0
-    return matched / float(total)
+    pixels = ring[opaque, :3].astype(np.int16)
+    near = (
+        (np.abs(pixels[:, 0] - tr) <= tol)
+        & (np.abs(pixels[:, 1] - tg) <= tol)
+        & (np.abs(pixels[:, 2] - tb) <= tol)
+    )
+    return float(near.mean())
 
 
-def _estimate_palette_size(
+def _analysis_probe(rgb: Image.Image, *, max_side: int = 256) -> Image.Image:
+    w, h = rgb.size
+    if max(w, h) <= max_side:
+        return rgb
+    scale = max_side / float(max(w, h))
+    return rgb.resize(
+        (max(1, int(w * scale)), max(1, int(h * scale))),
+        Image.Resampling.BOX,
+    )
+
+
+def _flat_mass_and_palette(
     rgb: Image.Image,
     unique: int | None,
     exact: bool,
-) -> int:
-    if exact and unique is not None:
-        return max(2, unique)
-    # Probe reconstruction error across a few palette sizes.
-    probe = rgb
-    w, h = probe.size
-    if max(w, h) > 256:
-        scale = 256 / float(max(w, h))
-        probe = probe.resize(
-            (max(1, int(w * scale)), max(1, int(h * scale))),
-            Image.Resampling.BILINEAR,
-        )
-    candidates = (4, 8, 12, 16, 24, 32, 48)
-    best = 32
+) -> tuple[float, int]:
+    """Return (flat_mass, effective_palette_size).
+
+    Anti-aliased logos inflate unique-color counts into the hundreds while still
+    reconstructing cleanly from a handful of solid inks. `flat_mass` is the
+    share of probe pixels whose OKLab distance to a 12-color MAXCOVERAGE
+    palette stays within the blend-tracer "stable" band.
+    """
+    from vectorizer.raster.color import nearest_oklab, srgb_u8_to_oklab
+
+    probe = _analysis_probe(rgb, max_side=256)
+    method = getattr(Image.Quantize, "MAXCOVERAGE", Image.Quantize.MEDIANCUT)
+    probe_arr = np.asarray(probe, dtype=np.uint8)
+    probe_lab = srgb_u8_to_oklab(probe_arr)
+
+    def _palette_colors(count: int) -> list[tuple[int, int, int]]:
+        try:
+            quantized = probe.quantize(
+                colors=max(2, count), method=method, dither=Image.Dither.NONE
+            )
+        except Exception:
+            quantized = probe.quantize(
+                colors=max(2, count),
+                method=Image.Quantize.MEDIANCUT,
+                dither=Image.Dither.NONE,
+            )
+        palette = quantized.getpalette() or []
+        colors: list[tuple[int, int, int]] = []
+        for index, freq in enumerate(quantized.histogram()):
+            if freq <= 0 or index * 3 + 2 >= len(palette):
+                continue
+            colors.append(
+                (
+                    int(palette[index * 3]),
+                    int(palette[index * 3 + 1]),
+                    int(palette[index * 3 + 2]),
+                )
+            )
+        return colors
+
+    colors12 = _palette_colors(12)
+    if not colors12:
+        fallback = max(2, unique or 24)
+        return 0.0, fallback
+    index, dist = nearest_oklab(
+        probe_lab, srgb_u8_to_oklab(np.asarray(colors12, dtype=np.uint8))
+    )
+    flat_mass = float((dist <= 0.0025).mean())
+    assigned = np.asarray(colors12, dtype=np.int16)[index]
+    mean12 = float(np.abs(probe_arr.astype(np.int16) - assigned).mean())
+
+    # Tiny exact palettes are trusted directly (pixel art, binary marks).
+    if exact and unique is not None and unique <= 32 and flat_mass >= 0.98:
+        return flat_mass, max(2, unique)
+
+    candidates = (2, 3, 4, 6, 8, 12, 16, 24, 32, 48)
+    best = candidates[-1]
     for n in candidates:
-        q = probe.quantize(colors=n, method=Image.Quantize.MEDIANCUT, dither=Image.Dither.NONE)
-        restored = q.convert("RGB")
-        # Mean channel absolute error — cheap stand-in for perceptual fit.
-        err = ImageChops.difference(probe, restored)
-        mean = sum(ImageStat.Stat(err).mean) / 3.0
+        colors = _palette_colors(n)
+        if not colors:
+            continue
+        _idx, _dist = nearest_oklab(
+            probe_lab, srgb_u8_to_oklab(np.asarray(colors, dtype=np.uint8))
+        )
+        restored = np.asarray(colors, dtype=np.int16)[_idx]
+        mean = float(np.abs(probe_arr.astype(np.int16) - restored).mean())
         best = n
-        if mean < 10.0:
+        # Prefer the smallest palette that still reconstructs the solids; AA
+        # fringe keeps mean error a bit above zero even on perfect logos.
+        if mean <= 10.0 or (flat_mass >= 0.92 and mean <= max(12.0, mean12 + 1.0)):
             break
-    if unique is None:
-        return max(best, 24)
-    return max(2, min(best, unique))
+    if unique is None and flat_mass < 0.75:
+        return flat_mass, max(best, 24)
+    if unique is not None and unique <= best:
+        return flat_mass, max(2, unique)
+    return flat_mass, max(2, best)
 
 
 # ---------------------------------------------------------------------------
@@ -498,12 +783,145 @@ def _edge_for_kind(kind: ContentKind, m: ImageMetrics) -> EdgeTreatment:
         return EdgeTreatment.HARD
     if kind == ContentKind.LINE_ART and m.corner_sharpness >= 0.55:
         return EdgeTreatment.HARD
+    # Large ink-heavy cel scenes: BlendTracer hard-cel collapses to ~one path
+    # per palette colour (broken outlines, splotchy fills). VTracer on a
+    # stroke-solidified snap keeps continuous ink and flat fills.
+    if (
+        kind == ContentKind.ILLUSTRATION
+        and m.ink_outline_score >= 0.008
+        and (m.width * m.height) >= 180_000
+    ):
+        return EdgeTreatment.PHOTO
+    # Logos / smaller illustrations keep the blend iso-contour path.
     return EdgeTreatment.BLENDED
+
+
+def _fold_background_into(
+    palette: tuple[str, ...],
+    metrics: ImageMetrics,
+    *,
+    tol: int = 10,
+) -> tuple[str, ...]:
+    """Put the scene-background ink first without adding a near-twin.
+
+    The detected background is a bucket centre (#fcccd4); the flat palette
+    already holds the true wall median (#ffcbd5). Inserting both splits one
+    wall into two interleaved fills, so prefer the palette's own colour.
+    """
+    from vectorizer.domain.settings import normalize_hex
+    from vectorizer.raster.color import hex_to_rgb, rgb_to_hex
+
+    if metrics.background_rgb is None or metrics.background_confidence < 0.45:
+        return palette
+    bg = metrics.background_rgb
+    for i, color in enumerate(palette):
+        r, g, b = hex_to_rgb(color)
+        if max(abs(r - bg[0]), abs(g - bg[1]), abs(b - bg[2])) <= tol:
+            return (color, *palette[:i], *palette[i + 1 :])
+    return (normalize_hex(rgb_to_hex(bg)), *palette)
+
+
+def _ensure_dark_ink(
+    palette: tuple[str, ...],
+    image: Image.Image,
+    *,
+    max_colors: int = 24,
+) -> tuple[str, ...]:
+    """Guarantee a near-black ink slot for cel outlines.
+
+    JPEG cel art often browns true black strokes. Sampling the *median* outline
+    pixel yields muddy brown (#724241) that then eats orange couches. Use the
+    darkest outline percentile instead, and never accept an ink lighter than
+    luma 45. The palette is always cleaned of stroke impostors, even when a
+    near-black ink is already present.
+    """
+    from vectorizer.raster.color import hex_to_rgb
+
+    def _luma(hex_color: str) -> float:
+        r, g, b = hex_to_rgb(hex_color)
+        return 0.299 * r + 0.587 * g + 0.114 * b
+
+    existing = [c for c in palette if _luma(c) <= 45]
+    if existing:
+        ink = min(existing, key=_luma)
+    else:
+        ink = _sample_dark_ink(image)
+    # Drop muddy-brown stroke impostors: JPEG outline pixels otherwise snap to
+    # them and break the black line work. High-chroma oranges (couch shadows
+    # like #b35427, sat > 110), dark hues (purple shelf, teal floor shadow) and
+    # neutral greys (metal hoops, tyres) are real fills and stay.
+    cleaned: list[str] = []
+    for color in palette:
+        if color == ink:
+            continue
+        r, g, b = hex_to_rgb(color)
+        luma = 0.299 * r + 0.587 * g + 0.114 * b
+        sat = max(r, g, b) - min(r, g, b)
+        if luma <= 45 and sat <= 48:
+            continue
+        brown = r >= g - 2 and g >= b - 2 and r - b >= 24
+        if 40 < luma <= 130 and sat <= 85 and brown:
+            continue
+        cleaned.append(color)
+    palette = tuple(cleaned) if cleaned else palette
+    if len(palette) < max_colors:
+        return palette + (ink,)
+    if len(palette) <= 1:
+        return (ink,)
+    replace_at = max(range(1, len(palette)), key=lambda i: _luma(palette[i]))
+    return tuple(ink if i == replace_at else c for i, c in enumerate(palette))
+
+
+def _sample_dark_ink(image: Image.Image) -> str:
+    """Darkest-quartile outline colour, forced to cel black when too light."""
+    from vectorizer.domain.settings import normalize_hex
+    from vectorizer.raster.color import rgb_to_hex
+
+    probe = _analysis_probe(image.convert("RGB"), max_side=256)
+    arr = np.asarray(probe, dtype=np.int16)
+    gray = (0.299 * arr[..., 0] + 0.587 * arr[..., 1] + 0.114 * arr[..., 2]).astype(
+        np.float32
+    )
+    padded = np.pad(gray, 1, mode="edge")
+    neigh_max = np.maximum.reduce(
+        [
+            padded[:-2, 1:-1],
+            padded[2:, 1:-1],
+            padded[1:-1, :-2],
+            padded[1:-1, 2:],
+        ]
+    )
+    # Prefer true stroke pixels: dark + high local contrast.
+    outline = (gray <= 70.0) & ((neigh_max - gray) >= 45.0)
+    if np.count_nonzero(outline) < 16:
+        # Fall back to globally darkest opaque pixels.
+        thr = float(np.percentile(gray, 1.0))
+        outline = gray <= thr
+    fallback = normalize_hex("#1a0a00")
+    if not np.any(outline):
+        return fallback
+    dark = arr[outline]
+    # Darkest quartile of outline samples — not the brown JPEG fringe median.
+    lumas = (0.299 * dark[:, 0] + 0.587 * dark[:, 1] + 0.114 * dark[:, 2]).astype(
+        np.float32
+    )
+    keep = lumas <= float(np.percentile(lumas, 25.0))
+    sample = dark[keep] if np.any(keep) else dark
+    median = np.median(sample, axis=0)
+    r, g, b = (int(median[0]), int(median[1]), int(median[2]))
+    if 0.299 * r + 0.587 * g + 0.114 * b > 45:
+        return fallback
+    return normalize_hex(rgb_to_hex((r, g, b)))
 
 
 def _classify(m: ImageMetrics) -> ContentKind:
     min_side = min(m.width, m.height)
     unique = m.unique_colors
+    # Effective ink count: prefer the reconstruction palette when anti-aliasing
+    # or JPEG fringe inflates the raw unique-color tally.
+    effective = m.palette_estimate
+    if unique is not None:
+        effective = min(effective, unique) if unique <= 48 else effective
 
     if unique is not None and unique <= 2:
         return ContentKind.BINARY_MARK
@@ -531,16 +949,71 @@ def _classify(m: ImageMetrics) -> ContentKind:
     ):
         return ContentKind.PIXEL_ART
 
+    # Cel / cartoon with ink outlines — check before flat-logo so large scenes
+    # with pink walls do not get the aggressive logo speckle recipe.
+    # Strong ink alone can certify cel art: rich JPEG scenes often report a
+    # collapsed flat_mass against a 12-colour probe even when fills are flat.
+    strong_ink = m.ink_outline_score >= 0.012
+    # Near-black canvas + sparse opaque mark is a logo/icon, not a cel scene.
+    logo_matte = (
+        m.background_rgb is not None
+        and max(m.background_rgb) <= 40
+        and m.background_confidence >= 0.7
+        and m.opaque_ratio >= 0.85
+    )
+    cel_like = (
+        not logo_matte
+        and m.ink_outline_score >= 0.008
+        and m.corner_sharpness >= 0.40
+        and m.fill_ratio >= 0.40
+        and m.noise_score < 0.60
+        and (m.flat_mass >= 0.40 or strong_ink)
+    )
+
+    # Flat logos: either a hard limited palette, or a small solid palette with
+    # anti-aliased / JPEG fringe that looks like "many colors". Large multi-
+    # colour scenes with ink outlines are illustrations, not logos.
     if (
-        unique is not None
-        and unique <= 32
+        not cel_like
         and m.corner_sharpness >= 0.35
         and m.noise_score < 0.45
         and m.fill_ratio >= 0.35
+        and (
+            logo_matte
+            or (unique is not None and unique <= 32 and m.pixel_count <= 250_000)
+            or (m.flat_mass >= 0.90 and effective <= 8 and m.pixel_count <= 500_000)
+            or (m.flat_mass >= 0.95 and effective <= 6)
+        )
     ):
         return ContentKind.FLAT_LOGO
 
-    if unique is not None and unique <= 96 and m.noise_score < 0.55 and m.corner_sharpness >= 0.25:
+    # Cel / cartoon / poster art: flat fills + dark ink outlines beat the
+    # unique-color explosion from JPEG/AA fringe. Do not use mid flat_mass
+    # alone — photographic probes often land around 0.6–0.7.
+    # Continuous-tone photos can look "flat" after aggressive quantization;
+    # require ink / limited unique colours before trusting mid flat_mass.
+    continuous_tone = unique is None or unique > 256
+    if (
+        m.noise_score < 0.60
+        and m.corner_sharpness >= 0.25
+        and (
+            cel_like
+            or (
+                strong_ink
+                and m.fill_ratio >= 0.55
+                and m.corner_sharpness >= 0.35
+            )
+            or (unique is not None and unique <= 96)
+            or (m.flat_mass >= 0.82 and effective <= 48 and not continuous_tone)
+            or (
+                m.flat_mass >= 0.70
+                and m.fill_ratio >= 0.45
+                and m.corner_sharpness >= 0.35
+                and effective <= 64
+                and not continuous_tone
+            )
+        )
+    ):
         return ContentKind.ILLUSTRATION
 
     # Continuous tone: separate smooth gradients from photographic noise.
@@ -654,15 +1127,17 @@ def _settings_for_kind(kind: ContentKind, m: ImageMetrics) -> TraceSettings:
         if palette > 24 or m.noise_score > 0.3:
             target = min(32, max(8, palette))
         # Soft anti-aliased logos (many near-bg fringe colors): knocking out the
-        # background tends to leave a halo of junk paths. Prefer tracing on the
-        # opaque raster unless the palette is already hard-edged and tiny.
-        logo_remove_bg = remove_bg and unique <= 8
+        # background tends to leave a halo of junk paths on the VTracer path.
+        # The blend tracer handles paper via empty labels, so allow knock-out
+        # when the effective solid palette is still small.
+        logo_remove_bg = remove_bg and (unique <= 8 or (m.flat_mass >= 0.9 and palette <= 8))
         return TraceSettings(
             workflow=WorkflowMode.AUTOMATIC,
             colormode=ColorMode.COLOR,
             hierarchical=hierarchical,
             mode=PathFitMode.SPLINE,
-            filter_speckle=max(1, int(3 * area_scale)),
+            # Speckle filter eats thin AA fringes and small accents; keep mild.
+            filter_speckle=max(0, int(2 * area_scale)),
             color_precision=7 if palette <= 16 else 6,
             layer_difference=10 if palette <= 16 else 14,
             corner_threshold=40 if m.corner_sharpness > 0.5 else 55,
@@ -670,7 +1145,7 @@ def _settings_for_kind(kind: ContentKind, m: ImageMetrics) -> TraceSettings:
             max_iterations=12,
             splice_threshold=40,
             path_precision=4,
-            preserve_transparency=True,
+            preserve_transparency=m.has_alpha and m.opaque_ratio < 0.98,
             remove_background=logo_remove_bg,
             background_r=bg[0],
             background_g=bg[1],
@@ -681,28 +1156,45 @@ def _settings_for_kind(kind: ContentKind, m: ImageMetrics) -> TraceSettings:
         ).validated()
 
     if kind == ContentKind.ILLUSTRATION:
-        target = min(48, max(12, m.palette_estimate))
+        # Cel-shaded scenes often match wall/sky to the corner colour — never
+        # auto-knock those out; the user can still enable removal manually.
+        illustration_remove = (
+            remove_bg
+            and m.background_confidence >= 0.88
+            and m.border_match_ratio >= 0.7
+            and m.foreground_coverage >= 0.5
+        )
+        # Keep thin ink outlines; the constrained palette already limits colours
+        # so an extra target_colors pass would only blur and merge fills.
+        ink_heavy = m.ink_outline_score >= 0.008
+        # Prefer smooth, faithful fills over ultra-tight "keen" geometry that
+        # turned cel couches muddy and edges crunchy at megapixel sizes.
+        # Large ink-heavy cels route to VTracer (PHOTO edge): favour slightly
+        # smoother corners so solidified ink ribbons do not look stair-stepped.
+        large_cel = ink_heavy and (m.width * m.height) >= 180_000
         return TraceSettings(
             workflow=WorkflowMode.AUTOMATIC,
             colormode=ColorMode.COLOR,
             hierarchical=HierarchyMode.STACKED,
             mode=PathFitMode.SPLINE,
-            filter_speckle=max(2, int(5 * area_scale)),
-            color_precision=6,
-            layer_difference=14,
-            corner_threshold=55,
-            length_threshold=4.0,
-            max_iterations=10,
-            splice_threshold=45,
-            path_precision=3,
+            # Speckle must stay tiny on cel art — filter_speckle≥4 eats 1–2 px
+            # ink outlines on megapixel scenes and the couch loses its contour.
+            filter_speckle=0 if ink_heavy else max(0, int(1 * area_scale)),
+            color_precision=8 if large_cel else 7,
+            layer_difference=4 if large_cel else (8 if ink_heavy else 10),
+            corner_threshold=48 if large_cel else (38 if ink_heavy else 50),
+            length_threshold=3.5 if ink_heavy else 3.6,
+            max_iterations=14 if ink_heavy else 12,
+            splice_threshold=30 if large_cel else (28 if ink_heavy else 35),
+            path_precision=4 if ink_heavy else 3,
             preserve_transparency=m.has_alpha,
-            remove_background=remove_bg and m.background_confidence >= 0.82,
+            remove_background=illustration_remove,
             background_r=bg[0],
             background_g=bg[1],
             background_b=bg[2],
             background_tolerance=_bg_tolerance(m),
-            target_colors=target if m.noise_score > 0.25 or (m.unique_colors or 999) > 48 else 0,
-            smooth_noise=smooth,
+            target_colors=0,
+            smooth_noise=False,
         ).validated()
 
     # PHOTO / GRADIENT — posterize then spline for editable regions.
@@ -762,6 +1254,15 @@ def _should_remove_background(kind: ContentKind, m: ImageMetrics) -> bool:
         return False
     if m.border_match_ratio < 0.55:
         return False
+    # Scene colours (walls, skies) dominate the interior while also matching the
+    # corners. Knocking those out swallows half the illustration.
+    if m.foreground_coverage < 0.42:
+        return False
+    # Black / near-black mattes are part of the logo (Brave, ChatGPT, app icons).
+    # Knocking them out leaves the mark floating on white and destroys the mark.
+    br, bg, bb = m.background_rgb
+    if max(br, bg, bb) <= 40:
+        return False
     # Background must cover a meaningful outer frame but not the whole image.
     if m.opaque_ratio > 0.995 and m.border_match_ratio > 0.97 and kind == ContentKind.FLAT_LOGO:
         # Full-bleed flat image with uniform border — still OK to knock out.
@@ -807,7 +1308,13 @@ def _build_notes(
             "Smooth gradients detected. Colors will be posterized into editable regions."
         ),
     }
-    notes.append(labels[kind])
+    if kind == ContentKind.ILLUSTRATION and m.ink_outline_score >= 0.008:
+        notes.append(
+            "Detected cel / cartoon art with ink outlines; preserving flat fills "
+            "and dark line work."
+        )
+    else:
+        notes.append(labels[kind])
 
     if m.unique_colors is not None:
         notes.append(f"About {m.unique_colors} unique colors sampled.")
@@ -820,6 +1327,16 @@ def _build_notes(
             f"Auto background removal armed (#{r:02x}{g:02x}{b:02x}, "
             f"confidence {m.background_confidence:.0%})."
         )
+    elif (
+        not suggested.remove_background
+        and m.background_rgb is not None
+        and m.background_confidence >= 0.45
+        and kind in {ContentKind.ILLUSTRATION, ContentKind.FLAT_LOGO}
+    ):
+        r, g, b = m.background_rgb
+        notes.append(
+            f"Scene background kept as fill (#{r:02x}{g:02x}{b:02x})."
+        )
     elif m.has_alpha:
         notes.append("Source transparency will be preserved.")
 
@@ -830,12 +1347,25 @@ def _build_notes(
         notes.append(
             f"Output colors constrained to a {len(suggested.palette)}-color palette."
         )
+    if (
+        kind == ContentKind.ILLUSTRATION
+        and m.ink_outline_score >= 0.008
+        and suggested.edge_treatment == EdgeTreatment.PHOTO
+    ):
+        notes.append(
+            "Cel outlines solidified before tracing so ink stays continuous."
+        )
     if suggested.edge_treatment == EdgeTreatment.BLENDED:
         notes.append("Edges follow anti-aliased blending inside each boundary pixel.")
     elif suggested.edge_treatment == EdgeTreatment.HARD:
         notes.append("Hard edges: shapes snap to flat colors before fitting.")
     elif suggested.edge_treatment == EdgeTreatment.PHOTO:
-        notes.append("Photograph: posterized to the palette, then traced as regions.")
+        if kind == ContentKind.ILLUSTRATION and m.ink_outline_score >= 0.008:
+            notes.append(
+                "Cel scene: palette-snapped regions with solidified ink outlines."
+            )
+        else:
+            notes.append("Photograph: posterized to the palette, then traced as regions.")
 
     if suggested.target_colors:
         notes.append(f"Pre-quantizing to {suggested.target_colors} colors for cleaner regions.")

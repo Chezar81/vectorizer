@@ -27,6 +27,7 @@ ALLOWED_MEMBER_NAMES = frozenset(
         "manifest.json",
         "source.png",
         "segmentation.png",
+        "soft_source.png",
         "result.svg",
     }
 )
@@ -60,8 +61,10 @@ def save_project(path: str | Path, data: ProjectData) -> Path:
     source_bytes = source_buf.getvalue()
 
     seg_bytes: bytes | None = None
+    soft_bytes: bytes | None = None
     if data.segmentation is not None:
         seg_bytes = data.segmentation.to_png_bytes()
+        soft_bytes = data.segmentation.soft_to_png_bytes()
 
     svg_text = data.result_svg
     manifest = {
@@ -70,6 +73,7 @@ def save_project(path: str | Path, data: ProjectData) -> Path:
         "source_name": data.source_name,
         "source": "source.png",
         "segmentation": "segmentation.png" if seg_bytes else None,
+        "soft_source": "soft_source.png" if soft_bytes else None,
         "result": "result.svg" if svg_text else None,
         "settings": data.settings.validated().to_json(),
         "notes": list(data.notes),
@@ -83,6 +87,8 @@ def save_project(path: str | Path, data: ProjectData) -> Path:
             archive.writestr("source.png", source_bytes)
             if seg_bytes is not None:
                 archive.writestr("segmentation.png", seg_bytes)
+            if soft_bytes is not None:
+                archive.writestr("soft_source.png", soft_bytes)
             if svg_text:
                 archive.writestr("result.svg", svg_text.encode("utf-8"))
         tmp.replace(destination)
@@ -130,7 +136,17 @@ def load_project(path: str | Path) -> ProjectData:
             seg_member = manifest.get("segmentation")
             if seg_member:
                 _assert_safe_member(seg_member)
-                segmentation = SegmentationMap.from_png_bytes(archive.read(seg_member))
+                soft_image = None
+                soft_member = manifest.get("soft_source")
+                if soft_member:
+                    _assert_safe_member(soft_member)
+                    if soft_member in archive.namelist():
+                        soft_image = Image.open(io.BytesIO(archive.read(soft_member)))
+                        soft_image.load()
+                        soft_image = soft_image.convert("RGBA")
+                segmentation = SegmentationMap.from_png_bytes(
+                    archive.read(seg_member), soft_source=soft_image
+                )
                 if segmentation.size != source.size:
                     raise ProjectError(
                         "Segmentation dimensions do not match the source image."

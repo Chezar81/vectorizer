@@ -39,20 +39,50 @@ def srgb_u8_to_oklab(rgb: np.ndarray) -> np.ndarray:
 def nearest_oklab(
     pixels: np.ndarray,
     palette: np.ndarray,
+    *,
+    chroma_weight: float = 1.0,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Return (index HxW int16, squared-distance HxW float32) to the nearest palette row."""
+    """Return (index HxW int16, squared-distance HxW float32) to the nearest palette row.
+
+    `chroma_weight` > 1 emphasises OKLab a/b (hue/chroma) over L. Cel cartoons
+    need this so pink walls do not collapse onto nearby orange fills.
+
+    Large rasters may use an optional CUDA path when the active compute plan
+    enables GPU raster work; otherwise this stays on numpy (identical algorithm).
+    """
+    from vectorizer.hardware.accel import nearest_oklab_accelerated
+
+    accelerated = nearest_oklab_accelerated(
+        pixels, palette, chroma_weight=chroma_weight
+    )
+    if accelerated is not None:
+        return accelerated
+
     height, width, _ = pixels.shape
     flat = np.ascontiguousarray(pixels, dtype=np.float32).reshape(-1, 3)
     pal = np.ascontiguousarray(palette, dtype=np.float32)
-    index = np.empty(flat.shape[0], dtype=np.int16)
-    dist = np.empty(flat.shape[0], dtype=np.float32)
-    chunk = 200_000
-    for start in range(0, flat.shape[0], chunk):
+    n_pixels = flat.shape[0]
+    n_palette = pal.shape[0]
+    index = np.empty(n_pixels, dtype=np.int16)
+    dist = np.empty(n_pixels, dtype=np.float32)
+    if n_palette == 0:
+        index.fill(0)
+        dist.fill(0.0)
+        return index.reshape(height, width), dist.reshape(height, width)
+    weight = np.asarray(
+        [1.0, max(1.0, float(chroma_weight)), max(1.0, float(chroma_weight))],
+        dtype=np.float32,
+    )
+    # Keep the (pixels × palette × 3) temporary under ~24 MiB of float32.
+    chunk = max(1, min(200_000, (6_000_000 // max(1, n_palette))))
+    for start in range(0, n_pixels, chunk):
         block = flat[start : start + chunk]
-        delta = block[:, None, :] - pal[None, :, :]
-        squared = np.einsum("nkc,nkc->nk", delta, delta)
-        index[start : start + chunk] = squared.argmin(axis=1).astype(np.int16)
-        dist[start : start + chunk] = squared.min(axis=1)
+        delta = (block[:, None, :] - pal[None, :, :]) * weight
+        squared = np.einsum("nkc,nkc->nk", delta, delta, optimize=True)
+        best = squared.argmin(axis=1)
+        rows = np.arange(best.shape[0])
+        index[start : start + chunk] = best.astype(np.int16, copy=False)
+        dist[start : start + chunk] = squared[rows, best]
     return index.reshape(height, width), dist.reshape(height, width)
 
 

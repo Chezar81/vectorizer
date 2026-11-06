@@ -100,13 +100,48 @@ class _WipeLabel(QWidget):
         self._original: QPixmap | None = None
         self._vector: QPixmap | None = None
         self._ratio = 0.5
+        self._scaled_original: QPixmap | None = None
+        self._scaled_vector: QPixmap | None = None
+        self._cache_size: tuple[int, int] | None = None
         self.setMinimumHeight(200)
 
     def set_wipe(self, original: QPixmap | None, vector: QPixmap | None, ratio: float) -> None:
-        self._original = original
-        self._vector = vector
+        if original is not self._original or vector is not self._vector:
+            self._original = original
+            self._vector = vector
+            self._scaled_original = None
+            self._scaled_vector = None
+            self._cache_size = None
         self._ratio = max(0.0, min(1.0, ratio))
         self.update()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        self._scaled_original = None
+        self._scaled_vector = None
+        self._cache_size = None
+        super().resizeEvent(event)
+
+    def _ensure_scaled(self) -> None:
+        size = (self.width(), self.height())
+        if self._cache_size == size and (
+            self._scaled_vector is not None or self._scaled_original is not None
+        ):
+            return
+        self._cache_size = size
+        self._scaled_original = None
+        self._scaled_vector = None
+        if self._vector is not None and not self._vector.isNull():
+            self._scaled_vector = self._vector.scaled(
+                self.size(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        if self._original is not None and not self._original.isNull():
+            self._scaled_original = self._original.scaled(
+                self.size(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
 
     def paintEvent(self, event) -> None:  # noqa: N802
         painter = QPainter(self)
@@ -115,26 +150,17 @@ class _WipeLabel(QWidget):
         if target is None or target.isNull():
             painter.end()
             return
-        scaled = target.scaled(
-            self.size(),
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
+        self._ensure_scaled()
+        scaled = self._scaled_vector or self._scaled_original
+        if scaled is None or scaled.isNull():
+            painter.end()
+            return
         x = (self.width() - scaled.width()) // 2
         y = (self.height() - scaled.height()) // 2
-        if self._vector is not None and not self._vector.isNull():
-            vec = self._vector.scaled(
-                self.size(),
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
-            painter.drawPixmap(x, y, vec)
-        if self._original is not None and not self._original.isNull():
-            orig = self._original.scaled(
-                self.size(),
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
+        if self._scaled_vector is not None and not self._scaled_vector.isNull():
+            painter.drawPixmap(x, y, self._scaled_vector)
+        if self._scaled_original is not None and not self._scaled_original.isNull():
+            orig = self._scaled_original
             clip_w = int(orig.width() * self._ratio)
             painter.drawPixmap(x, y, orig, 0, 0, clip_w, orig.height())
             pen = QPen(QColor("#1f9ede"))
