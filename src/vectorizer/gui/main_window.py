@@ -31,7 +31,6 @@ from PySide6.QtWidgets import (
     QLabel,
     QMainWindow,
     QMessageBox,
-    QProgressBar,
     QSpinBox,
     QStackedWidget,
     QTabWidget,
@@ -199,15 +198,8 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
         self.setMinimumSize(640, 360)
 
-        self._progress = QProgressBar()
-        self._progress.setMaximumWidth(180)
-        self._progress.setRange(0, 1000)
-        self._progress.setValue(0)
-        self._progress.setTextVisible(False)
-        self._progress.hide()
         self._status_info = QLabel()
         self.statusBar().addWidget(self._status_info, 1)
-        self.statusBar().addPermanentWidget(self._progress)
 
         self.runner = TraceJobRunner(self)
         self.runner.started.connect(self._on_job_started)
@@ -935,8 +927,6 @@ class MainWindow(QMainWindow):
             indeterminate=True,
             show_eta=False,
         )
-        self._progress.setRange(0, 0)
-        self._progress.show()
         self._idle_status = False
         self._status_info.setText(t(stage))
         QApplication.processEvents()
@@ -949,11 +939,7 @@ class MainWindow(QMainWindow):
             return
         if fraction is None:
             self._trace_overlay.set_stage(stage)
-            self._progress.setRange(0, 0)
         else:
-            # Determinate steps once analysis/segmentation progress is known.
-            self._progress.setRange(0, 1000)
-            self._progress.setValue(int(round(max(0.0, min(1.0, fraction)) * 1000)))
             self._trace_overlay.set_stage(stage, fraction=fraction)
         self._status_info.setText(t(stage))
         QApplication.processEvents()
@@ -962,8 +948,6 @@ class MainWindow(QMainWindow):
         if self.runner.busy:
             return
         self._trace_overlay.finish()
-        self._progress.hide()
-        self._progress.setValue(0)
 
     def _adopt_loaded(self, loaded: LoadedImage) -> None:
         # Loading chrome may already be visible from open_path / paste.
@@ -1515,9 +1499,6 @@ class MainWindow(QMainWindow):
         if token != self._current_token:
             return
         self.panel.set_busy(True)
-        self._progress.setRange(0, 1000)
-        self._progress.setValue(0)
-        self._progress.show()
         self._idle_status = False
         label = (
             t("Retracing segmentation…")
@@ -1534,16 +1515,12 @@ class MainWindow(QMainWindow):
     def _on_job_progress(self, token: int, fraction: float, stage: str) -> None:
         if token != self._current_token:
             return
-        self._progress.setRange(0, 1000)
-        self._progress.setValue(int(round(max(0.0, min(1.0, fraction)) * 1000)))
         self._trace_overlay.update_progress(fraction, stage)
         self._idle_status = False
         self._status_info.setText(t(stage) if stage else t("Tracing…"))
 
     def _finish_job_chrome(self) -> None:
         self.panel.set_busy(False)
-        self._progress.hide()
-        self._progress.setValue(0)
         self._trace_overlay.finish()
 
     def _on_job_succeeded(self, token: int, result: object) -> None:

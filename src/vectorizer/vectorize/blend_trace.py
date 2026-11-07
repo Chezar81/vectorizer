@@ -27,6 +27,7 @@ from vectorizer.svg.parse import parse_svg_document
 from vectorizer.vectorize.backend import TraceResult
 from vectorizer.vectorize.curves import fit_closed_contour, segments_to_path_d
 from vectorizer.vectorize.iso_contour import (
+    _dilate4,
     coverage_field,
     marching_squares,
     orient_clockwise,
@@ -37,6 +38,12 @@ _EMPTY = -1
 # Megapixel cel scenes: trace at a capped working size, then scale paths back.
 # Full-resolution iso-contours were 40s+ and often crunchier, not closer.
 _MAX_WORKING_SIDE = 1280
+# Cutout layers trace the source's own AA coverage, so only a light blur is
+# needed; ≥1.5 px blur dropped 2 px ink strokes below the 0.5 isolevel.
+_CUTOUT_SIGMA = 0.9
+# Along-contour smoothing of cutout iso rings: removes residual pixel-stair
+# wobble on long letter / shield edges without eroding thin strokes.
+_CUTOUT_RING_PASSES = 8
 
 
 class BlendTracer:
@@ -101,6 +108,8 @@ class BlendTracer:
         else:
             labels, pixels_lab, palette_lab, bg_lab = label_regions(rgba, colors, validated)
             labels = _drop_specks(labels, validated.filter_speckle)
+            if validated.preserve_transparency and float((labels < 0).mean()) >= 0.02:
+                _absorb_between_fringe(labels, pixels_lab, palette_lab)
         report(STAGE_CONTOURS, 0.22)
         soft_lab = None
         if soft_for_labels is not None:
@@ -175,11 +184,21 @@ def label_regions(
             + 0.114 * int(palette_rgb[i][2])
         ),
     )
+    # Bright palette slots (white letters, specular eye dots) must survive
+    # stroke forcing and spatial majority — a 2×2 white eye highlight is
+    # otherwise voted into black by its ink neighbourhood.
+    bright_ids = [
+        i
+        for i, color in enumerate(palette_rgb)
+        if (0.299 * int(color[0]) + 0.587 * int(color[1]) + 0.114 * int(color[2]))
+        >= 200
+    ]
+    protect_ids = list(dict.fromkeys([*dark_ids, *bright_ids]))
     if dark_ids:
         # Reclaim flat chromatic darks first, then force strokes onto ink so
         # reclaim cannot undo the outline pass.
         _reclaim_chromatic_darks(labels, rgba[..., :3], palette_rgb, dark_ids)
-        _force_stroke_ink(labels, rgba[..., :3], dark_ids)
+        _force_stroke_ink(labels, rgba[..., :3], dark_ids, protect=bright_ids)
         _recover_dark_ink(labels, rgba[..., :3], palette_lab, dark_ids)
 
     # Cel outlines are thin; treat dark ink labels as stable so blend absorb
@@ -189,14 +208,21 @@ def label_regions(
     if dark_ids:
         dark_mask = np.isin(labels, np.asarray(dark_ids, dtype=np.int16))
         stable |= dark_mask
+    if bright_ids:
+        bright_mask = np.isin(labels, np.asarray(bright_ids, dtype=np.int16))
+        stable |= bright_mask
     unstable_fraction = float((~stable & (labels >= 0)).mean()) if height and width else 0.0
     if unstable_fraction <= 0.45:
-        _absorb_blends(labels, stable, pixels_lab, palette_lab, protect=dark_ids)
+        _absorb_blends(labels, stable, pixels_lab, palette_lab, protect=protect_ids)
     # Light spatial cleanup only — aggressive passes merged accents into fills.
-    _spatial_clean_labels(labels, protect=dark_ids, passes=1, majority=7)
-    # Final stroke pass after cleanup — outlines must win.
+    _spatial_clean_labels(labels, protect=protect_ids, passes=1, majority=7)
+    # Final stroke pass after cleanup — outlines must win (bright stays bright).
     if dark_ids:
-        _force_stroke_ink(labels, rgba[..., :3], dark_ids)
+        _force_stroke_ink(labels, rgba[..., :3], dark_ids, protect=bright_ids)
+    # Re-snap very bright source pixels to their bright palette slot after the
+    # ink passes — eye speculars are 2–4 px and otherwise remain black.
+    if bright_ids:
+        _restore_bright_specks(labels, rgba[..., :3], palette_rgb, bright_ids)
 
     bg = np.asarray(
         [[settings.background_r, settings.background_g, settings.background_b]],
@@ -267,6 +293,8 @@ def _force_stroke_ink(
     labels: np.ndarray,
     rgb: np.ndarray,
     dark_ids: list[int],
+    *,
+    protect: list[int] | None = None,
 ) -> None:
     """Hard-assign cel stroke pixels to the darkest ink label.
 
@@ -302,6 +330,8 @@ def _force_stroke_ink(
         & (contrast >= 48.0)
         & (sat <= 58)
     )
+    if protect:
+        stroke &= ~np.isin(labels, np.asarray(protect, dtype=np.int16))
     if not np.any(stroke):
         return
     ink_id = int(dark_ids[0])
@@ -316,7 +346,43 @@ def _force_stroke_ink(
         | padded[1:-1, 2:]
     )
     bridge = (~ink) & near & (labels >= 0) & (gray <= 70.0) & (contrast >= 35.0) & (sat <= 65)
+    if protect:
+        bridge &= ~np.isin(labels, np.asarray(protect, dtype=np.int16))
+        # Never bridge into bright source pixels (eye speculars).
+        bridge &= gray < 180.0
     labels[bridge] = ink_id
+
+
+def _restore_bright_specks(
+    labels: np.ndarray,
+    rgb: np.ndarray,
+    palette_rgb: np.ndarray,
+    bright_ids: list[int],
+) -> None:
+    """Force near-white source pixels onto the nearest bright palette slot."""
+    if not bright_ids:
+        return
+    gray = (
+        0.299 * rgb[..., 0].astype(np.float32)
+        + 0.587 * rgb[..., 1].astype(np.float32)
+        + 0.114 * rgb[..., 2].astype(np.float32)
+    )
+    sat = rgb.max(axis=2).astype(np.int16) - rgb.min(axis=2).astype(np.int16)
+    candidates = (labels >= 0) & (gray >= 210.0) & (sat <= 40)
+    if not np.any(candidates):
+        return
+    bright = np.asarray(bright_ids, dtype=np.int16)
+    # Nearest bright palette entry in RGB for those pixels.
+    pix = rgb[candidates].astype(np.int16)
+    best = np.full(pix.shape[0], bright[0], dtype=np.int16)
+    best_d = np.full(pix.shape[0], np.inf, dtype=np.float32)
+    for bid in bright_ids:
+        center = palette_rgb[bid].astype(np.int16)
+        d = ((pix - center) ** 2).sum(axis=1).astype(np.float32)
+        take = d < best_d
+        best[take] = bid
+        best_d[take] = d[take]
+    labels[candidates] = best
 
 
 def _recover_dark_ink(
@@ -538,6 +604,66 @@ def _absorb_blends(
         stable[fy, fx] = True
 
 
+def _absorb_between_fringe(
+    labels: np.ndarray,
+    pixels_lab: np.ndarray,
+    palette_lab: np.ndarray,
+) -> None:
+    """Fold thin AA slivers into the inks they blend between.
+
+    The black↔olive ramp of a badge passes through charcoal, so a 1–2 px
+    charcoal ribbon traces along every outline. A thin pixel whose colour lies
+    on the segment between the labels on either side of it is fringe, not a
+    feature; real thin ink (lion strokes, claw tips) is not "between" anything.
+    """
+    height, width = labels.shape
+    if height < 5 or width < 5:
+        return
+    valid = labels >= 0
+    padded = np.pad(labels, 1, mode="constant", constant_values=_EMPTY)
+    # Opening residual: pixels with no same-label 3×3 core anywhere around them.
+    core = np.ones_like(valid)
+    for dy in (0, 1, 2):
+        for dx in (0, 1, 2):
+            core &= padded[dy : dy + height, dx : dx + width] == labels
+    core_pad = np.pad(core, 1, mode="constant")
+    covered = np.zeros_like(valid)
+    for dy in (0, 1, 2):
+        for dx in (0, 1, 2):
+            covered |= core_pad[dy : dy + height, dx : dx + width] & (
+                padded[dy : dy + height, dx : dx + width] == labels
+            )
+    thin = valid & ~covered
+    if not np.any(thin):
+        return
+    ys, xs = np.nonzero(thin)
+    current = labels[ys, xs]
+    pix = pixels_lab[ys, xs]
+    own = palette_lab[current]
+    own_d = np.einsum("nc,nc->n", pix - own, pix - own)
+    best_d = own_d * 0.5
+    best_label = current.copy()
+    pad2 = np.pad(labels, 2, mode="constant", constant_values=_EMPTY)
+    for r in (1, 2):
+        for dy, dx in ((0, r), (r, 0), (r, r), (r, -r)):
+            a = pad2[ys + 2 - dy, xs + 2 - dx]
+            b = pad2[ys + 2 + dy, xs + 2 + dx]
+            ok = (a >= 0) & (b >= 0) & (a != b) & (a != current) & (b != current)
+            if not np.any(ok):
+                continue
+            la = palette_lab[np.where(ok, a, 0)]
+            lb = palette_lab[np.where(ok, b, 0)]
+            ab = lb - la
+            denom = np.maximum(np.einsum("nc,nc->n", ab, ab), 1e-10)
+            t = np.clip(np.einsum("nc,nc->n", pix - la, ab) / denom, 0.0, 1.0)
+            proj = la + ab * t[:, None]
+            d = np.einsum("nc,nc->n", pix - proj, pix - proj)
+            take = ok & (d < best_d)
+            best_d = np.where(take, d, best_d)
+            best_label = np.where(take, np.where(t < 0.5, a, b), best_label).astype(np.int16)
+    labels[ys, xs] = best_label
+
+
 def _drop_specks(labels: np.ndarray, min_pixels: int) -> np.ndarray:
     if min_pixels <= 1:
         return labels
@@ -639,8 +765,17 @@ def _svg_from_labels(
     geom_scale = max(1.0, math.sqrt((width * height) / 160_000.0))
     # Cel / illustration with ink: crack-edge contours keep thin outlines as
     # closed ribbons. Soft iso alone melted strokes into neighbouring fills.
-    hard_cel = settings.target_colors == 0 and (
-        settings.corner_threshold is not None and float(settings.corner_threshold) <= 45
+    # Transparent cutouts use stacked Gaussian masks (not hard_cel): that
+    # averages pixel stairs into smooth silhouettes and covers seams by
+    # painting each fill under everything above it.
+    cutout_precision = bool(
+        settings.preserve_transparency and settings.automatic_quality.value != "fast"
+    )
+    hard_cel = (
+        settings.target_colors == 0
+        and settings.corner_threshold is not None
+        and float(settings.corner_threshold) <= 45
+        and not cutout_precision
     )
     if settings.automatic_quality.value == "high":
         tolerance = (1.15 if hard_cel else 0.55) * min(1.8, geom_scale)
@@ -651,9 +786,18 @@ def _svg_from_labels(
     else:
         tolerance = (1.35 if hard_cel else 0.95) * min(1.9, geom_scale)
         blur = 0.65
+    cutout_sigma = _CUTOUT_SIGMA
+    if cutout_precision:
+        # Rings are already smooth and sit on the source edge; a loose fit
+        # (≥1.2 px) let neighbouring layers drift apart into lumps and seams.
+        tolerance = 0.9 if settings.automatic_quality.value == "high" else 1.1
+        blur = min(blur, 0.40)
     corner = float(settings.corner_threshold) if settings.corner_threshold else 50.0
-    if hard_cel:
+    if hard_cel and not cutout_precision:
         corner = max(corner, 50.0)
+    elif cutout_precision:
+        # Ignore High's corner−10 (that re-frayed cutout letters); keep smooth.
+        corner = 50.0
     # Always evenodd: cel ink outlines are thin rings with holes. Nonzero fill
     # paints those holes solid and swallows teal/orange bodies into black.
     fill_rule = "evenodd"
@@ -681,6 +825,8 @@ def _svg_from_labels(
                 f'<path d="M 0 0 H {out_w} V {out_h} H 0 Z" fill="{underlay}"/>'
             )
     pad = max(3, int(math.ceil(blur)) + 2)
+    if cutout_precision and not hard_cel:
+        pad = max(pad, int(math.ceil(3.0 * cutout_sigma)) + 1)
     # Paint large fills first, dark ink last so cel outlines sit on top of
     # walls/furniture instead of being buried underneath.
     def _paint_key(label: int) -> tuple[int, int]:
@@ -691,6 +837,62 @@ def _svg_from_labels(
         return (dark, -area)
 
     paint_order = sorted(range(len(palette)), key=_paint_key)
+    # Tiny bright islands (lion eye specular, ~2–20 px) must paint after ink
+    # or the solid black path covers them. Large white letter fills stay earlier.
+    if cutout_precision:
+        late_bright: list[int] = []
+        for label in list(paint_order):
+            color = hex_to_rgb(palette[label])
+            luma = 0.299 * color[0] + 0.587 * color[1] + 0.114 * color[2]
+            area = int((labels == label).sum())
+            if luma >= 200 and 0 < area <= 64:
+                late_bright.append(label)
+        if late_bright:
+            paint_order = [i for i in paint_order if i not in late_bright] + late_bright
+    # Alpha cutouts: abutting paths each anti-alias their shared edge, so the
+    # empty canvas shows through as pale hairlines. Draw outline ink last and
+    # tuck every lower fill 1 px under the layers painted above it — fills grow
+    # only underneath, never over ink.
+    tuck: dict[int, np.ndarray] = {}
+    if hard_cel and cutout_precision and empty_share >= 0.02:
+        lumas = [
+            sum(w * c for w, c in zip((0.299, 0.587, 0.114), hex_to_rgb(color)))
+            for color in palette
+        ]
+        darkest = int(np.argmin(lumas))
+        if lumas[darkest] <= 40:
+            paint_order = [i for i in paint_order if i != darkest] + [darkest]
+        above = np.zeros(labels.shape, dtype=bool)
+        for label in reversed(paint_order):
+            own = labels == label
+            if not np.any(own):
+                continue
+            # Two rings: enough underlap so cubic wobble cannot open white
+            # hairlines between black ink and yellow/olive fills.
+            tuck[label] = _dilate4(own, rings=2) & above
+            above |= own
+    # Alpha cutouts: each fill underlaps only 2 px into layers painted above.
+    # Full-union underlap closed seams but put white/red under the whole black
+    # ring, so letter rims fringed white/pink. Local underlap keeps the true
+    # neighbour colour at each ink edge.
+    stacked: dict[int, np.ndarray] = {}
+    cutout_lab = soft_lab if soft_lab is not None else pixels_lab
+    cutout_alpha = rgba[..., 3].astype(np.float32) / 255.0
+    if cutout_lab.shape[:2] != labels.shape:
+        cutout_lab = pixels_lab
+    if cutout_alpha.shape != labels.shape:
+        cutout_alpha = (labels >= 0).astype(np.float32)
+    if cutout_precision and not hard_cel:
+        above = np.zeros(labels.shape, dtype=bool)
+        for label in reversed(paint_order):
+            own = labels == label
+            if not np.any(own):
+                continue
+            # Up to 2 px underlap, but never within 1 px of anything painted
+            # below (or transparency) — there it would peek past thin ink.
+            exposed = _dilate4(~(above | own), rings=1)
+            stacked[label] = _dilate4(own, rings=2) & above & ~own & ~exposed
+            above = above | own
     total_labels = max(1, len(paint_order))
     for index, label in enumerate(paint_order):
         # Contours dominate runtime; keep fraction moving for the ETA display.
@@ -706,10 +908,48 @@ def _svg_from_labels(
         y1 = min(height, int(ys.max()) + pad + 1)
         x0 = max(0, int(xs.min()) - pad)
         x1 = min(width, int(xs.max()) + pad + 1)
-        if hard_cel:
+        if label in stacked:
+            underlap = stacked[label]
+            field = _soft_cutout_field(
+                labels[y0:y1, x0:x1],
+                label,
+                cutout_lab[y0:y1, x0:x1],
+                cutout_alpha[y0:y1, x0:x1],
+                palette_lab,
+            )
+            field = np.maximum(field, underlap[y0:y1, x0:x1].astype(np.float32))
+            field = _gaussian_blur(field, sigma=cutout_sigma)
+            # Keep bright holes (eye specular, letter counters) from being
+            # filled in by the ink blur — force coverage to 0 there.
+            color = hex_to_rgb(palette[label])
+            luma = 0.299 * color[0] + 0.587 * color[1] + 0.114 * color[2]
+            if luma <= 40:
+                sub = labels[y0:y1, x0:x1]
+                bright_here = np.zeros(sub.shape, dtype=bool)
+                for bi, bcol in enumerate(palette):
+                    br, bg, bb = hex_to_rgb(bcol)
+                    if 0.299 * br + 0.587 * bg + 0.114 * bb >= 200:
+                        bright_here |= sub == bi
+                if np.any(bright_here):
+                    field = field.copy()
+                    field[bright_here] = 0.0
+            contours = marching_squares(field, level=0.5)
+            # Marching squares samples pixel centres; shift back to pixel space.
+            contours = [
+                [(p[0] + x0 + 0.5, p[1] + y0 + 0.5) for p in contour]
+                for contour in contours
+            ]
+            contours = [
+                _smooth_iso_ring(c, passes=_CUTOUT_RING_PASSES) for c in contours
+            ]
+        elif hard_cel:
             # Crack-edge contours on the hard label mask. Marching-squares
             # chaining fragments complex cel flats so couch cushions etc. vanish.
-            contours = _trace_mask(mask)
+            contours = _trace_mask(mask | tuck[label] if label in tuck else mask)
+            if cutout_precision:
+                # Crack stairs are ±0.5 px off the true edge; a sub-pixel fit
+                # tolerance otherwise reproduces every stair as a wobble.
+                contours = [_smooth_crack_ring(c) for c in contours]
         else:
             sub_labels = labels[y0:y1, x0:x1]
             sub_pixels = pixels_lab[y0:y1, x0:x1]
@@ -765,6 +1005,98 @@ def _svg_from_labels(
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{out_w}" height="{out_h}" '
         f'viewBox="0 0 {out_w} {out_h}">\n  {body}\n</svg>\n'
     )
+
+
+def _smooth_iso_ring(
+    contour: list[tuple[float, float]], *, passes: int
+) -> list[tuple[float, float]]:
+    """[1, 2, 1] passes along an iso ring; sharp turns (spike tips) stay pinned."""
+    pts = np.asarray(contour, dtype=np.float64)
+    if np.allclose(pts[0], pts[-1]):
+        pts = pts[:-1]
+    # Tiny islands (2×2 eye speculars) would shrink to nothing.
+    if len(pts) < 40:
+        return contour
+    span = 3
+    ahead = np.roll(pts, -span, axis=0) - pts
+    behind = pts - np.roll(pts, span, axis=0)
+    cross = behind[:, 0] * ahead[:, 1] - behind[:, 1] * ahead[:, 0]
+    dot = np.einsum("nc,nc->n", behind, ahead)
+    turn = np.abs(np.arctan2(cross, dot))
+    pinned = turn >= math.radians(70.0)
+    for _ in range(passes):
+        smooth = 0.25 * np.roll(pts, 1, axis=0) + 0.5 * pts + 0.25 * np.roll(pts, -1, axis=0)
+        pts = np.where(pinned[:, None], pts, smooth)
+    out = [(float(x), float(y)) for x, y in pts]
+    out.append(out[0])
+    return out
+
+
+def _soft_cutout_field(
+    labels: np.ndarray,
+    label: int,
+    lab: np.ndarray,
+    alpha: np.ndarray,
+    palette_lab: np.ndarray,
+) -> np.ndarray:
+    """Per-pixel coverage of `label` read from the source anti-aliasing.
+
+    Each pixel near the label boundary is unmixed against whichever nearby
+    label (or transparency) explains its colour best, so the 0.5 isolevel
+    lands on the source's sub-pixel edge instead of on binary pixel stairs.
+    """
+    height, width = labels.shape
+    own = labels == label
+    field = own.astype(np.float32)
+    band = _dilate4(own, rings=2) & _dilate4(~own, rings=2)
+    if not np.any(band):
+        return field * np.minimum(1.0, alpha * 1.0)
+    ys, xs = np.nonzero(band)
+    pix = lab[ys, xs]
+    ink = palette_lab[label]
+    best_res = np.full(ys.shape[0], np.inf, dtype=np.float32)
+    best_cov = np.where(own[ys, xs], 1.0, 0.0).astype(np.float32)
+    padded = np.pad(labels, 2, mode="constant", constant_values=_EMPTY)
+    offsets = [(0, 0)] + [
+        (dy, dx) for dy in range(-2, 3) for dx in range(-2, 3) if (dy, dx) != (0, 0)
+    ]
+    for dy, dx in offsets:
+        other = padded[ys + 2 + dy, xs + 2 + dx]
+        ok = (other >= 0) & (other != label)
+        if not np.any(ok):
+            continue
+        ab = palette_lab[np.where(ok, other, 0)] - ink
+        denom = np.maximum(np.einsum("nc,nc->n", ab, ab), 1e-10)
+        t = np.clip(np.einsum("nc,nc->n", pix - ink, ab) / denom, 0.0, 1.0)
+        resid = pix - (ink + ab * t[:, None])
+        res = np.einsum("nc,nc->n", resid, resid)
+        take = ok & (res < best_res)
+        best_res = np.where(take, res, best_res)
+        best_cov = np.where(take, 1.0 - t, best_cov).astype(np.float32)
+    field[ys, xs] = best_cov
+    # Transparent neighbours: alpha is the coverage (colour is unpremultiplied).
+    return field * np.clip(alpha, 0.0, 1.0)
+
+
+def _gaussian_blur(field: np.ndarray, *, sigma: float) -> np.ndarray:
+    """Separable Gaussian with zero padding (outside the crop is empty)."""
+    radius = max(1, int(math.ceil(3.0 * sigma)))
+    taps = np.arange(-radius, radius + 1, dtype=np.float32)
+    kernel = np.exp(-0.5 * (taps / float(sigma)) ** 2)
+    kernel /= kernel.sum()
+    out = field.astype(np.float32)
+    for axis in (0, 1):
+        pad = [(0, 0), (0, 0)]
+        pad[axis] = (radius, radius)
+        padded = np.pad(out, pad, mode="constant")
+        length = out.shape[axis]
+        acc = np.zeros_like(out)
+        for offset, weight in enumerate(kernel):
+            window = [slice(None), slice(None)]
+            window[axis] = slice(offset, offset + length)
+            acc += weight * padded[tuple(window)]
+        out = acc
+    return out
 
 
 def _colors_close(a: str, b: str, *, tol: int) -> bool:
@@ -890,6 +1222,31 @@ def _side_pixel(x: int, y: int, direction: int, *, right: bool) -> tuple[int, in
     if direction == 2:  # west
         return (x - 1, y - 1) if right else (x - 1, y)
     return (x, y - 1) if right else (x - 1, y - 1)  # north
+
+
+def _smooth_crack_ring(contour: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    """Unit-step crack polygon → edge midpoints with a few [1, 2, 1] passes.
+
+    Both labels sharing a boundary walk the same unit edges, so they get the
+    same smoothed points and stay seam-free. Extra passes knock down the
+    pixel-stair fray that a single midpoint step still left on heraldic ink.
+    """
+    pts = np.asarray(contour, dtype=np.float64)
+    if len(pts) < 5:
+        return contour
+    if np.allclose(pts[0], pts[-1]):
+        pts = pts[:-1]
+    # Midpoints of each crack edge (shared by both abutting labels).
+    smooth = 0.5 * (pts + np.roll(pts, -1, axis=0))
+    for _ in range(3):
+        smooth = (
+            0.25 * np.roll(smooth, 1, axis=0)
+            + 0.5 * smooth
+            + 0.25 * np.roll(smooth, -1, axis=0)
+        )
+    out = [(float(x), float(y)) for x, y in smooth]
+    out.append(out[0])
+    return out
 
 
 def _trace_mask(mask: np.ndarray) -> list[list[tuple[float, float]]]:

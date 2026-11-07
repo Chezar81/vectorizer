@@ -11,6 +11,7 @@ def preprocess_image(image: Image.Image, settings: TraceSettings) -> Image.Image
     """Return a working RGBA image for tracing.
 
     Original `image` is left unchanged. Operations (in order):
+    - scrub chroma-key fringe (magenta/near-transparent junk)
     - solidify near-black transparent mattes (icon “black backgrounds”)
     - optional flattening of existing alpha when preserve_transparency is False
     - optional background removal by color + tolerance
@@ -19,6 +20,7 @@ def preprocess_image(image: Image.Image, settings: TraceSettings) -> Image.Image
     """
     settings = settings.validated()
     working = image.convert("RGBA").copy()
+    working = scrub_chroma_key_alpha(working)
     working = solidify_black_matte(working)
 
     if not settings.preserve_transparency:
@@ -48,11 +50,14 @@ def preprocess_image(image: Image.Image, settings: TraceSettings) -> Image.Image
     return working
 
 
-def cel_stroke_mask(rgb: Image.Image | object) -> object:
+def cel_stroke_mask(rgb: Image.Image | object, *, bleed_ink: bool = False) -> object:
     """Boolean mask of dark ink outlines abutting brighter fills.
 
     JPEG cel art browns true black; require local contrast so couch shadows are
     not treated as strokes.
+
+    `bleed_ink` also accepts thin lines whose chroma was smeared in from a
+    saturated fill (fold lines on a yellow curtain read as olive ~(108,80,6)).
     """
     import numpy as np
 
@@ -93,7 +98,10 @@ def cel_stroke_mask(rgb: Image.Image | object) -> object:
     )
     black_hat = np.asarray(closed, dtype=np.float32) - gray
     thin_ink = (black_hat >= 40.0) & (gray <= 125.0) & (sat <= 90)
-    return edge_ink | dark_on_dark | thin_ink
+    mask = edge_ink | dark_on_dark | thin_ink
+    if bleed_ink:
+        mask |= (black_hat >= 70.0) & (gray <= 105.0) & (sat <= 135)
+    return mask
 
 
 def prepare_cel_ink(
@@ -114,16 +122,37 @@ def prepare_cel_ink(
 
     rgba = image.convert("RGBA")
     rgb = np.asarray(rgba.convert("RGB"), dtype=np.uint8).copy()
-    stroke = cel_stroke_mask(rgb)
+    stroke = cel_stroke_mask(rgb, bleed_ink=True)
     if not np.any(stroke):
         return snap_image_to_palette(rgba, palette)
-    stroke = _binary_close(stroke)
+    # Closing may only add mid/dark pixels: a bright 1px gap between two ink
+    # lines is a real fill (outlet face, sink rim, chair texture between
+    # comma strokes) and closing it welds detail into a black blob.
+    gray = 0.299 * rgb[..., 0] + 0.587 * rgb[..., 1] + 0.114 * rgb[..., 2]
+    stroke = stroke | (_binary_close(stroke) & (gray <= 140.0))
     # Bridge 1px gaps between stroke pixels (JPEG breakups).
     stroke = _bridge_stroke_gaps(rgb, stroke)
-    # Clear AA brown fringe from fills, but bake ink at the closed stroke
-    # width — dilating the bake made Simpsons outlines look like charcoal.
-    fill_hole = _binary_dilate(stroke, 1)
-    filled = _inpaint_masked(rgb, fill_hole, fallback=ink_rgb)
+    # Bake at true line width: AA shoulders lighter than the ink/fill midpoint
+    # return to fill (they are re-inpainted with the fill ring below).
+    stroke = _thin_stroke_shoulders(rgb, stroke, ink_rgb)
+    # VTracer clusters are 4-connected: a 1px diagonal outline (sail edges)
+    # otherwise traces as a dashed line with fill leaking through the gaps.
+    stroke = _four_connect_strokes(rgb, stroke)
+    # Clear AA brown/orange fringe from fills over a 2px ring, but bake ink
+    # only at the closed stroke width — dilating the bake made Simpsons
+    # outlines look like charcoal. (Ink/fill unmix on the stroke ring was
+    # tried; it splintered flat fills into thousands of extra VTracer paths.)
+    # Pale neutral fills (keypad buttons, white sails) are never AA fringe;
+    # inside a dense ink grid the ring would swallow them whole and inpaint
+    # falls back to ink, crushing a keypad to a black blob. Likewise any ring
+    # pixel that already sits on a palette fill at its luma plateau: small
+    # background objects (outlet, scale dial, faucet) are narrower than the
+    # ring and were otherwise repainted from whatever lay 3px away.
+    keep = _pale_neutral_fill(rgb, stroke) | _palette_plateau_fill(
+        rgb, stroke, palette, ink_rgb
+    )
+    fill_hole = _binary_dilate(stroke, 2) & ~keep
+    filled = _inpaint_masked(rgb, fill_hole, fallback=None)
     # Skip median on cel prep — it chews thin ink abutments into stair-steps.
     stroke_b = np.asarray(stroke, dtype=bool)
     snapped = snap_image_to_palette(
@@ -135,8 +164,352 @@ def prepare_cel_ink(
     out[stroke_b, 0] = ink_rgb[0]
     out[stroke_b, 1] = ink_rgb[1]
     out[stroke_b, 2] = ink_rgb[2]
+    # JPEG fringe along fold lines snaps to orange/brown freckles that VTracer
+    # then turns into shards; majority-clean fills while leaving ink alone.
+    out[..., :3] = _majority_clean_fills(out[..., :3], stroke_b, passes=2, majority=6)
+    out[..., :3] = _despeckle_fills(out[..., :3], stroke_b)
+    out[..., :3] = _flatten_enclosed_fills(out[..., :3], stroke_b)
+    out[stroke_b, 0] = ink_rgb[0]
+    out[stroke_b, 1] = ink_rgb[1]
+    out[stroke_b, 2] = ink_rgb[2]
     out[..., 3] = np.asarray(rgba)[..., 3]
     return Image.fromarray(out, mode="RGBA")
+
+
+def _majority_clean_fills(
+    rgb: object,
+    stroke: object,
+    *,
+    passes: int = 2,
+    majority: int = 6,
+) -> object:
+    """Replace fill pixels that disagree with most neighbours (ink is frozen)."""
+    import numpy as np
+
+    out = np.asarray(rgb, dtype=np.uint8).copy()
+    frozen = np.asarray(stroke, dtype=bool)
+    if out.size == 0 or not np.any(~frozen):
+        return out
+    # Pack RGB into int32 so neighbour voting is a single channel.
+    packed = (
+        out[..., 0].astype(np.int32) << 16
+        | out[..., 1].astype(np.int32) << 8
+        | out[..., 2].astype(np.int32)
+    )
+    for _ in range(max(1, passes)):
+        pad = np.pad(packed, 1, mode="edge")
+        neigh = np.stack(
+            [
+                pad[:-2, 1:-1],
+                pad[2:, 1:-1],
+                pad[1:-1, :-2],
+                pad[1:-1, 2:],
+                pad[:-2, :-2],
+                pad[:-2, 2:],
+                pad[2:, :-2],
+                pad[2:, 2:],
+            ],
+            axis=0,
+        )
+        # Mode of 8-neighbourhood via sort; ties keep the current pixel.
+        ordered = np.sort(neigh, axis=0)
+        # Count runs at the median of each sorted neighbourhood.
+        mid = ordered[3]
+        agree = (neigh == mid).sum(axis=0)
+        # Prefer the true mode when the median slot is a weak tie.
+        for candidate in (ordered[2], ordered[4], ordered[1], ordered[5]):
+            cand_agree = (neigh == candidate).sum(axis=0)
+            better = cand_agree > agree
+            mid = np.where(better, candidate, mid)
+            agree = np.where(better, cand_agree, agree)
+        self_agree = (neigh == packed).sum(axis=0)
+        flip = (~frozen) & (agree >= majority) & (agree > self_agree) & (mid != packed)
+        if not np.any(flip):
+            break
+        packed = np.where(flip, mid, packed)
+    out[..., 0] = (packed >> 16) & 255
+    out[..., 1] = (packed >> 8) & 255
+    out[..., 2] = packed & 255
+    return out
+
+
+def _despeckle_fills(
+    rgb: object,
+    stroke: object,
+    *,
+    passes: int = 2,
+    max_self: int = 3,
+) -> object:
+    """Absorb fill specks of ≤ `max_self`+1 pixels into the dominant 5×5 fill.
+
+    Painterly shading between two inks (salmon cabinet frame, mauve toaster)
+    snaps to 2–4 pixel freckles that an 8-neighbour majority cannot reach.
+    A 1px line keeps four same-colour pixels in its 5×5 window and survives.
+    """
+    import numpy as np
+
+    out = np.asarray(rgb, dtype=np.uint8).copy()
+    frozen = np.asarray(stroke, dtype=bool)
+    packed = (
+        out[..., 0].astype(np.int32) << 16
+        | out[..., 1].astype(np.int32) << 8
+        | out[..., 2].astype(np.int32)
+    )
+    h, w = packed.shape
+    offsets = [(dy, dx) for dy in range(-2, 3) for dx in range(-2, 3) if dy or dx]
+    for _ in range(max(1, passes)):
+        pad = np.pad(packed, 2, mode="edge")
+        ink = np.pad(frozen, 2, mode="edge")
+
+        def _shift(arr, dy, dx):
+            return arr[2 + dy : 2 + dy + h, 2 + dx : 2 + dx + w]
+
+        self_count = np.zeros((h, w), dtype=np.int16)
+        fill_count = np.zeros((h, w), dtype=np.int16)
+        for dy, dx in offsets:
+            nk = ~_shift(ink, dy, dx)
+            self_count += (_shift(pad, dy, dx) == packed) & nk
+            fill_count += nk
+        cand_pix = (~frozen) & (self_count <= max_self) & (fill_count >= 12)
+        if not np.any(cand_pix):
+            break
+        best = packed.copy()
+        best_count = np.zeros((h, w), dtype=np.int16)
+        # Candidates: every non-ink colour in the 3×3 ring.
+        for cy, cx in offsets:
+            if max(abs(cy), abs(cx)) > 1:
+                continue
+            cand = _shift(pad, cy, cx)
+            usable = cand_pix & ~_shift(ink, cy, cx) & (cand != packed)
+            if not np.any(usable):
+                continue
+            votes = np.zeros((h, w), dtype=np.int16)
+            for dy, dx in offsets:
+                votes += (_shift(pad, dy, dx) == cand) & ~_shift(ink, dy, dx)
+            better = usable & (votes > best_count)
+            best = np.where(better, cand, best)
+            best_count = np.where(better, votes, best_count)
+        flip = cand_pix & (best_count * 5 >= fill_count * 3)
+        if not np.any(flip):
+            break
+        packed = np.where(flip, best, packed)
+    out[..., 0] = (packed >> 16) & 255
+    out[..., 1] = (packed >> 8) & 255
+    out[..., 2] = packed & 255
+    return out
+
+
+def _thin_stroke_shoulders(
+    rgb: object,
+    stroke: object,
+    ink_rgb: tuple[int, int, int],
+) -> object:
+    """Drop outer stroke pixels that are mostly fill (coverage below one half).
+
+    Only the stroke's outer layer is judged, against the brightest adjacent
+    non-ink pixel. A shoulder must sit closer to that fill than to ink and
+    still be visibly darker than it; a fill barely above ink (dark pole
+    shading on GolfCart) is not an AA partner. Line ridges stay so 1px fold
+    lines keep their spine, and dark masses wider than ~5px are left whole.
+    """
+    import numpy as np
+
+    arr = np.asarray(rgb, dtype=np.uint8)
+    ink = np.asarray(stroke, dtype=bool)
+    gray = (
+        0.299 * arr[..., 0] + 0.587 * arr[..., 1] + 0.114 * arr[..., 2]
+    ).astype(np.float32)
+    ink_l = 0.299 * ink_rgb[0] + 0.587 * ink_rgb[1] + 0.114 * ink_rgb[2]
+    fill_gray = np.where(ink, -1.0, gray).astype(np.float32)
+    p = np.pad(fill_gray, 1, constant_values=-1.0)
+    h, w = gray.shape
+    adj_fill = np.maximum.reduce(
+        [p[1 + dy : 1 + dy + h, 1 + dx : 1 + dx + w] for dy in (-1, 0, 1) for dx in (-1, 0, 1)]
+    )
+    shoulder = (
+        ink
+        & (adj_fill >= 0.0)
+        & (adj_fill - ink_l >= 90.0)
+        & (gray > (adj_fill + ink_l) * 0.5)
+        & (adj_fill - gray >= 16.0)
+    )
+    g = np.pad(gray, 1, mode="edge")
+
+    def _at(dy: int, dx: int):
+        return g[1 + dy : 1 + dy + h, 1 + dx : 1 + dx + w]
+
+    ridge = np.zeros_like(ink)
+    for (ay, ax), (by, bx) in (
+        ((0, -1), (0, 1)),
+        ((-1, 0), (1, 0)),
+        ((-1, -1), (1, 1)),
+        ((-1, 1), (1, -1)),
+    ):
+        ridge |= gray <= np.minimum(_at(ay, ax), _at(by, bx))
+    dark = ink | (gray <= ink_l + 70.0)
+    wide_dark = _binary_dilate(_binary_erode(dark, 2), 3)
+    return ink & ~(shoulder & ~ridge & ~wide_dark)
+
+
+def _label_regions(mask: object, values: object | None = None) -> object:
+    """4-connected component labels (root pixel index; -1 outside `mask`).
+
+    With `values`, neighbours only join when their values are equal.
+    """
+    import numpy as np
+
+    m = np.asarray(mask, dtype=bool)
+    h, w = m.shape
+    idx = np.arange(h * w, dtype=np.int64).reshape(h, w)
+    eh = m[:, :-1] & m[:, 1:]
+    ev = m[:-1, :] & m[1:, :]
+    if values is not None:
+        v = np.asarray(values)
+        eh &= v[:, :-1] == v[:, 1:]
+        ev &= v[:-1, :] == v[1:, :]
+    a = np.concatenate([idx[:, :-1][eh], idx[:-1, :][ev]])
+    b = np.concatenate([idx[:, 1:][eh], idx[1:, :][ev]])
+    lab = np.arange(h * w, dtype=np.int64)
+    while a.size:
+        la = lab[a]
+        lb = lab[b]
+        diff = la != lb
+        if not np.any(diff):
+            break
+        a, b, la, lb = a[diff], b[diff], la[diff], lb[diff]
+        # Hook the larger root onto the smaller, then compress fully so
+        # every entry points at a root again.
+        np.minimum.at(lab, np.maximum(la, lb), np.minimum(la, lb))
+        while True:
+            nxt = lab[lab]
+            if np.array_equal(nxt, lab):
+                break
+            lab = nxt
+    out = lab.reshape(h, w)
+    out[~m] = -1
+    return out
+
+
+def _flatten_enclosed_fills(
+    rgb: object,
+    stroke: object,
+    *,
+    max_dist: float = 0.14,
+    min_contact: float = 0.45,
+    host_ratio: int = 3,
+    passes: int = 2,
+) -> object:
+    """Fold small shading blotches into the fill that surrounds them.
+
+    Painterly shading on small objects (toaster faces, cabinet frame) snaps to
+    blotches of a neighbouring palette shade, too large for `_despeckle_fills`.
+    A same-colour blob is merged into the non-ink neighbour blob it touches
+    most when that host is OKLab-close, several times larger, and supplies
+    most of the blob's boundary. Ink contacts count against the share, so
+    outlined details (carrots on the curtain, keypad buttons) stay.
+    """
+    import numpy as np
+
+    from vectorizer.raster.color import srgb_u8_to_oklab
+
+    out = np.asarray(rgb, dtype=np.uint8).copy()
+    fill = ~np.asarray(stroke, dtype=bool)
+    if not np.any(fill):
+        return out
+    h, w = fill.shape
+    max_blob = max(64, int(h * w * 6e-5))
+    packed = (
+        out[..., 0].astype(np.int64) << 16
+        | out[..., 1].astype(np.int64) << 8
+        | out[..., 2].astype(np.int64)
+    )
+    for _ in range(max(1, passes)):
+        roots = _label_regions(fill, packed)
+        _, blob = np.unique(roots[fill], return_inverse=True)
+        n_blob = int(blob.max()) + 1
+        blob_map = np.full((h, w), -1, dtype=np.int64)
+        blob_map[fill] = blob.ravel()
+        blob = blob_map
+        area = np.bincount(blob[fill], minlength=n_blob)
+        blob_color = np.zeros(n_blob, dtype=np.int64)
+        blob_color[blob[fill]] = packed[fill]
+        pairs = []
+        for a, b in (
+            (blob[:, :-1], blob[:, 1:]),
+            (blob[:-1, :], blob[1:, :]),
+        ):
+            a = a.ravel()
+            b = b.ravel()
+            diff = a != b
+            pairs.append((a[diff], b[diff]))
+            pairs.append((b[diff], a[diff]))
+        src = np.concatenate([p[0] for p in pairs])
+        dst = np.concatenate([p[1] for p in pairs])
+        keep = src >= 0
+        src, dst = src[keep], dst[keep]
+        small = area[src] <= max_blob
+        src, dst = src[small], dst[small]
+        if src.size == 0:
+            break
+        contacts = np.bincount(src, minlength=n_blob)
+        fill_pair = dst >= 0
+        keys, counts = np.unique(
+            src[fill_pair] * n_blob + dst[fill_pair], return_counts=True
+        )
+        k_src = keys // n_blob
+        k_dst = keys % n_blob
+        order = np.lexsort((counts, k_src))
+        last = np.r_[k_src[order][1:] != k_src[order][:-1], True]
+        b_src = k_src[order][last]
+        b_host = k_dst[order][last]
+        b_cnt = counts[order][last]
+        colors = np.unique(blob_color)
+        rgb_u8 = np.stack(
+            [(colors >> 16) & 255, (colors >> 8) & 255, colors & 255], axis=-1
+        ).astype(np.uint8)
+        lab_c = srgb_u8_to_oklab(rgb_u8[None])[0]
+        ci = np.searchsorted(colors, blob_color[b_src])
+        hi = np.searchsorted(colors, blob_color[b_host])
+        dist = np.sqrt(((lab_c[ci] - lab_c[hi]) ** 2).sum(axis=1))
+        # Thick elongated blobs are drawn shading (lampshade pleats, handset
+        # shadow); only compact blotches and sub-3px AA slivers fold away.
+        yy, xx = np.nonzero(fill)
+        ids = blob[fill]
+        sy = np.bincount(ids, yy, n_blob)
+        sx = np.bincount(ids, xx, n_blob)
+        n = np.maximum(area, 1)
+        cyy = np.bincount(ids, yy.astype(np.float64) ** 2, n_blob) / n - (sy / n) ** 2
+        cxx = np.bincount(ids, xx.astype(np.float64) ** 2, n_blob) / n - (sx / n) ** 2
+        cxy = np.bincount(ids, yy.astype(np.float64) * xx, n_blob) / n - sy * sx / n**2
+        tr = cxx + cyy
+        disc = np.sqrt(np.maximum(((cxx - cyy) * 0.5) ** 2 + cxy**2, 0.0))
+        major = tr * 0.5 + disc
+        minor = np.maximum(tr * 0.5 - disc, 1e-3)
+        p = np.pad(blob, 1, constant_values=-2)
+        core = (
+            (p[:-2, 1:-1] == blob)
+            & (p[2:, 1:-1] == blob)
+            & (p[1:-1, :-2] == blob)
+            & (p[1:-1, 2:] == blob)
+            & fill
+        )
+        has_core = np.bincount(blob[core], minlength=n_blob) > 0
+        shape_ok = ~has_core | (major <= 16.0 * minor)
+        merge = (
+            (dist <= max_dist)
+            & (b_cnt >= min_contact * contacts[b_src])
+            & (area[b_host] >= host_ratio * area[b_src])
+            & shape_ok[b_src]
+        )
+        if not np.any(merge):
+            break
+        new_color = blob_color.copy()
+        new_color[b_src[merge]] = blob_color[b_host[merge]]
+        packed = np.where(fill, new_color[np.maximum(blob, 0)], packed)
+    out[..., 0] = (packed >> 16) & 255
+    out[..., 1] = (packed >> 8) & 255
+    out[..., 2] = packed & 255
+    return out
 
 
 def _binary_dilate(mask: object, iterations: int = 1) -> object:
@@ -204,14 +577,106 @@ def _bridge_stroke_gaps(rgb: object, stroke: object) -> object:
     return ink | bridge
 
 
+def _four_connect_strokes(rgb: object, stroke: object) -> object:
+    """Fill one orthogonal corner wherever ink touches only diagonally."""
+    import numpy as np
+
+    arr = np.asarray(rgb, dtype=np.uint8)
+    ink = np.asarray(stroke, dtype=bool).copy()
+    gray = (
+        0.299 * arr[..., 0] + 0.587 * arr[..., 1] + 0.114 * arr[..., 2]
+    ).astype(np.float32)
+    a = ink[:-1, :-1]
+    b = ink[:-1, 1:]
+    c = ink[1:, :-1]
+    d = ink[1:, 1:]
+    # Main diagonal a–d with b, c empty; anti-diagonal b–c with a, d empty.
+    main = a & d & ~b & ~c
+    anti = b & c & ~a & ~d
+    g_a = gray[:-1, :-1]
+    g_b = gray[:-1, 1:]
+    g_c = gray[1:, :-1]
+    g_d = gray[1:, 1:]
+    ys, xs = np.nonzero(main)
+    pick_b = g_b[ys, xs] <= g_c[ys, xs]
+    ink[ys[pick_b], xs[pick_b] + 1] = True
+    ink[ys[~pick_b] + 1, xs[~pick_b]] = True
+    ys, xs = np.nonzero(anti)
+    pick_a = g_a[ys, xs] <= g_d[ys, xs]
+    ink[ys[pick_a], xs[pick_a]] = True
+    ink[ys[~pick_a] + 1, xs[~pick_a] + 1] = True
+    return ink
+
+
+def _pale_neutral_fill(rgb: object, stroke: object) -> object:
+    """Light low-chroma non-ink pixels at their local luma plateau."""
+    import numpy as np
+
+    arr = np.asarray(rgb, dtype=np.uint8)
+    gray = (
+        0.299 * arr[..., 0] + 0.587 * arr[..., 1] + 0.114 * arr[..., 2]
+    ).astype(np.float32)
+    sat = arr.max(axis=2).astype(np.int16) - arr.min(axis=2).astype(np.int16)
+    gray_img = Image.fromarray(np.clip(gray, 0, 255).astype(np.uint8), "L")
+    local_max = np.asarray(gray_img.filter(ImageFilter.MaxFilter(3)), dtype=np.float32)
+    return (
+        ~np.asarray(stroke, dtype=bool)
+        & (gray >= 170.0)
+        & (sat <= 40)
+        & (gray >= local_max - 25.0)
+    )
+
+
+def _palette_plateau_fill(
+    rgb: object,
+    stroke: object,
+    palette: tuple[str, ...],
+    ink_rgb: tuple[int, int, int],
+    *,
+    max_dist: float = 0.05,
+) -> object:
+    """Non-ink pixels already close to a non-ink palette fill at their luma plateau.
+
+    AA fringe is a fill/ink mix: darker than its brightest neighbour and off
+    every fill ink, so it still fails this test and gets inpainted.
+    """
+    import numpy as np
+
+    from vectorizer.raster.color import hex_to_rgb, nearest_oklab, srgb_u8_to_oklab
+
+    arr = np.asarray(rgb, dtype=np.uint8)
+    fills = [hex_to_rgb(c) for c in palette if hex_to_rgb(c) != tuple(ink_rgb)]
+    if not fills:
+        return np.zeros(arr.shape[:2], dtype=bool)
+    _idx, sq = nearest_oklab(
+        srgb_u8_to_oklab(arr),
+        srgb_u8_to_oklab(np.asarray(fills, dtype=np.uint8)),
+        chroma_weight=1.35,
+    )
+    gray = (
+        0.299 * arr[..., 0] + 0.587 * arr[..., 1] + 0.114 * arr[..., 2]
+    ).astype(np.float32)
+    gray_img = Image.fromarray(np.clip(gray, 0, 255).astype(np.uint8), "L")
+    local_max = np.asarray(gray_img.filter(ImageFilter.MaxFilter(3)), dtype=np.float32)
+    return (
+        ~np.asarray(stroke, dtype=bool)
+        & (sq <= max_dist * max_dist)
+        & (gray >= local_max - 25.0)
+    )
+
+
 def _inpaint_masked(
     rgb: object,
     missing: object,
     *,
-    fallback: tuple[int, int, int],
+    fallback: tuple[int, int, int] | None,
     passes: int = 10,
 ) -> object:
-    """Propagate neighbouring known colours into `missing` pixels."""
+    """Propagate neighbouring known colours into `missing` pixels.
+
+    Pixels still unreached after `passes` take `fallback`, or keep their own
+    colour when `fallback` is None.
+    """
     import numpy as np
 
     out = np.asarray(rgb, dtype=np.float32).copy()
@@ -242,8 +707,75 @@ def _inpaint_masked(
         can = hole & (weight > 0)
         out[can] = acc[can] / weight[can, None]
         hole[can] = False
-    out[hole] = fallback
+    if fallback is not None:
+        out[hole] = fallback
     return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def scrub_chroma_key_alpha(image: Image.Image) -> Image.Image:
+    """Force chroma-key / junk fringe pixels to fully transparent.
+
+    Exports often store the area outside a badge as magenta (#ff00ff) with
+    alpha 1–16. Palette quantization then treats that as a real fill, so
+    VTracer paints a neon-pink rectangle behind the crest. Clear those pixels
+    (and any near-invisible alpha) before analysis and tracing.
+    """
+    import numpy as np
+
+    rgba = np.asarray(image.convert("RGBA"), dtype=np.uint8)
+    alpha = rgba[..., 3]
+    r = rgba[..., 0].astype(np.int16)
+    g = rgba[..., 1].astype(np.int16)
+    b = rgba[..., 2].astype(np.int16)
+    # Classic chroma keys + near-transparent anything.
+    magenta = (r >= 200) & (b >= 200) & (g <= 80) & (alpha < 250)
+    near_invisible = alpha < 16
+    kill = magenta | near_invisible
+    out = rgba.copy()
+    # Cleared pixels keep their matte RGB: zeroing it would turn a transparent
+    # white matte into a "black matte" that solidify_black_matte then bakes
+    # opaque. Only the chroma key itself is neutralised.
+    if np.any(kill):
+        out[kill, 3] = 0
+        out[magenta, :3] = 255
+    # Soft cutout fringe (alpha 16–96): mid-greys along the silhouette become
+    # pale soft-iso labels and show as white slivers outside the black outline.
+    # Clear low coverage; promote denser fringe to fully opaque so labels snap
+    # to a real fill instead of a translucent ghost.
+    alpha2 = out[..., 3]
+    soft = (alpha2 >= 16) & (alpha2 < 96)
+    if np.any(soft):
+        promote = soft & (alpha2 >= 48)
+        clear = soft & ~promote
+        out[clear, 3] = 0
+        out[promote, 3] = 255
+    # Light AA halo outside dark ink rings (e.g. grey ~142 at alpha ~190 on
+    # crest exports). Those pixels are closer to "empty" than to any fill and
+    # otherwise become white/grey soft-iso ribbons around the badge.
+    alpha3 = out[..., 3]
+    rgb3 = out[..., :3].astype(np.int16)
+    luma = 0.299 * rgb3[..., 0] + 0.587 * rgb3[..., 1] + 0.114 * rgb3[..., 2]
+    sat = rgb3.max(axis=2) - rgb3.min(axis=2)
+    pale = (alpha3 >= 96) & (alpha3 < 250) & (luma >= 90) & (sat <= 40)
+    if np.any(pale):
+        empty = alpha3 < 16
+        padded = np.pad(empty, 1, constant_values=False)
+        near_empty = (
+            padded[:-2, 1:-1]
+            | padded[1:-1, :-2]
+            | padded[1:-1, 2:]
+            | padded[2:, 1:-1]
+            | padded[:-2, :-2]
+            | padded[:-2, 2:]
+            | padded[2:, :-2]
+            | padded[2:, 2:]
+        )
+        halo = pale & near_empty
+        if np.any(halo):
+            out[halo, 3] = 0
+    if not np.any(kill) and not np.any(soft) and not np.any(pale):
+        return image.convert("RGBA")
+    return Image.fromarray(out, mode="RGBA")
 
 
 def solidify_black_matte(image: Image.Image) -> Image.Image:
@@ -273,6 +805,16 @@ def solidify_black_matte(image: Image.Image) -> Image.Image:
     threshold = 0.55 if opaque_ratio <= 0.35 else 0.70
     if float(dark_matte.mean()) < threshold:
         return image.convert("RGBA")
+    # Cutout badges/crests (colourful opaque subject + empty corners) must keep
+    # real transparency. Only solidify when the mark is sparse or itself mostly
+    # near-black (ChatGPT / Brave style black mattes).
+    opaque = rgba[alpha >= 128, :3].astype(np.int16)
+    if opaque_ratio >= 0.50 and len(opaque):
+        opaque_luma = (
+            0.299 * opaque[:, 0] + 0.587 * opaque[:, 1] + 0.114 * opaque[:, 2]
+        )
+        if float((opaque_luma <= 55).mean()) < 0.55:
+            return image.convert("RGBA")
     out = rgba.copy()
     ys, xs = np.nonzero(transparent)
     keep = dark_matte

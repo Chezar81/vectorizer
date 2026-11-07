@@ -151,11 +151,13 @@ def marching_squares(
                 + float(padded[y + 1, x])
                 + float(padded[y + 1, x + 1])
             ) * 0.25
-            if (code == 5 and centre < level) or (code == 10 and centre >= level):
+            # Centre inside joins the two inside corners; segments keep the
+            # same winding as the single-outside-corner cases (7/13, 11/14).
+            if centre >= level:
                 if code == 5:
-                    pairs = ((_EDGE_D, _EDGE_C), (_EDGE_A, _EDGE_B))
+                    pairs = ((_EDGE_D, _EDGE_C), (_EDGE_B, _EDGE_A))
                 else:
-                    pairs = ((_EDGE_A, _EDGE_D), (_EDGE_B, _EDGE_C))
+                    pairs = ((_EDGE_A, _EDGE_D), (_EDGE_C, _EDGE_B))
         corners = (
             float(padded[y + 1, x]),
             float(padded[y + 1, x + 1]),
@@ -168,6 +170,9 @@ def marching_squares(
             # Undo the 1-pixel pad.
             p0 = (p0[0] - 1.0, p0[1] - 1.0)
             p1 = (p1[0] - 1.0, p1[1] - 1.0)
+            if _key(p0) == _key(p1):
+                # Crossing on a corner: zero-length segment would self-loop.
+                continue
             segments.setdefault(_key(p0), []).append(p1)
 
     return _chain_segments(segments)

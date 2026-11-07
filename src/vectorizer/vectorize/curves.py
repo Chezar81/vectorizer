@@ -24,6 +24,16 @@ class ArcSegment:
 PathSegment = Union[Cubic, ArcSegment]
 
 
+def simplify_closed_ring(
+    points: Sequence[Point], *, epsilon: float
+) -> list[Point]:
+    """Corner-preserving Douglas–Peucker on a closed ring (public helper)."""
+    ring = _dedupe(_open_ring(points))
+    if len(ring) < 3:
+        return list(ring)
+    return _douglas_peucker_closed(ring, max(0.25, float(epsilon)))
+
+
 def fit_closed_contour(
     points: Sequence[Point], *, tolerance: float, corner_degrees: float
 ) -> list[PathSegment]:
@@ -92,10 +102,26 @@ def _preprocess_ring(ring: Sequence[Point], tolerance: float) -> list[Point]:
         return list(ring)
     # First pass: keep geometry within ~half a pixel of the crack polyline.
     simplified = _douglas_peucker_closed(ring, max(0.35, tolerance * 0.45))
-    if len(simplified) <= 2200:
-        return _dedupe(simplified)
-    # Extreme contours: Visvalingam-style area cull after the DP pass.
-    return _area_decimate_closed(simplified, max_points=2200)
+    if len(simplified) > 2200:
+        # Extreme contours: Visvalingam-style area cull after the DP pass.
+        simplified = _area_decimate_closed(simplified, max_points=2200)
+    # Schneider only checks error at samples; long DP chords left the cubic
+    # free to bulge 2–3 px between sparse vertices.
+    return _densify_closed(_dedupe(simplified), spacing=2.0)
+
+
+def _densify_closed(ring: Sequence[Point], *, spacing: float) -> list[Point]:
+    out: list[Point] = []
+    count = len(ring)
+    for i in range(count):
+        a = ring[i]
+        b = ring[(i + 1) % count]
+        out.append(a)
+        steps = int(_hypot(b[0] - a[0], b[1] - a[1]) // spacing)
+        for k in range(1, steps + 1):
+            t = k / float(steps + 1)
+            out.append((a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t))
+    return out
 
 
 def _area_decimate_closed(ring: Sequence[Point], *, max_points: int) -> list[Point]:
