@@ -94,8 +94,8 @@ app = BUNDLE(
     info_plist={
         "CFBundleName": "Vectorizer",
         "CFBundleDisplayName": "Vectorizer",
-        "CFBundleShortVersionString": "0.6.0",
-        "CFBundleVersion": "0.6.0",
+        "CFBundleShortVersionString": "0.5.0",
+        "CFBundleVersion": "0.5.0",
         "NSHighResolutionCapable": True,
         "NSRequiresAquaSystemAppearance": False,
         "LSMinimumSystemVersion": "11.0",
