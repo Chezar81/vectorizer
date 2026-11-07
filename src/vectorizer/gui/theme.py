@@ -316,6 +316,20 @@ def mint_stylesheet(colors: ThemeColors) -> str:
         background-color: {bg};
         border-top: 1px solid {border};
         color: {muted};
+        min-height: 22px;
+        max-height: 24px;
+        padding: 0 8px;
+    }}
+    QStatusBar::item {{
+        border: none;
+        margin: 0;
+        padding: 0;
+    }}
+    QStatusBar QLabel {{
+        background: transparent;
+        color: {muted};
+        padding: 0;
+        margin: 0;
     }}
     QTabWidget::pane {{
         border: 1px solid {border};
@@ -455,44 +469,54 @@ def mint_stylesheet(colors: ThemeColors) -> str:
         border-radius: 5px;
     }}
     QScrollBar:vertical {{
-        background: {panel};
+        background: transparent;
         width: 12px;
         margin: 0;
         border: none;
     }}
     QScrollBar::handle:vertical {{
         background: {border};
-        border-radius: 5px;
+        border: none;
+        border-radius: 4px;
         min-height: 28px;
-        margin: 2px;
+        margin: 2px 2px;
     }}
     QScrollBar::handle:vertical:hover {{
+        background: {muted};
+    }}
+    QScrollBar::handle:vertical:pressed {{
         background: {accent};
     }}
     QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical,
     QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{
-        background: none;
+        background: transparent;
         height: 0;
+        width: 0;
         border: none;
     }}
     QScrollBar:horizontal {{
-        background: {panel};
+        background: transparent;
         height: 12px;
         margin: 0;
         border: none;
     }}
     QScrollBar::handle:horizontal {{
         background: {border};
-        border-radius: 5px;
+        border: none;
+        border-radius: 4px;
         min-width: 28px;
-        margin: 2px;
+        margin: 2px 2px;
     }}
     QScrollBar::handle:horizontal:hover {{
+        background: {muted};
+    }}
+    QScrollBar::handle:horizontal:pressed {{
         background: {accent};
     }}
     QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal,
     QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {{
-        background: none;
+        background: transparent;
+        height: 0;
         width: 0;
         border: none;
     }}
@@ -500,11 +524,23 @@ def mint_stylesheet(colors: ThemeColors) -> str:
         background: {base};
         border: none;
     }}
-    QGraphicsView QScrollBar:horizontal {{
-        height: 12px;
-    }}
     QGraphicsView QScrollBar:vertical {{
-        width: 12px;
+        background: transparent;
+        width: 10px;
+    }}
+    QGraphicsView QScrollBar:horizontal {{
+        background: transparent;
+        height: 10px;
+    }}
+    QGraphicsView QScrollBar::handle:vertical {{
+        border-radius: 3px;
+        margin: 2px 2px;
+        min-height: 24px;
+    }}
+    QGraphicsView QScrollBar::handle:horizontal {{
+        border-radius: 3px;
+        margin: 2px 2px;
+        min-width: 24px;
     }}
     QSplitter::handle {{
         background: {border};

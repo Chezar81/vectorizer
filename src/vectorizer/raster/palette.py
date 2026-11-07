@@ -112,6 +112,7 @@ def cel_fill_palette(
     radius: float = 0.05,
     chroma_weight: float = 1.6,
     min_share: float = 0.0005,
+    thin_strip_residuals: bool = False,
 ) -> tuple[str, ...]:
     """Flat-fill inks for ink-outlined cel art, ignoring strokes and AA fringe.
 
@@ -120,26 +121,39 @@ def cel_fill_palette(
     neck) disappear. Here only flat interior pixels vote, and inks are chosen
     by set cover in chroma-weighted OKLab so each slot adds a new colour rather
     than another shade of the wall.
+
+    `thin_strip_residuals` lets fills hatched by dense ink (a curtain with fold
+    lines every few pixels) earn a slot: they fail the 5×5 flatness vote or
+    fall just under `min_pixels` after downscale, so soft 3×3 pixels far from
+    every chosen ink get a second set-cover pass (including flat leftovers).
     """
     from PIL import ImageFilter
 
     from vectorizer.raster.preprocess import _binary_dilate, cel_stroke_mask
 
-    rgb_img = image.convert("RGB")
-    width, height = rgb_img.size
+    rgba_img = image.convert("RGBA")
+    width, height = rgba_img.size
     if max(width, height) > max_side:
         scale = max_side / float(max(width, height))
-        rgb_img = rgb_img.resize(
+        rgba_img = rgba_img.resize(
             (max(1, int(width * scale)), max(1, int(height * scale))),
             Image.Resampling.BOX,
         )
-    rgb = np.asarray(rgb_img, dtype=np.uint8)
+    rgba = np.asarray(rgba_img, dtype=np.uint8)
+    rgb = rgba[..., :3]
+    opaque = rgba[..., 3] >= 128
     stroke = _binary_dilate(cel_stroke_mask(rgb), 1)
     med_img = Image.fromarray(rgb, "RGB").filter(ImageFilter.MedianFilter(3))
     med = np.asarray(med_img, dtype=np.uint8)
     hi = np.asarray(med_img.filter(ImageFilter.MaxFilter(5)), dtype=np.int16)
     lo = np.asarray(med_img.filter(ImageFilter.MinFilter(5)), dtype=np.int16)
-    flat = ((hi - lo).max(axis=2) <= 16) & ~stroke
+    # Skip transparent / chroma-key leftovers so magenta never earns a slot.
+    chroma = (
+        (med[..., 0] >= 200)
+        & (med[..., 2] >= 200)
+        & (med[..., 1] <= 80)
+    )
+    flat = ((hi - lo).max(axis=2) <= 16) & ~stroke & opaque & ~chroma
     pixels = med[flat]
     if len(pixels) < 64:
         return ()
@@ -207,7 +221,144 @@ def cel_fill_palette(
         seen.add(hex_color)
         ranked.append((len(members), hex_color))
     ranked.sort(key=lambda item: -item[0])
-    return tuple(color for _count, color in ranked)
+    colors = [color for _count, color in ranked]
+    if thin_strip_residuals and len(colors) < max_colors:
+        # Curtain yellow & similar: fold lines fail 5×5 flatness, and the few
+        # flat leftovers often sit just under min_pixels after downscale. Pull
+        # soft 3×3 interiors that are still far from every reported ink.
+        hi3 = np.asarray(med_img.filter(ImageFilter.MaxFilter(3)), dtype=np.int16)
+        lo3 = np.asarray(med_img.filter(ImageFilter.MinFilter(3)), dtype=np.int16)
+        soft = (
+            ((hi3 - lo3).max(axis=2) <= 24) & ~stroke & opaque & ~chroma
+        )
+        # Measure against reported medians, not k-means means: a cream mean
+        # drifts toward yellow when yellow pixels joined its votes.
+        reported = np.asarray([hex_to_rgb(c) for c in colors], dtype=np.uint8)
+        extras = _thin_strip_inks(
+            med[soft],
+            srgb_u8_to_oklab(reported.reshape(1, -1, 3))[0] * weight,
+            weight,
+            radius=radius,
+            min_pixels=max(8, min_pixels // 3),
+            limit=6,
+            seen=seen,
+        )
+        # Small shaded solids (a sea-green lamp base, a green book spine)
+        # fall under min_pixels once the flat vote is subsampled and sit
+        # inside the 2r blend gate of a neighbouring teal, so they dither
+        # between two inks. Their flat pixels are not edge blends.
+        reported = np.asarray(
+            [hex_to_rgb(c) for c in (*colors, *extras)], dtype=np.uint8
+        )
+        extras += _thin_strip_inks(
+            med[flat],
+            srgb_u8_to_oklab(reported.reshape(1, -1, 3))[0] * weight,
+            weight,
+            radius=radius,
+            min_pixels=max(8, min_pixels * 2),
+            limit=3,
+            seen=seen,
+            far_gate=1.6,
+        )
+        colors = _prune_by_error_rise(
+            med[soft | flat],
+            [*colors, *extras],
+            weight,
+            max_colors,
+            tolerance=1.2 * radius,
+        )
+    return tuple(colors)
+
+
+def _prune_by_error_rise(
+    pixels: np.ndarray,
+    colors: list[str],
+    weight: np.ndarray,
+    max_colors: int,
+    *,
+    tolerance: float = 0.0,
+) -> list[str]:
+    """Drop inks whose removal raises snap error over `pixels` the least.
+
+    The dominant (first) ink is always kept. A faint base shade can then yield
+    its slot to a small but distinct solid found by the residual passes.
+
+    Error below `tolerance` is free: a wide pastel with a near-twin otherwise
+    outvotes a small book spine whose pixels would snap to a different hue.
+    """
+    if len(colors) <= max_colors:
+        return list(colors)
+    sample = np.ascontiguousarray(pixels[:: max(1, len(pixels) // 200_000)])
+    lab = srgb_u8_to_oklab(sample.reshape(1, -1, 3))[0] * weight
+    rgb = np.asarray([hex_to_rgb(c) for c in colors], dtype=np.uint8)
+    c = srgb_u8_to_oklab(rgb.reshape(1, -1, 3))[0] * weight
+    d = (lab * lab).sum(-1)[:, None] - 2.0 * lab @ c.T + (c * c).sum(-1)[None, :]
+    dist = np.maximum(np.sqrt(np.maximum(d, 0.0)) - tolerance, 0.0)
+    alive = list(range(len(colors)))
+    while len(alive) > max_colors:
+        sub = dist[:, alive]
+        order = np.argsort(sub, axis=1)
+        rows = np.arange(len(sub))
+        first = sub[rows, order[:, 0]]
+        second = sub[rows, order[:, 1]]
+        rise = np.bincount(order[:, 0], weights=second - first, minlength=len(alive))
+        rise[0] = np.inf
+        alive.pop(int(np.argmin(rise)))
+    return [colors[i] for i in alive]
+
+
+def _thin_strip_inks(
+    pixels: np.ndarray,
+    centers: np.ndarray,
+    weight: np.ndarray,
+    *,
+    radius: float,
+    min_pixels: int,
+    limit: int,
+    seen: set[str],
+    far_gate: float = 2.0,
+) -> list[str]:
+    if limit <= 0 or len(pixels) < min_pixels:
+        return []
+    lab = srgb_u8_to_oklab(np.ascontiguousarray(pixels).reshape(1, -1, 3))[0] * weight
+
+    def _nearest(c: np.ndarray) -> np.ndarray:
+        d = (
+            (lab * lab).sum(-1)[:, None]
+            - 2.0 * lab @ c.T
+            + (c * c).sum(-1)[None, :]
+        )
+        return np.sqrt(np.maximum(d.min(axis=1), 0.0))
+
+    # Default twice the vote radius: blends between two chosen inks stay unclaimed.
+    far = _nearest(centers) > far_gate * radius
+    added: list[str] = []
+    for _ in range(limit):
+        if int(far.sum()) < min_pixels:
+            break
+        cand = lab[far]
+        sample = cand[:: max(1, len(cand) // 4000)]
+        d = (
+            (sample * sample).sum(-1)[:, None]
+            - 2.0 * sample @ cand.T
+            + (cand * cand).sum(-1)[None, :]
+        )
+        near = d < radius * radius
+        best = int(np.argmax(near.sum(axis=1)))
+        members = near[best]
+        if int(members.sum()) < min_pixels:
+            break
+        median = np.median(pixels[far][members], axis=0)
+        hex_color = normalize_hex(
+            rgb_to_hex((int(median[0]), int(median[1]), int(median[2])))
+        )
+        idx = np.nonzero(far)[0][members]
+        far[idx] = False
+        if hex_color in seen:
+            continue
+        seen.add(hex_color)
+        added.append(hex_color)
+    return added
 
 
 def snap_image_to_palette(
