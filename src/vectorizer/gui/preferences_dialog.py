@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QGridLayout,
@@ -21,12 +22,20 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSizePolicy,
     QSpinBox,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
 from vectorizer.batch.engine import CollisionPolicy
-from vectorizer.domain.settings import AutomaticQuality, WorkflowMode
+from vectorizer.domain.settings import (
+    AutomaticQuality,
+    DxfCurveMode,
+    DxfLineDensity,
+    EpsCompatibility,
+    SvgPaintStyle,
+    WorkflowMode,
+)
 from vectorizer.export.tools import find_inkscape
 from vectorizer.gui.i18n import preferences_file_filter, t, tf
 from vectorizer.gui.preferences import (
@@ -62,10 +71,21 @@ def _path_row(edit: QLineEdit, *buttons: QPushButton) -> QWidget:
     return wrap
 
 
+def _tab_page(*widgets: QWidget) -> QWidget:
+    page = QWidget()
+    layout = QVBoxLayout(page)
+    layout.setContentsMargins(12, 12, 12, 12)
+    layout.setSpacing(12)
+    for widget in widgets:
+        layout.addWidget(widget)
+    layout.addStretch(1)
+    return page
+
+
 class PreferencesDialog(QDialog):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setMinimumSize(1080, 660)
+        self.setMinimumSize(720, 520)
         prefs = current_preferences()
 
         self.workflow = QComboBox()
@@ -126,10 +146,25 @@ class PreferencesDialog(QDialog):
         self.png_height.setMinimumWidth(110)
         self.png_bg = QComboBox()
         self.png_bg.setMinimumWidth(160)
-        self.png_bg.addItem("", "")  # transparent
+        self.png_bg.addItem("", "")
         self.png_bg.addItem("", "#ffffff")
         self.png_bg.addItem("", "#000000")
         self.png_bg.addItem("", "#1f9ede")
+
+        self.svg_style = QComboBox()
+        self.gap_filler_width = QDoubleSpinBox()
+        self.gap_filler_width.setRange(0.0, 5.0)
+        self.gap_filler_width.setSingleStep(0.1)
+        self.gap_filler_width.setDecimals(2)
+        self.gap_filler_non_scaling = QCheckBox()
+        self.parameterized_shapes = QCheckBox()
+        self.palette_tolerance = QSpinBox()
+        self.palette_tolerance.setRange(0, 255)
+        self.dxf_mode = QComboBox()
+        self.dxf_density = QComboBox()
+        self.eps_level = QComboBox()
+        self.max_side = QSpinBox()
+        self.max_side.setRange(0, 16384)
 
         self.session_steps = QSpinBox()
         self.session_steps.setRange(2, 500)
@@ -148,6 +183,10 @@ class PreferencesDialog(QDialog):
             self.last_preset,
             self.batch_collision,
             self.png_bg,
+            self.svg_style,
+            self.dxf_mode,
+            self.dxf_density,
+            self.eps_level,
         ):
             combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
@@ -174,6 +213,28 @@ class PreferencesDialog(QDialog):
         for index, box in enumerate(fmt_boxes):
             fmt_grid.addWidget(box, index // 3, index % 3)
         self._formats_box = formats
+
+        svg_box = QGroupBox()
+        svg_form = _comfortable_form(svg_box)
+        self._svg_style_label = QLabel()
+        self._gap_width_label = QLabel()
+        self._palette_tol_label = QLabel()
+        svg_form.addRow(self._svg_style_label, self.svg_style)
+        svg_form.addRow(self._gap_width_label, self.gap_filler_width)
+        svg_form.addRow(self.gap_filler_non_scaling)
+        svg_form.addRow(self.parameterized_shapes)
+        svg_form.addRow(self._palette_tol_label, self.palette_tolerance)
+        self._svg_box = svg_box
+
+        cad_box = QGroupBox()
+        cad_form = _comfortable_form(cad_box)
+        self._dxf_mode_label = QLabel()
+        self._dxf_density_label = QLabel()
+        self._eps_level_label = QLabel()
+        cad_form.addRow(self._dxf_mode_label, self.dxf_mode)
+        cad_form.addRow(self._dxf_density_label, self.dxf_density)
+        cad_form.addRow(self._eps_level_label, self.eps_level)
+        self._cad_box = cad_box
 
         batch = QGroupBox()
         batch_form = _comfortable_form(batch)
@@ -218,10 +279,18 @@ class PreferencesDialog(QDialog):
         self._session_label = QLabel()
         self._seg_steps_label = QLabel()
         self._seg_mib_label = QLabel()
+        self._max_side_label = QLabel()
         hist_form.addRow(self._session_label, self.session_steps)
         hist_form.addRow(self._seg_steps_label, self.seg_steps)
         hist_form.addRow(self._seg_mib_label, self.seg_mib)
+        hist_form.addRow(self._max_side_label, self.max_side)
         self._history_box = history
+
+        self.tabs = QTabWidget()
+        self.tabs.addTab(_tab_page(defaults), "")
+        self.tabs.addTab(_tab_page(formats, png, svg_box, cad_box), "")
+        self.tabs.addTab(_tab_page(batch), "")
+        self.tabs.addTab(_tab_page(history, tools), "")
 
         self.save_file_btn = QPushButton()
         self.load_file_btn = QPushButton()
@@ -250,24 +319,6 @@ class PreferencesDialog(QDialog):
             button.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
         self._loading_form = False
 
-        left = QVBoxLayout()
-        left.setSpacing(12)
-        left.addWidget(defaults)
-        left.addWidget(batch)
-        left.addStretch(1)
-
-        right = QVBoxLayout()
-        right.setSpacing(12)
-        right.addWidget(formats)
-        right.addWidget(png)
-        right.addWidget(history)
-        right.addStretch(1)
-
-        columns = QHBoxLayout()
-        columns.setSpacing(16)
-        columns.addLayout(left, 3)
-        columns.addLayout(right, 2)
-
         button_bar = QHBoxLayout()
         button_bar.setContentsMargins(0, 0, 0, 0)
         box_layout = self._buttons.layout()
@@ -285,21 +336,26 @@ class PreferencesDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(14, 14, 14, 14)
         layout.setSpacing(12)
-        layout.addLayout(columns, 1)
-        layout.addWidget(tools)
+        layout.addWidget(self.tabs, 1)
         layout.addLayout(button_bar)
+
+        self.dxf_mode.currentIndexChanged.connect(self._sync_dxf_density)
+        self.svg_style.currentIndexChanged.connect(self._sync_gap_rows)
 
         self._load_values(prefs)
         self.retranslate_ui()
         self._refresh_inkscape_status()
         self._watch_form_edits()
         self.inkscape_path.textChanged.connect(lambda _t: self._refresh_inkscape_status())
-        # Prefer content size, with a roomy floor so labels and spinboxes are not clipped.
         hint = self.sizeHint()
-        self.resize(max(hint.width() + 40, 1120), max(hint.height() + 24, 700))
+        self.resize(max(hint.width() + 40, 780), max(hint.height() + 24, 560))
 
     def retranslate_ui(self) -> None:
         self.setWindowTitle(t("Preferences"))
+        self.tabs.setTabText(0, t("General"))
+        self.tabs.setTabText(1, t("Export"))
+        self.tabs.setTabText(2, t("Batch"))
+        self.tabs.setTabText(3, t("Advanced"))
         self.save_file_btn.setText(t("&Save to file"))
         self.load_file_btn.setText(t("&Load from file"))
         self.reset_btn.setText(t("&Reset Preferences"))
@@ -336,6 +392,52 @@ class PreferencesDialog(QDialog):
         self.fmt_png.setText(t("PNG preview"))
         self.fmt_dxf.setText(t("DXF (outlines)"))
         self.fmt_eps.setText(t("EPS (Inkscape)"))
+
+        self._svg_box.setTitle(t("SVG defaults"))
+        self._svg_style_label.setText(t("SVG paint"))
+        self._gap_width_label.setText(t("Gap / edge stroke width"))
+        self._palette_tol_label.setText(t("Palette snap tolerance"))
+        self.gap_filler_non_scaling.setText(t("Non-scaling gap / edge strokes"))
+        self.parameterized_shapes.setText(t("Detect circles and rectangles"))
+        self._set_combo_labels(
+            self.svg_style,
+            (
+                (t("Fill only"), SvgPaintStyle.FILL),
+                (t("Stroke and fill"), SvgPaintStyle.STROKE_FILL),
+                (t("Gap filler"), SvgPaintStyle.GAP_FILLER),
+                (t("Stroke edges"), SvgPaintStyle.STROKE_EDGES),
+            ),
+        )
+
+        self._cad_box.setTitle(t("DXF / EPS defaults"))
+        self._dxf_mode_label.setText(t("DXF curves"))
+        self._dxf_density_label.setText(t("DXF line density"))
+        self._eps_level_label.setText(t("EPS compatibility"))
+        self._set_combo_labels(
+            self.dxf_mode,
+            (
+                (t("DXF lines"), DxfCurveMode.LINES),
+                (t("DXF lines and arcs"), DxfCurveMode.LINES_AND_ARCS),
+                (t("DXF splines"), DxfCurveMode.SPLINES),
+            ),
+        )
+        self._set_combo_labels(
+            self.dxf_density,
+            (
+                (t("Few (~4)"), DxfLineDensity.FEW),
+                (t("Normal (~8)"), DxfLineDensity.NORMAL),
+                (t("Many (~16)"), DxfLineDensity.MANY),
+            ),
+        )
+        self._set_combo_labels(
+            self.eps_level,
+            (
+                (t("Maximize compatibility"), EpsCompatibility.COMPATIBLE),
+                (t("Minimize file size"), EpsCompatibility.COMPACT),
+            ),
+        )
+        self._sync_dxf_density()
+        self._sync_gap_rows()
 
         self._batch_box.setTitle(t("Batch defaults"))
         self._collision_label.setText(t("Collisions"))
@@ -376,10 +478,19 @@ class PreferencesDialog(QDialog):
             ),
         )
 
-        self._history_box.setTitle(t("History"))
+        self._history_box.setTitle(t("History and limits"))
         self._session_label.setText(t("Session undo steps"))
         self._seg_steps_label.setText(t("Segmentation undo steps"))
         self._seg_mib_label.setText(t("Segmentation undo memory"))
+        self._max_side_label.setText(t("Max working side"))
+        self.max_side.setSpecialValueText(t("Prompt"))
+        self.max_side.setToolTip(
+            t(
+                "0 asks before shrinking an image over the working limit. A positive value "
+                "shrinks the working copy so the long side is at most this many pixels. "
+                "The original file is not modified."
+            )
+        )
 
     def _load_values(self, prefs: AppPreferences) -> None:
         self._loading_form = True
@@ -415,9 +526,20 @@ class PreferencesDialog(QDialog):
             bg = ""
         bg_idx = self.png_bg.findData(bg)
         self.png_bg.setCurrentIndex(bg_idx if bg_idx >= 0 else 0)
+        self._select_data(self.svg_style, prefs.svg_paint_style)
+        self.gap_filler_width.setValue(prefs.gap_filler_width)
+        self.gap_filler_non_scaling.setChecked(prefs.gap_filler_non_scaling)
+        self.parameterized_shapes.setChecked(prefs.parameterized_shapes)
+        self.palette_tolerance.setValue(prefs.palette_tolerance)
+        self._select_data(self.dxf_mode, prefs.dxf_curve_mode)
+        self._select_data(self.dxf_density, prefs.dxf_line_density)
+        self._select_data(self.eps_level, prefs.eps_compatibility)
+        self.max_side.setValue(prefs.max_side)
         self.session_steps.setValue(prefs.session_history_steps)
         self.seg_steps.setValue(prefs.segmentation_history_steps)
         self.seg_mib.setValue(prefs.segmentation_history_mib)
+        self._sync_dxf_density()
+        self._sync_gap_rows()
 
     def _form_preferences(self) -> AppPreferences | None:
         if not (
@@ -452,6 +574,15 @@ class PreferencesDialog(QDialog):
             png_width=self.png_width.value(),
             png_height=self.png_height.value(),
             png_background=str(self.png_bg.currentData() or ""),
+            svg_paint_style=self.svg_style.currentData() or SvgPaintStyle.FILL,
+            gap_filler_width=float(self.gap_filler_width.value()),
+            gap_filler_non_scaling=self.gap_filler_non_scaling.isChecked(),
+            parameterized_shapes=self.parameterized_shapes.isChecked(),
+            palette_tolerance=self.palette_tolerance.value(),
+            dxf_curve_mode=self.dxf_mode.currentData() or DxfCurveMode.LINES,
+            dxf_line_density=self.dxf_density.currentData() or DxfLineDensity.NORMAL,
+            eps_compatibility=self.eps_level.currentData() or EpsCompatibility.COMPACT,
+            max_side=self.max_side.value(),
             session_history_steps=self.session_steps.value(),
             segmentation_history_steps=self.seg_steps.value(),
             segmentation_history_mib=self.seg_mib.value(),
@@ -554,6 +685,10 @@ class PreferencesDialog(QDialog):
             self.last_preset,
             self.batch_collision,
             self.png_bg,
+            self.svg_style,
+            self.dxf_mode,
+            self.dxf_density,
+            self.eps_level,
         ):
             combo.currentIndexChanged.connect(self._on_form_edited)
         for box in (
@@ -564,6 +699,8 @@ class PreferencesDialog(QDialog):
             self.fmt_eps,
             self.batch_continue,
             self.confirm_overwrite,
+            self.gap_filler_non_scaling,
+            self.parameterized_shapes,
         ):
             box.toggled.connect(self._on_form_edited)
         for edit in (
@@ -579,13 +716,30 @@ class PreferencesDialog(QDialog):
             self.session_steps,
             self.seg_steps,
             self.seg_mib,
+            self.palette_tolerance,
+            self.max_side,
         ):
             spin.valueChanged.connect(self._on_form_edited)
+        self.gap_filler_width.valueChanged.connect(self._on_form_edited)
 
     def _on_form_edited(self, *_args: object) -> None:
         if self._loading_form:
             return
         self._set_file_status("")
+
+    def _sync_dxf_density(self) -> None:
+        lines = self.dxf_mode.currentData() == DxfCurveMode.LINES
+        self.dxf_density.setEnabled(lines)
+        self._dxf_density_label.setEnabled(lines)
+
+    def _sync_gap_rows(self) -> None:
+        show = self.svg_style.currentData() in {
+            SvgPaintStyle.GAP_FILLER,
+            SvgPaintStyle.STROKE_EDGES,
+        }
+        self.gap_filler_width.setEnabled(show)
+        self.gap_filler_non_scaling.setEnabled(show)
+        self._gap_width_label.setEnabled(show)
 
     def _browse_export_dir(self) -> None:
         path = QFileDialog.getExistingDirectory(
@@ -619,7 +773,6 @@ class PreferencesDialog(QDialog):
             self._refresh_inkscape_status()
 
     def _refresh_inkscape_status(self) -> None:
-        # Probe with temporary override without mutating global prefs yet.
         from vectorizer.export.tools import inkscape_override, set_inkscape_override
 
         previous = inkscape_override()

@@ -1,4 +1,4 @@
-"""Settings sidebar. Background and color controls stay visible in every mode."""
+"""Settings sidebar with progressive disclosure by workflow mode."""
 
 from __future__ import annotations
 
@@ -262,18 +262,10 @@ class SettingsPanel(QWidget):
         trace_btns.addWidget(self.trace_remove_btn)
         trace_layout.addLayout(trace_btns)
         colors_form.addRow(self._trace_editor)
-        self._palette_caption = QLabel()
-        self._result_palette = QWidget()
-        self._result_palette.setObjectName("optionBlock")
-        result_layout = QVBoxLayout(self._result_palette)
-        result_layout.setContentsMargins(0, 4, 0, 0)
-        result_layout.setSpacing(4)
-        result_layout.addWidget(self._palette_caption)
-        result_layout.addWidget(self.palette_list)
-        result_layout.addWidget(self.recolor_btn)
-        colors_form.addRow(self._result_palette)
         self._colors_box = colors
 
+        # Output controls stay as widgets for presets/batch/settings round-trip,
+        # but live in Preferences + export dialogs — not in the sidebar.
         output = QGroupBox()
         output_form = QFormLayout(output)
         self._svg_style_label = QLabel()
@@ -295,6 +287,18 @@ class SettingsPanel(QWidget):
         self._max_side_label = QLabel()
         output_form.addRow(self._max_side_label, self.max_side)
         self._output_box = output
+        self._output_box.hide()
+
+        self._palette_caption = QLabel()
+        result = QGroupBox()
+        result_layout = QVBoxLayout(result)
+        result_layout.setContentsMargins(8, 8, 8, 8)
+        result_layout.setSpacing(4)
+        result_layout.addWidget(self._palette_caption)
+        result_layout.addWidget(self.palette_list)
+        result_layout.addWidget(self.recolor_btn)
+        self._result_box = result
+        self._result_palette = result
 
         self._basic_guide = QGroupBox()
         guide_form = QFormLayout(self._basic_guide)
@@ -430,15 +434,17 @@ class SettingsPanel(QWidget):
         layout.addLayout(top)
         layout.addWidget(self.notes)
         layout.addWidget(background)
-        layout.addWidget(colors)
-        layout.addWidget(output)
         layout.addWidget(self._basic_guide)
+        layout.addWidget(colors)
         layout.addWidget(basic)
         layout.addWidget(self._palette_box)
         layout.addWidget(self._segments_box)
         layout.addWidget(self._curves_box)
         layout.addWidget(self._engine_box)
+        layout.addWidget(self._result_box)
         layout.addWidget(presets)
+        # Kept for settings round-trip; never shown in the sidebar.
+        layout.addWidget(output)
         layout.addStretch(1)
         self.retranslate_ui()
 
@@ -553,9 +559,9 @@ class SettingsPanel(QWidget):
             )
             self.workflow.setToolTip(
                 t(
-                    "Automatic classifies the image (logo, line art, photo, …) and "
-                    "chooses tracing plus preprocess defaults. Background and color "
-                    "controls below always apply — switch to Basic for path-fitting options."
+                    "Automatic classifies the image and chooses tracing defaults. "
+                    "Basic shows a short guide. Advanced unlocks expert knobs. "
+                    "Export options live in the export dialogs and Preferences."
                 )
             )
             self._refill_combo(
@@ -803,6 +809,7 @@ class SettingsPanel(QWidget):
             )
             self._colors_box.setTitle(t("Colors"))
             self._output_box.setTitle(t("Output"))
+            self._result_box.setTitle(t("Result colors"))
             self._image_type_label.setText(t("Image type"))
             self._edge_label.setText(t("Edges"))
             self._palette_choice_label.setText(t("Trace palette"))
@@ -822,7 +829,7 @@ class SettingsPanel(QWidget):
             self._sync_gap_filler_rows()
             self._sync_dxf_density()
             self._target_colors_label.setText(t("Target color count"))
-            self._palette_caption.setText(t("Result palette (after vectorize):"))
+            self._palette_caption.setText(t("After vectorize — recolor without retracing:"))
             self._basic_guide.setTitle(t("Basic guide"))
             self._basic_image_label.setText(t("Image type"))
             self._basic_quality_label.setText(t("Quality"))
@@ -958,7 +965,23 @@ class SettingsPanel(QWidget):
         self.bg_tolerance.setEnabled(checked)
         self.bg_color_btn.setEnabled(checked)
         self.bg_pick_btn.setEnabled(checked)
+        self._sync_background_detail_rows()
         self._emit_changed()
+
+    def _sync_background_detail_rows(self) -> None:
+        """In Automatic, hide color/tolerance until Remove background is on."""
+        auto = self.workflow.currentData() == WorkflowMode.AUTOMATIC
+        show_details = (not auto) or self.remove_background.isChecked()
+        self._bg_color_label.setVisible(show_details)
+        self.bg_color_btn.setVisible(show_details)
+        self.bg_pick_btn.setVisible(show_details)
+        tol_wrap = self._bg_tolerance_label.parentWidget()
+        if tol_wrap is not None:
+            tol_wrap.setVisible(show_details)
+        else:
+            self._bg_tolerance_label.setVisible(show_details)
+            self.bg_tolerance.setVisible(show_details)
+        self._bg_hint.setVisible(show_details and not auto)
 
     def _on_auto_quality_changed(self) -> None:
         if self._updating:
@@ -971,19 +994,25 @@ class SettingsPanel(QWidget):
         mode = self.workflow.currentData()
         advanced = mode == WorkflowMode.ADVANCED
         basic = mode == WorkflowMode.BASIC
-        # Background + Colors stay visible in every mode.
+        auto = mode == WorkflowMode.AUTOMATIC
+        # Automatic: mode + quality + slim background + post-trace result colors.
+        # Basic: guide instead of the detailed Colors group.
+        # Advanced: full color/curve/engine knobs. Output stays in export dialogs.
         self._preprocess_box.setVisible(True)
-        self._colors_box.setVisible(True)
+        self._sync_background_detail_rows()
+        self._colors_box.setVisible(advanced)
+        self._output_box.setVisible(False)
         self._basic_guide.setVisible(basic)
-        self._basic_box.setVisible(mode in {WorkflowMode.BASIC, WorkflowMode.ADVANCED})
+        self._basic_box.setVisible(basic or advanced)
         self._palette_box.setVisible(advanced)
         self._segments_box.setVisible(advanced)
         self._curves_box.setVisible(advanced)
         self._engine_box.setVisible(advanced)
+        self._presets_box.setVisible(basic or advanced)
         self._place_mode_controls(advanced)
-        auto = mode == WorkflowMode.AUTOMATIC
         self.auto_quality.setVisible(auto)
         self._auto_quality_label.setVisible(auto)
+        self._sync_result_palette_visibility()
         self._apply_transparency_advice()
         self._emit_changed()
         if not self._updating and auto:
@@ -1009,6 +1038,8 @@ class SettingsPanel(QWidget):
         self._segments_box.setEnabled(not busy)
         self._curves_box.setEnabled(not busy)
         self._engine_box.setEnabled(not busy)
+        self._result_box.setEnabled(not busy)
+        self._presets_box.setEnabled(not busy)
         if not busy:
             self._on_remove_bg_toggled(self.remove_background.isChecked())
 
@@ -1125,10 +1156,14 @@ class SettingsPanel(QWidget):
         self._emit_changed()
 
     def _sync_optional_color_rows(self) -> None:
-        """Show the custom palette editor and result swatches only when they have a job."""
+        """Show the custom palette editor only when Custom is selected."""
         choice = self.palette_choice.currentData()
         self._trace_editor.setVisible(choice == -2 or bool(self._trace_palette))
-        self._result_palette.setVisible(self.palette_list.count() > 0)
+        self._sync_result_palette_visibility()
+
+    def _sync_result_palette_visibility(self) -> None:
+        """Result recolor is available in every mode after a successful trace."""
+        self._result_box.setVisible(self.palette_list.count() > 0)
 
     def _apply_palette_choice(self) -> None:
         if self._updating:
@@ -1175,6 +1210,24 @@ class SettingsPanel(QWidget):
                 self._set_combo(self.palette_choice, count)
                 return
         self._set_combo(self.palette_choice, -2)
+
+    def apply_output_defaults(self, prefs) -> None:
+        """Apply Preferences export defaults without changing workflow/trace knobs."""
+        self._updating = True
+        try:
+            self._set_combo(self.svg_style, prefs.svg_paint_style)
+            self.gap_filler_width.setValue(prefs.gap_filler_width)
+            self.gap_filler_non_scaling.setChecked(prefs.gap_filler_non_scaling)
+            self.parameterized_shapes.setChecked(prefs.parameterized_shapes)
+            self.palette_tolerance.setValue(prefs.palette_tolerance)
+            self._set_combo(self.dxf_mode, prefs.dxf_curve_mode)
+            self._set_combo(self.dxf_density, prefs.dxf_line_density)
+            self._set_combo(self.eps_level, prefs.eps_compatibility)
+            self.max_side.setValue(prefs.max_side)
+            self._sync_gap_filler_rows()
+            self._sync_dxf_density()
+        finally:
+            self._updating = False
 
     def set_settings(self, settings: TraceSettings) -> None:
         self._updating = True

@@ -87,7 +87,7 @@ def test_main_window_language_switch(qapp: QApplication, tmp_path, monkeypatch) 
     assert window._appearance_actions["system"].text() == "&Systemeinstellung"
     assert window._appearance_actions["light"].text() == "&Heller Modus"
     assert window._appearance_actions["dark"].text() == "&Dunkler Modus"
-    assert window.preview_tabs.tabText(4) == "Segmentierung"
+    assert window.preview_tabs.tabText(3) == "Segmentierung"
     window._set_ui_language(LANG_EN)
     assert window.panel.vectorize_btn.text() == "Vectorize"
     window.close()

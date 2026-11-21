@@ -4,7 +4,15 @@ from __future__ import annotations
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QPainter, QPen, QPixmap
-from PySide6.QtWidgets import QHBoxLayout, QLabel, QSlider, QVBoxLayout, QWidget
+from PySide6.QtWidgets import (
+    QComboBox,
+    QHBoxLayout,
+    QLabel,
+    QSlider,
+    QStackedWidget,
+    QVBoxLayout,
+    QWidget,
+)
 
 from vectorizer.gui.canvas import ImageCanvas
 from vectorizer.gui.i18n import t
@@ -186,3 +194,74 @@ class _WipeLabel(QWidget):
             painter.setPen(pen)
             painter.drawLine(x + clip_w, y, x + clip_w, y + orig.height())
         painter.end()
+
+
+class CompareHost(QWidget):
+    """One Compare tab with a Side-by-side / Wipe mode switch."""
+
+    MODE_SIDE = "side"
+    MODE_WIPE = "wipe"
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.side_by_side = SyncSideBySide()
+        self.split_compare = SplitCompare()
+        self.mode = QComboBox()
+        self.mode.setObjectName("compareMode")
+        self.stack = QStackedWidget()
+        self.stack.addWidget(self.side_by_side)
+        self.stack.addWidget(self.split_compare)
+
+        header = QHBoxLayout()
+        header.setContentsMargins(8, 6, 8, 4)
+        header.setSpacing(8)
+        self._mode_label = QLabel()
+        header.addWidget(self._mode_label)
+        header.addWidget(self.mode, 0)
+        header.addStretch(1)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addLayout(header)
+        layout.addWidget(self.stack, 1)
+
+        self.mode.currentIndexChanged.connect(self._on_mode_changed)
+        self.retranslate_ui()
+        self.set_mode(self.MODE_SIDE)
+
+    def retranslate_ui(self) -> None:
+        self._mode_label.setText(t("Layout"))
+        current = self.mode.currentData() or self.MODE_SIDE
+        self.mode.blockSignals(True)
+        self.mode.clear()
+        self.mode.addItem(t("Side by side"), self.MODE_SIDE)
+        self.mode.addItem(t("Wipe"), self.MODE_WIPE)
+        idx = self.mode.findData(current)
+        self.mode.setCurrentIndex(idx if idx >= 0 else 0)
+        self.mode.blockSignals(False)
+        self.side_by_side.retranslate_ui()
+        self.split_compare.retranslate_ui()
+
+    def set_mode(self, mode: str) -> None:
+        idx = self.mode.findData(mode)
+        if idx >= 0:
+            self.mode.setCurrentIndex(idx)
+        self._apply_mode(mode)
+
+    def current_mode(self) -> str:
+        return str(self.mode.currentData() or self.MODE_SIDE)
+
+    def show_wipe(self) -> None:
+        self.set_mode(self.MODE_WIPE)
+
+    def show_side_by_side(self) -> None:
+        self.set_mode(self.MODE_SIDE)
+
+    def _on_mode_changed(self, *_args) -> None:
+        self._apply_mode(self.current_mode())
+
+    def _apply_mode(self, mode: str) -> None:
+        self.stack.setCurrentWidget(
+            self.split_compare if mode == self.MODE_WIPE else self.side_by_side
+        )

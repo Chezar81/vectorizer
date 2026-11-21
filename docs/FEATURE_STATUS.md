@@ -75,6 +75,10 @@ Inspired by Vector Magic Desktop Edition’s wizard model (not a port of its fit
 | PNG linked scale presets | implemented | Width/height/scale linked; 1× / 2× / 4× / 8× |
 | Advanced panel groups | implemented | Palette / Segments / Curves; engine knobs behind disclosure |
 | Basic guide | implemented | Image type, transparency, quality, color mode with Recommended badges |
+| Slim Automatic sidebar | implemented | Mode + quality + background; Colors/Presets only in Basic/Advanced |
+| Export options outside sidebar | implemented | SVG/DXF/EPS dialogs + Preferences Export tab hold paint/DXF/EPS/max-side |
+| Unified Compare tab | implemented | Side-by-side / Wipe layout switch in one tab |
+| Tabbed Preferences | implemented | General / Export / Batch / Advanced |
 
 ## Honest export gaps
 

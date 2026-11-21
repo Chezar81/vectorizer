@@ -41,10 +41,12 @@ def test_main_window_smoke(qapp: QApplication, fixtures: dict[str, Path]) -> Non
     window.open_path(fixtures["mono_logo.png"])
     qapp.processEvents()
     assert window._loaded is not None
-    assert window.preview_tabs.count() == 5
+    assert window.preview_tabs.count() == 4
     from vectorizer.gui.i18n import t
 
-    assert window.preview_tabs.tabText(3) == t("Compare")
+    assert window.preview_tabs.tabText(2) == t("Compare")
+    assert window.preview_tabs.tabText(3) == t("Segmentation")
+    assert window.compare_host.current_mode() == window.compare_host.MODE_SIDE
     assert window._preview_stack.currentWidget() is window.preview_tabs
     assert window.panel.vectorize_btn.isEnabled()
     assert window.seg_editor.has_map()
@@ -71,7 +73,12 @@ def test_empty_canvas_accepts_file_drop(qapp: QApplication) -> None:
 def test_default_geometry_follows_golden_ratio(qapp: QApplication) -> None:
     from PySide6.QtCore import QSettings
 
-    from vectorizer.gui.main_window import GOLDEN_RATIO
+    from vectorizer.gui.main_window import (
+        GOLDEN_RATIO,
+        MIN_CANVAS_WIDTH,
+        SCREEN_MARGIN,
+        SIDEBAR_WIDTH,
+    )
 
     # Even with a stale saved geometry, startup must use the designed default.
     store = QSettings("Vectorizer", "Vectorizer")
@@ -84,6 +91,13 @@ def test_default_geometry_follows_golden_ratio(qapp: QApplication) -> None:
     assert not window._pending_default_geometry
     ratio = window.width() / max(window.height(), 1)
     assert abs(ratio - GOLDEN_RATIO) < 0.05, (window.width(), window.height(), ratio)
+    # Floors apply fully when the screen is large enough; offscreen (800×800)
+    # may scale down and only needs a usable canvas slot beside the sidebar.
+    screen = window.screen() or qapp.primaryScreen()
+    avail_w = screen.availableGeometry().width() if screen is not None else 0
+    if avail_w >= SIDEBAR_WIDTH + MIN_CANVAS_WIDTH + 2 * SCREEN_MARGIN:
+        assert window.width() >= SIDEBAR_WIDTH + MIN_CANVAS_WIDTH - 40
+    assert window.width() - SIDEBAR_WIDTH >= 200
     window.close()
     assert store.value("ui/geometry") is None
 
@@ -122,8 +136,12 @@ def test_session_undo_after_apply_result(qapp: QApplication, fixtures: dict[str,
 
 
 def test_view_menu_appearance_override(qapp: QApplication, monkeypatch: pytest.MonkeyPatch) -> None:
+    from vectorizer.gui import i18n as i18n_mod
     from vectorizer.gui import theme as theme_mod
+    from vectorizer.gui.i18n import LANG_EN, set_language, t
 
+    monkeypatch.setattr(i18n_mod, "load_language", lambda: set_language(LANG_EN, persist=False))
+    set_language(LANG_EN, persist=False)
     saved: list[str] = []
     monkeypatch.setattr(theme_mod, "appearance_mode", lambda: "system")
     monkeypatch.setattr(theme_mod, "set_appearance_mode", lambda mode: saved.append(mode) or mode)
@@ -131,9 +149,9 @@ def test_view_menu_appearance_override(qapp: QApplication, monkeypatch: pytest.M
 
     window = MainWindow()
     assert window._appearance_actions["system"].isChecked()
-    assert window._appearance_actions["system"].text() == "&System setting"
-    assert window._appearance_actions["light"].text() == "&Light mode"
-    assert window._appearance_actions["dark"].text() == "&Dark mode"
+    assert window._appearance_actions["system"].text() == t("&System setting")
+    assert window._appearance_actions["light"].text() == t("&Light mode")
+    assert window._appearance_actions["dark"].text() == t("&Dark mode")
     assert not window._appearance_actions["light"].isChecked()
 
     window._appearance_actions["dark"].trigger()
