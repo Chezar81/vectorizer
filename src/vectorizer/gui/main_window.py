@@ -119,6 +119,9 @@ SIDEBAR_WIDTH = 420
 GOLDEN_RATIO = (1.0 + 5.0**0.5) / 2.0
 SCREEN_MARGIN = 24
 MIN_CANVAS_WIDTH = 480
+# Slim Automatic content must not shrink the first window below a usable preview.
+# Matches the pre-show resize in __init__ (~1165×720 at golden ratio).
+DEFAULT_MIN_HEIGHT = 720
 _TIMING_ELAPSED_KEY = "timing/last_elapsed_seconds"
 _TIMING_MEGAPIXELS_KEY = "timing/last_megapixels"
 
@@ -708,14 +711,25 @@ class MainWindow(QMainWindow):
         return height + 12
 
     def _apply_default_geometry(self) -> None:
-        """Size to fit the sidebar, keep golden-ratio aspect, clamp to the screen."""
+        """Size for a usable preview + sidebar; keep golden-ratio aspect."""
         screen = self.screen() or QApplication.primaryScreen()
+        chrome = self._chrome_height()
         sidebar_h = self.panel.preferred_content_height()
         # Offscreen / incomplete layout can report tiny hints; use a sane floor.
         if sidebar_h < 240:
             sidebar_h = 560
-        height = sidebar_h + self._chrome_height()
-        width = int(round(height * GOLDEN_RATIO))
+
+        min_width = SIDEBAR_WIDTH + MIN_CANVAS_WIDTH
+        min_height = max(
+            DEFAULT_MIN_HEIGHT,
+            sidebar_h + chrome,
+            int(round(min_width / GOLDEN_RATIO)),
+        )
+        height = min_height
+        width = max(int(round(height * GOLDEN_RATIO)), min_width)
+        # Keep the ratio after the width floor bump.
+        height = max(height, int(round(width / GOLDEN_RATIO)))
+        width = max(width, int(round(height * GOLDEN_RATIO)))
 
         avail = None
         max_w = 10_000
@@ -729,12 +743,17 @@ class MainWindow(QMainWindow):
         width = max(1, int(round(width * scale)))
         height = max(1, int(round(height * scale)))
 
-        # Force the computed size; layout minimums (toolbar / seg bar) would
-        # otherwise refuse a shorter golden-ratio window on constrained screens.
-        self.setFixedSize(width, height)
-        self.setMinimumSize(min(640, width), min(360, height))
-        self.setMaximumSize(16777215, 16777215)
+        # Prefer a usable preview even on constrained screens; shrink canvas only
+        # when the available width cannot hold SIDEBAR + MIN_CANVAS.
         canvas_min = min(MIN_CANVAS_WIDTH, max(200, width - SIDEBAR_WIDTH))
+        floor_w = SIDEBAR_WIDTH + canvas_min
+        floor_h = min(DEFAULT_MIN_HEIGHT, height)
+        self.setMinimumSize(min(floor_w, width), min(floor_h, height))
+        self.setMaximumSize(16777215, 16777215)
+        # Force the computed size past layout minimums that fight a shorter window.
+        self.setFixedSize(width, height)
+        self.setMinimumSize(min(floor_w, width), min(floor_h, height))
+        self.setMaximumSize(16777215, 16777215)
         self.preview_tabs.setMinimumWidth(canvas_min)
         self._preview_stack.setMinimumWidth(canvas_min)
         self.seg_editor.setMinimumWidth(canvas_min)

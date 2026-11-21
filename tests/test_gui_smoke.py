@@ -73,7 +73,12 @@ def test_empty_canvas_accepts_file_drop(qapp: QApplication) -> None:
 def test_default_geometry_follows_golden_ratio(qapp: QApplication) -> None:
     from PySide6.QtCore import QSettings
 
-    from vectorizer.gui.main_window import GOLDEN_RATIO
+    from vectorizer.gui.main_window import (
+        GOLDEN_RATIO,
+        MIN_CANVAS_WIDTH,
+        SCREEN_MARGIN,
+        SIDEBAR_WIDTH,
+    )
 
     # Even with a stale saved geometry, startup must use the designed default.
     store = QSettings("Vectorizer", "Vectorizer")
@@ -86,6 +91,13 @@ def test_default_geometry_follows_golden_ratio(qapp: QApplication) -> None:
     assert not window._pending_default_geometry
     ratio = window.width() / max(window.height(), 1)
     assert abs(ratio - GOLDEN_RATIO) < 0.05, (window.width(), window.height(), ratio)
+    # Floors apply fully when the screen is large enough; offscreen (800×800)
+    # may scale down and only needs a usable canvas slot beside the sidebar.
+    screen = window.screen() or qapp.primaryScreen()
+    avail_w = screen.availableGeometry().width() if screen is not None else 0
+    if avail_w >= SIDEBAR_WIDTH + MIN_CANVAS_WIDTH + 2 * SCREEN_MARGIN:
+        assert window.width() >= SIDEBAR_WIDTH + MIN_CANVAS_WIDTH - 40
+    assert window.width() - SIDEBAR_WIDTH >= 200
     window.close()
     assert store.value("ui/geometry") is None
 
