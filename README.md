@@ -13,7 +13,7 @@ Current milestone: **4** — batch processing, optional EPS, native DXF, user pa
 
 Pre-built installers are on the
 [**GitHub Releases**](https://github.com/Chezar81/vectorizer/releases/latest)
-page (currently [v0.5.0](https://github.com/Chezar81/vectorizer/releases/tag/v0.5.0)):
+page (currently [v0.6.0](https://github.com/Chezar81/vectorizer/releases/tag/v0.6.0)):
 
 | Platform | File | How to install |
 | --- | --- | --- |
