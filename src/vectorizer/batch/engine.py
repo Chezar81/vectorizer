@@ -45,6 +45,9 @@ class BatchJob:
     formats: tuple[ExportFormat, ...] = (ExportFormat.SVG,)
     collision: CollisionPolicy = CollisionPolicy.RENAME
     continue_on_error: bool = True
+    # 0 uses settings.max_side, which itself is 0 for reject-if-oversize.
+    # A positive value shrinks each working copy. The source file is unchanged.
+    max_side: int = 0
 
 
 @dataclass
@@ -56,6 +59,10 @@ class BatchResult:
     path_count: int = 0
     seconds: float = 0.0
     skipped: bool = False
+    original_width: int = 0
+    original_height: int = 0
+    working_width: int = 0
+    working_height: int = 0
 
 
 @dataclass
@@ -107,12 +114,30 @@ class BatchSummary:
         for r in self.results:
             status = "skipped" if r.skipped else ("ok" if r.ok else "failed")
             detail = ", ".join(r.outputs) if r.ok else (r.error or "")
+            if r.working_width and (
+                r.original_width != r.working_width or r.original_height != r.working_height
+            ):
+                detail = (
+                    f"{detail} (working {r.working_width}×{r.working_height} "
+                    f"from {r.original_width}×{r.original_height})"
+                ).strip()
             lines.append(
                 f"| `{Path(r.source).name}` | {status} | {r.path_count} | "
                 f"{r.seconds:.2f} | {detail} |"
             )
         md.write_text("\n".join(lines) + "\n", encoding="utf-8")
         return path
+
+
+def _size_fields(loaded) -> dict[str, int]:
+    original_w = int(loaded.original_width or loaded.image.width)
+    original_h = int(loaded.original_height or loaded.image.height)
+    return {
+        "original_width": original_w,
+        "original_height": original_h,
+        "working_width": int(loaded.image.width),
+        "working_height": int(loaded.image.height),
+    }
 
 
 def collect_inputs(paths: list[Path] | Path) -> list[Path]:
@@ -206,6 +231,7 @@ def run_batch(
             "formats": [f.value for f in job.formats],
             "collision": job.collision.value,
             "continue_on_error": job.continue_on_error,
+            "max_side": int(job.max_side or job.settings.max_side or 0),
             "settings": job.settings.to_json(),
             "input_count": total,
         },
@@ -220,7 +246,8 @@ def run_batch(
 def _process_one(source: Path, job: BatchJob) -> BatchResult:
     t0 = time.time()
     try:
-        loaded = load_image(source)
+        side = int(job.max_side or job.settings.max_side or 0)
+        loaded = load_image(source, max_side=side, shrink=side > 0)
         traced = run_trace_sync(loaded.image, job.settings)
         outputs: list[str] = []
         skipped_all = True
@@ -231,18 +258,24 @@ def _process_one(source: Path, job: BatchJob) -> BatchResult:
                 continue
             skipped_all = False
             if fmt == ExportFormat.SVG:
-                export_svg(traced.document, dest, paint_style=job.settings.svg_paint_style)
+                export_svg(traced.document, dest, settings=job.settings)
             elif fmt == ExportFormat.PDF:
                 export_pdf(traced.document, dest)
             elif fmt == ExportFormat.PNG:
                 export_png_preview(traced.document, dest, background=None)
             elif fmt == ExportFormat.EPS:
-                export_eps(traced.document, dest)
+                export_eps(traced.document, dest, settings=job.settings)
             elif fmt == ExportFormat.DXF:
-                export_dxf(traced.document, dest, curve_mode=job.settings.dxf_curve_mode)
+                export_dxf(
+                    traced.document,
+                    dest,
+                    curve_mode=job.settings.dxf_curve_mode,
+                    line_density=job.settings.dxf_line_density,
+                )
             else:
                 raise ExportError(f"Unsupported format: {fmt}")
             outputs.append(str(dest))
+        size = _size_fields(loaded)
         if skipped_all and not outputs:
             return BatchResult(
                 source=str(source),
@@ -251,6 +284,7 @@ def _process_one(source: Path, job: BatchJob) -> BatchResult:
                 seconds=time.time() - t0,
                 path_count=traced.document.path_count,
                 error="All outputs already existed (collision=skip).",
+                **size,
             )
         return BatchResult(
             source=str(source),
@@ -258,6 +292,7 @@ def _process_one(source: Path, job: BatchJob) -> BatchResult:
             outputs=outputs,
             path_count=traced.document.path_count,
             seconds=time.time() - t0,
+            **size,
         )
     except (ImageLoadError, TraceError, ExportError, VectorizerError, ValueError, OSError) as exc:
         return BatchResult(

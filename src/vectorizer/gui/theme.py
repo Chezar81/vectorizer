@@ -603,6 +603,12 @@ def mint_stylesheet(colors: ThemeColors) -> str:
         background: transparent;
         font-size: 12px;
     }}
+    QLabel#recommendedBadge {{
+        color: {accent};
+        background: transparent;
+        font-size: 11px;
+        font-weight: 600;
+    }}
     QLabel#previewCaption {{
         padding: 6px 8px 2px 8px;
     }}
@@ -610,6 +616,14 @@ def mint_stylesheet(colors: ThemeColors) -> str:
         background: {accent};
         color: {on_accent};
         padding: 8px 14px;
+        font-weight: 600;
+    }}
+    QFrame#troubleStrip {{
+        background: {panel};
+        border-bottom: 1px solid {border};
+    }}
+    QPushButton#troubleButton {{
+        padding: 4px 12px;
         font-weight: 600;
     }}
     QWidget#traceProgressOverlay {{

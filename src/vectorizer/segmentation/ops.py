@@ -251,6 +251,117 @@ def zap_fringes(map_: SegmentationMap, *, max_pixels: int = 48) -> SegmentationM
     return _finalize_edit(map_, result)
 
 
+def zap_component(map_: SegmentationMap, x: int, y: int) -> SegmentationMap:
+    """Dissolve the clicked segment into the colors that touch it.
+
+    The component is split: boundary pixels take the neighboring segment color
+    that already surrounds them, then that choice floods inward. Unlike
+    ``zap_fringes``, the click picks the component and size is not limited.
+    A transparent click, or a component with no neighboring color, is unchanged.
+    """
+    width, height = map_.size
+    if not (0 <= x < width and 0 <= y < height):
+        raise SegmentationError("Zap seed is outside the image.")
+
+    result = map_.copy()
+    arr = np.asarray(result.image, dtype=np.uint8).copy()
+    packed = arr.view(np.uint32).reshape(height, width)
+    flat = packed.ravel()
+    alpha = np.ascontiguousarray(arr[..., 3]).ravel()
+    seed = y * width + x
+    if int(alpha[seed]) == 0:
+        return result
+    color = int(flat[seed])
+
+    comp = np.zeros(width * height, dtype=bool)
+    stack = [seed]
+    comp[seed] = True
+    component: list[int] = [seed]
+    while stack:
+        ci = stack.pop()
+        cx = ci % width
+        cy = ci // width
+        for nx, ny in ((cx - 1, cy), (cx + 1, cy), (cx, cy - 1), (cx, cy + 1)):
+            if not (0 <= nx < width and 0 <= ny < height):
+                continue
+            ni = ny * width + nx
+            if comp[ni] or int(flat[ni]) != color:
+                continue
+            comp[ni] = True
+            stack.append(ni)
+            component.append(ni)
+
+    def majority(counts: dict[int, int]) -> int:
+        return max(counts.items(), key=lambda item: (item[1], -item[0]))[0]
+
+    assigned = np.zeros(width * height, dtype=np.uint32)
+    has = np.zeros(width * height, dtype=bool)
+    for ci in component:
+        cx = ci % width
+        cy = ci // width
+        counts: dict[int, int] = {}
+        y0 = cy - 1 if cy > 0 else 0
+        y1 = cy + 2 if cy + 1 < height else height
+        x0 = cx - 1 if cx > 0 else 0
+        x1 = cx + 2 if cx + 1 < width else width
+        for ny in range(y0, y1):
+            row = ny * width
+            for nx in range(x0, x1):
+                if nx == cx and ny == cy:
+                    continue
+                ni = row + nx
+                if comp[ni] or int(alpha[ni]) == 0:
+                    continue
+                ncol = int(flat[ni])
+                if ncol == color:
+                    continue
+                counts[ncol] = counts.get(ncol, 0) + 1
+        if counts:
+            assigned[ci] = np.uint32(majority(counts))
+            has[ci] = True
+
+    if not bool(has.any()):
+        return result
+
+    queue: deque[int] = deque(int(i) for i in np.flatnonzero(has))
+    while queue:
+        ci = queue.popleft()
+        cx = ci % width
+        cy = ci // width
+        for nx, ny in ((cx - 1, cy), (cx + 1, cy), (cx, cy - 1), (cx, cy + 1)):
+            if not (0 <= nx < width and 0 <= ny < height):
+                continue
+            ni = ny * width + nx
+            if not comp[ni] or has[ni]:
+                continue
+            counts = {}
+            for mx, my in ((nx - 1, ny), (nx + 1, ny), (nx, ny - 1), (nx, ny + 1)):
+                if not (0 <= mx < width and 0 <= my < height):
+                    continue
+                mi = my * width + mx
+                if has[mi]:
+                    ncol = int(assigned[mi])
+                    counts[ncol] = counts.get(ncol, 0) + 1
+            if not counts:
+                continue
+            assigned[ni] = np.uint32(majority(counts))
+            has[ni] = True
+            queue.append(ni)
+
+    changed = False
+    for ci in component:
+        if not has[ci]:
+            continue
+        new = int(assigned[ci])
+        if int(flat[ci]) != new:
+            flat[ci] = new
+            changed = True
+    if not changed:
+        return result
+    result.image = Image.fromarray(arr, mode="RGBA")
+    return _finalize_edit(map_, result)
+
+
 def find_problems(map_: SegmentationMap) -> list[tuple[int, int, str]]:
     """Mark one-pixel pinches and one-pixel gaps between the same color."""
     arr = np.asarray(map_.image, dtype=np.uint8)

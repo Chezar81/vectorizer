@@ -20,16 +20,20 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QSpinBox,
     QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
 from vectorizer.domain.settings import (
+    AaArtifactRejection,
     AutomaticQuality,
     ColorMode,
     DxfCurveMode,
+    DxfLineDensity,
     EdgeTreatment,
+    EpsCompatibility,
     HierarchyMode,
     PathFitMode,
     SvgPaintStyle,
@@ -64,6 +68,44 @@ def _add_slider_row(form: QFormLayout, title_key: str, widget: QWidget) -> QLabe
     return label
 
 
+def guide_color_choice(
+    *,
+    colormode: ColorMode,
+    palette: tuple[str, ...] | list[str] = (),
+    target_colors: int = 0,
+    palette_choice: int | None = None,
+) -> str:
+    """Map palette / binary controls onto the basic guide's three choices.
+
+    ``two`` is black-and-white, a 2-color palette, or a target count of 2.
+    ``custom`` is any other locked palette or target count. ``unlimited`` leaves
+    color count to the tracer.
+    """
+    colors = tuple(palette)
+    if colormode == ColorMode.BINARY or len(colors) == 2 or int(target_colors) == 2:
+        return "two"
+    if palette_choice == -2 or colors or int(target_colors) > 0:
+        return "custom"
+    return "unlimited"
+
+
+def _recommended_badge() -> QLabel:
+    badge = QLabel()
+    badge.setObjectName("recommendedBadge")
+    badge.setVisible(False)
+    return badge
+
+
+def _guide_value_row(control: QWidget, badge: QLabel) -> QWidget:
+    row = QWidget()
+    layout = QHBoxLayout(row)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(6)
+    layout.addWidget(control, 1)
+    layout.addWidget(badge)
+    return row
+
+
 class SettingsPanel(QWidget):
     vectorize_requested = Signal()
     cancel_requested = Signal()
@@ -82,6 +124,11 @@ class SettingsPanel(QWidget):
         self._trace_palette: list[str] = []
         self._palette_suggestions: dict[int, tuple[str, ...]] = {}
         self._notes_en = ""
+        self._transparency_advice_en = ""
+        self._transparency_recommendation = ""
+        self._guide_suggested: TraceSettings | None = None
+        self._cluster_in_palette = False
+        self._noise_in_engine = False
 
         self.workflow = QComboBox()
         self.auto_quality = QComboBox()
@@ -97,6 +144,11 @@ class SettingsPanel(QWidget):
         self.max_iterations = IntSliderSpin(1, 64)
         self.splice_threshold = IntSliderSpin(0, 180)
         self.path_precision = IntSliderSpin(0, 12)
+        self.contour_smoothness = IntSliderSpin(0, 100)
+        self.contour_smoothness.setValue(50)
+        self.node_budget = IntSliderSpin(0, 100)
+        self.node_budget.setValue(50)
+        self.aa_artifact_rejection = QComboBox()
 
         # --- Always-visible background controls ---
         self.preserve_transparency = QCheckBox()
@@ -117,7 +169,21 @@ class SettingsPanel(QWidget):
         self.trace_add_btn = QPushButton()
         self.trace_remove_btn = QPushButton()
         self.svg_style = QComboBox()
+        self.gap_filler_width = DoubleSliderSpin(0.0, 5.0, step=0.1, decimals=2)
+        self.gap_filler_width.setValue(2.0)
+        self.gap_filler_non_scaling = QCheckBox()
+        self.gap_filler_non_scaling.setChecked(True)
+        self.parameterized_shapes = QCheckBox()
+        self.parameterized_shapes.setChecked(True)
+        self.palette_tolerance = IntSliderSpin(0, 255)
+        self.palette_tolerance.setValue(255)
+        self.cluster_similar = QCheckBox()
         self.dxf_mode = QComboBox()
+        self.dxf_density = QComboBox()
+        self.eps_level = QComboBox()
+        self.max_side = QSpinBox()
+        self.max_side.setRange(0, 16384)
+        self.max_side.setValue(0)
 
         self.palette_list = QListWidget()
         self.palette_list.setObjectName("paletteList")
@@ -150,6 +216,11 @@ class SettingsPanel(QWidget):
         bg_form = QFormLayout(background)
         bg_form.addRow(self.preserve_transparency)
         bg_form.addRow(self.remove_background)
+        self._transparency_hint = QLabel()
+        self._transparency_hint.setWordWrap(True)
+        self._transparency_hint.setObjectName("inlineHint")
+        self._transparency_hint.setVisible(False)
+        bg_form.addRow(self._transparency_hint)
         bg_color_row = QHBoxLayout()
         bg_color_row.addWidget(self.bg_color_btn, 1)
         bg_color_row.addWidget(self.bg_pick_btn)
@@ -165,12 +236,15 @@ class SettingsPanel(QWidget):
         # Colors group — always visible
         colors = QGroupBox()
         colors_form = QFormLayout(colors)
+        self._colors_form = colors_form
         self._image_type_label = QLabel()
         colors_form.addRow(self._image_type_label, self.colormode)
         self._target_colors_label = _add_slider_row(
             colors_form, "Target color count", self.target_colors
         )
         colors_form.addRow(self.smooth_noise)
+        self._cluster_row = colors_form.rowCount()
+        colors_form.addRow(self.cluster_similar)
         self._edge_label = QLabel()
         colors_form.addRow(self._edge_label, self.edge_treatment)
         self._palette_choice_label = QLabel()
@@ -204,31 +278,124 @@ class SettingsPanel(QWidget):
         output_form = QFormLayout(output)
         self._svg_style_label = QLabel()
         output_form.addRow(self._svg_style_label, self.svg_style)
+        self._gap_width_label = _add_slider_row(
+            output_form, "Gap / edge stroke width", self.gap_filler_width
+        )
+        output_form.addRow(self.gap_filler_non_scaling)
+        output_form.addRow(self.parameterized_shapes)
+        self._palette_tol_label = _add_slider_row(
+            output_form, "Palette snap tolerance", self.palette_tolerance
+        )
         self._dxf_mode_label = QLabel()
         output_form.addRow(self._dxf_mode_label, self.dxf_mode)
+        self._dxf_density_label = QLabel()
+        output_form.addRow(self._dxf_density_label, self.dxf_density)
+        self._eps_level_label = QLabel()
+        output_form.addRow(self._eps_level_label, self.eps_level)
+        self._max_side_label = QLabel()
+        output_form.addRow(self._max_side_label, self.max_side)
         self._output_box = output
+
+        self._basic_guide = QGroupBox()
+        guide_form = QFormLayout(self._basic_guide)
+        self.basic_image_type = QComboBox()
+        self.basic_quality = QComboBox()
+        self.basic_color = QComboBox()
+        self._basic_image_label = QLabel()
+        self._basic_quality_label = QLabel()
+        self._basic_color_label = QLabel()
+        self._basic_transparency_label = QLabel()
+        self._basic_edge_badge = _recommended_badge()
+        self._basic_quality_badge = _recommended_badge()
+        self._basic_color_badge = _recommended_badge()
+        self._basic_transparency_badge = _recommended_badge()
+        self._basic_transparency = QLabel()
+        self._basic_transparency.setWordWrap(True)
+        self._basic_transparency.setObjectName("inlineHint")
+        guide_form.addRow(
+            self._basic_image_label,
+            _guide_value_row(self.basic_image_type, self._basic_edge_badge),
+        )
+        guide_form.addRow(
+            self._basic_quality_label,
+            _guide_value_row(self.basic_quality, self._basic_quality_badge),
+        )
+        guide_form.addRow(
+            self._basic_color_label,
+            _guide_value_row(self.basic_color, self._basic_color_badge),
+        )
+        transparency_row = QWidget()
+        transparency_col = QVBoxLayout(transparency_row)
+        transparency_col.setContentsMargins(0, 0, 0, 0)
+        transparency_col.setSpacing(2)
+        transparency_col.addWidget(self._basic_transparency_badge)
+        transparency_col.addWidget(self._basic_transparency)
+        guide_form.addRow(self._basic_transparency_label, transparency_row)
 
         basic = QGroupBox()
         basic_form = QFormLayout(basic)
+        self._basic_form = basic_form
         self._path_fitting_label = QLabel()
         basic_form.addRow(self._path_fitting_label, self.path_mode)
+        self._noise_row = basic_form.rowCount()
         self._noise_label = _add_slider_row(basic_form, "Noise removal (px)", self.filter_speckle)
+        self._noise_wrap = self._noise_label.parentWidget()
         self._layering_label = QLabel()
         basic_form.addRow(self._layering_label, self.hierarchy)
         self._basic_box = basic
 
-        advanced = QGroupBox()
-        adv_form = QFormLayout(advanced)
-        self._color_precision_label = _add_slider_row(
-            adv_form, "Color precision (bits)", self.color_precision
+        self._palette_box = QGroupBox()
+        self._palette_form = QFormLayout(self._palette_box)
+
+        self._segments_box = QGroupBox()
+        seg_form = QFormLayout(self._segments_box)
+        self._aa_rejection_label = QLabel()
+        seg_form.addRow(self._aa_rejection_label, self.aa_artifact_rejection)
+
+        self._curves_box = QGroupBox()
+        curves_form = QFormLayout(self._curves_box)
+        self._smoothness_label = _add_slider_row(
+            curves_form, "Contour smoothness", self.contour_smoothness
         )
-        self._layer_diff_label = _add_slider_row(adv_form, "Layer difference", self.layer_difference)
-        self._corner_label = _add_slider_row(adv_form, "Corner threshold (°)", self.corner_threshold)
-        self._length_label = _add_slider_row(adv_form, "Length threshold (px)", self.length_threshold)
-        self._max_iter_label = _add_slider_row(adv_form, "Max iterations", self.max_iterations)
-        self._splice_label = _add_slider_row(adv_form, "Splice threshold (°)", self.splice_threshold)
-        self._path_precision_label = _add_slider_row(adv_form, "Path precision", self.path_precision)
-        self._advanced_box = advanced
+        self._node_budget_label = _add_slider_row(curves_form, "Node budget", self.node_budget)
+
+        self._engine_box = QGroupBox()
+        engine_outer = QVBoxLayout(self._engine_box)
+        engine_outer.setContentsMargins(0, 0, 0, 0)
+        engine_outer.setSpacing(6)
+        self._engine_toggle = QToolButton()
+        self._engine_toggle.setCheckable(True)
+        self._engine_toggle.setChecked(False)
+        self._engine_toggle.setAutoRaise(True)
+        self._engine_toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self._engine_toggle.setArrowType(Qt.ArrowType.RightArrow)
+        self._engine_body = QWidget()
+        self._engine_form = QFormLayout(self._engine_body)
+        self._engine_body.setVisible(False)
+        self._color_precision_label = _add_slider_row(
+            self._engine_form, "Color precision (bits)", self.color_precision
+        )
+        self._layer_diff_label = _add_slider_row(
+            self._engine_form, "Layer difference", self.layer_difference
+        )
+        self._corner_label = _add_slider_row(
+            self._engine_form, "Corner threshold (°)", self.corner_threshold
+        )
+        self._length_label = _add_slider_row(
+            self._engine_form, "Length threshold (px)", self.length_threshold
+        )
+        self._max_iter_label = _add_slider_row(
+            self._engine_form, "Max iterations", self.max_iterations
+        )
+        self._splice_label = _add_slider_row(
+            self._engine_form, "Splice threshold (°)", self.splice_threshold
+        )
+        self._path_precision_label = _add_slider_row(
+            self._engine_form, "Path precision", self.path_precision
+        )
+        engine_outer.addWidget(self._engine_toggle)
+        engine_outer.addWidget(self._engine_body)
+        self._engine_toggle.toggled.connect(self._on_engine_toggled)
 
         self._preset_menu = QMenu(self)
         self._preset_dup_act = self._preset_menu.addAction("")
@@ -265,8 +432,12 @@ class SettingsPanel(QWidget):
         layout.addWidget(background)
         layout.addWidget(colors)
         layout.addWidget(output)
+        layout.addWidget(self._basic_guide)
         layout.addWidget(basic)
-        layout.addWidget(advanced)
+        layout.addWidget(self._palette_box)
+        layout.addWidget(self._segments_box)
+        layout.addWidget(self._curves_box)
+        layout.addWidget(self._engine_box)
         layout.addWidget(presets)
         layout.addStretch(1)
         self.retranslate_ui()
@@ -309,25 +480,41 @@ class SettingsPanel(QWidget):
             self.max_iterations,
             self.splice_threshold,
             self.path_precision,
+            self.contour_smoothness,
+            self.node_budget,
+            self.aa_artifact_rejection,
             self.bg_tolerance,
             self.target_colors,
             self.edge_treatment,
             self.palette_choice,
             self.svg_style,
+            self.gap_filler_width,
+            self.palette_tolerance,
             self.dxf_mode,
+            self.dxf_density,
+            self.eps_level,
+            self.max_side,
         ):
             if hasattr(widget, "valueChanged"):
                 widget.valueChanged.connect(self._emit_changed)
             else:
                 widget.currentIndexChanged.connect(self._emit_changed)
         self.preserve_transparency.toggled.connect(self._emit_changed)
+        self.gap_filler_non_scaling.toggled.connect(self._emit_changed)
+        self.parameterized_shapes.toggled.connect(self._emit_changed)
+        self.svg_style.currentIndexChanged.connect(self._sync_gap_filler_rows)
         self.smooth_noise.toggled.connect(self._emit_changed)
+        self.cluster_similar.toggled.connect(self._emit_changed)
+        self.dxf_mode.currentIndexChanged.connect(self._sync_dxf_density)
         self.remove_background.toggled.connect(self._on_remove_bg_toggled)
         self.bg_color_btn.clicked.connect(self._pick_bg_color)
         self.bg_pick_btn.clicked.connect(self.pick_background_requested.emit)
         self.trace_add_btn.clicked.connect(self.pick_trace_color_requested.emit)
         self.trace_remove_btn.clicked.connect(self._remove_trace_color)
         self.palette_choice.currentIndexChanged.connect(self._apply_palette_choice)
+        self.basic_image_type.activated.connect(self._on_basic_image_type)
+        self.basic_quality.activated.connect(self._on_basic_quality)
+        self.basic_color.activated.connect(self._on_basic_color)
         self.vectorize_btn.clicked.connect(self.vectorize_requested.emit)
         self.cancel_btn.clicked.connect(self.cancel_requested.emit)
         self.recolor_btn.clicked.connect(self._recolor_selected)
@@ -381,8 +568,45 @@ class SettingsPanel(QWidget):
             )
             self.auto_quality.setToolTip(
                 t(
-                    "Fast: quicker, fewer paths. Balanced: default. "
-                    "High detail: finer colors and more path detail."
+                    "For artwork, Fast absorbs a wider blend, Balanced is about 2 px, "
+                    "and High detail is about 1 px. For photographs, the same levels "
+                    "change how many shapes are kept."
+                )
+            )
+            self._refill_combo(
+                self.basic_image_type,
+                (
+                    ("Artwork without blending", EdgeTreatment.HARD),
+                    ("Artwork with blending", EdgeTreatment.BLENDED),
+                    ("Photograph", EdgeTreatment.PHOTO),
+                ),
+            )
+            self.basic_image_type.setToolTip(
+                t(
+                    "Choose hard edges, blended artwork, or a photograph. This sets Edges."
+                )
+            )
+            self._refill_combo(
+                self.basic_quality,
+                (
+                    ("Fast", AutomaticQuality.FAST),
+                    ("Balanced", AutomaticQuality.BALANCED),
+                    ("High detail", AutomaticQuality.HIGH),
+                ),
+            )
+            self.basic_quality.setToolTip(self.auto_quality.toolTip())
+            self._refill_combo(
+                self.basic_color,
+                (
+                    ("Unlimited", "unlimited"),
+                    ("2 colors", "two"),
+                    ("Custom", "custom"),
+                ),
+            )
+            self.basic_color.setToolTip(
+                t(
+                    "Unlimited keeps the image colors. 2 colors uses a two-color palette, "
+                    "or black and white when no palette is suggested. Custom edits the trace palette."
                 )
             )
             self._refill_combo(
@@ -439,25 +663,88 @@ class SettingsPanel(QWidget):
                 (
                     ("Fill only", SvgPaintStyle.FILL),
                     ("Stroke and fill", SvgPaintStyle.STROKE_FILL),
+                    ("Gap filler", SvgPaintStyle.GAP_FILLER),
+                    ("Stroke edges", SvgPaintStyle.STROKE_EDGES),
                 ),
             )
             self.svg_style.setToolTip(
                 t(
-                    "Fill only is the simpler file. Stroke and fill paints a hairline of the "
-                    "same color so viewers do not show thin gaps between shapes."
+                    "Fill only is the simpler file. Stroke and fill paints a same-color hairline. "
+                    "Gap filler puts average-color strokes under shared edges. "
+                    "Stroke edges exports cutting paths only."
+                )
+            )
+            self.gap_filler_non_scaling.setText(t("Non-scaling gap / edge strokes"))
+            self.gap_filler_non_scaling.setToolTip(
+                t("Keep stroke width constant when zooming (SVG vector-effect).")
+            )
+            self.parameterized_shapes.setText(t("Detect circles and rectangles"))
+            self.parameterized_shapes.setToolTip(
+                t(
+                    "When a contour fits a circle or axis-aligned rectangle, emit native "
+                    "SVG shapes instead of generic path curves."
+                )
+            )
+            self.palette_tolerance.setToolTip(
+                t(
+                    "How close a color must be to snap onto the trace palette (0 = exact, "
+                    "255 = always snap). Remaps still apply afterward."
                 )
             )
             self._refill_combo(
                 self.dxf_mode,
                 (
                     ("DXF lines", DxfCurveMode.LINES),
+                    ("DXF lines and arcs", DxfCurveMode.LINES_AND_ARCS),
                     ("DXF splines", DxfCurveMode.SPLINES),
                 ),
             )
             self.dxf_mode.setToolTip(
                 t(
-                    "Lines samples curves into polylines. Splines keep cubic curves. "
-                    "Neither mode writes fills."
+                    "Lines samples curves into polylines. Lines and arcs keep circular arcs. "
+                    "Splines keep cubic curves. None of these modes write fills."
+                )
+            )
+            self._refill_combo(
+                self.dxf_density,
+                (
+                    ("Few (~4)", DxfLineDensity.FEW),
+                    ("Normal (~8)", DxfLineDensity.NORMAL),
+                    ("Many (~16)", DxfLineDensity.MANY),
+                ),
+            )
+            self.dxf_density.setToolTip(
+                t(
+                    "How many samples LINES mode uses per curve. Few is about 4, normal is 8, "
+                    "many is about 16. Lines-and-arcs and splines keep their own geometry."
+                )
+            )
+            self._refill_combo(
+                self.eps_level,
+                (
+                    ("Maximize compatibility", EpsCompatibility.COMPATIBLE),
+                    ("Minimize file size", EpsCompatibility.COMPACT),
+                ),
+            )
+            self.eps_level.setToolTip(
+                t(
+                    "Maximize compatibility writes PostScript Level 2. "
+                    "Minimize file size writes Level 3."
+                )
+            )
+            self.max_side.setSpecialValueText(t("Prompt"))
+            self.max_side.setToolTip(
+                t(
+                    "0 asks before shrinking an image over the working limit. A positive value "
+                    "shrinks the working copy so the long side is at most this many pixels. "
+                    "The original file is not modified."
+                )
+            )
+            self.cluster_similar.setText(t("Cluster similar colors"))
+            self.cluster_similar.setToolTip(
+                t(
+                    "After an unlimited-palette trace, merge fills closer than a medium OKLab step. "
+                    "Off by default so automatic free-color keeps its own steps."
                 )
             )
 
@@ -465,8 +752,8 @@ class SettingsPanel(QWidget):
             self.remove_background.setText(t("Remove background"))
             self.remove_background.setToolTip(
                 t(
-                    "Make pixels near the selected background color transparent before tracing "
-                    "(similar to a background knockout)."
+                    "Knock out pixels close to the background color and treat them as empty. "
+                    "This is separate from flattening existing alpha."
                 )
             )
             self.bg_tolerance.setToolTip(
@@ -526,14 +813,51 @@ class SettingsPanel(QWidget):
             )
             self.trace_remove_btn.setText(t("Remove color"))
             self._svg_style_label.setText(t("SVG paint"))
+            self._gap_width_label.setText(t("Gap / edge stroke width"))
+            self._palette_tol_label.setText(t("Palette snap tolerance"))
             self._dxf_mode_label.setText(t("DXF curves"))
+            self._dxf_density_label.setText(t("DXF line density"))
+            self._eps_level_label.setText(t("EPS compatibility"))
+            self._max_side_label.setText(t("Max working side"))
+            self._sync_gap_filler_rows()
+            self._sync_dxf_density()
             self._target_colors_label.setText(t("Target color count"))
             self._palette_caption.setText(t("Result palette (after vectorize):"))
+            self._basic_guide.setTitle(t("Basic guide"))
+            self._basic_image_label.setText(t("Image type"))
+            self._basic_quality_label.setText(t("Quality"))
+            self._basic_color_label.setText(t("Color mode"))
+            self._basic_transparency_label.setText(t("Transparency"))
+            for badge in (
+                self._basic_edge_badge,
+                self._basic_quality_badge,
+                self._basic_color_badge,
+                self._basic_transparency_badge,
+            ):
+                badge.setText(t("Recommended"))
             self._basic_box.setTitle(t("Tracing (Basic)"))
             self._path_fitting_label.setText(t("Path fitting"))
             self._noise_label.setText(t("Noise removal (px)"))
             self._layering_label.setText(t("Layering"))
-            self._advanced_box.setTitle(t("Advanced (VTracer)"))
+            self._palette_box.setTitle(t("Palette"))
+            self._palette_box.setToolTip(
+                t("Merge near-duplicate fills after an unlimited-color trace.")
+            )
+            self._segments_box.setTitle(t("Segments"))
+            self._segments_box.setToolTip(
+                t("How regions drop anti-aliased fringe before curves are fit.")
+            )
+            self._curves_box.setTitle(t("Curves"))
+            self._curves_box.setToolTip(
+                t("How tightly fitted contours follow the segmentation.")
+            )
+            self._engine_box.setTitle(t("Engine parameters"))
+            self._engine_toggle.setToolTip(
+                t(
+                    "Low-level tracer knobs. Values still apply while this section is collapsed."
+                )
+            )
+            self._sync_engine_toggle_text()
             self._color_precision_label.setText(t("Color precision (bits)"))
             self._layer_diff_label.setText(t("Layer difference"))
             self._corner_label.setText(t("Corner threshold (°)"))
@@ -541,6 +865,9 @@ class SettingsPanel(QWidget):
             self._max_iter_label.setText(t("Max iterations"))
             self._splice_label.setText(t("Splice threshold (°)"))
             self._path_precision_label.setText(t("Path precision"))
+            self._smoothness_label.setText(t("Contour smoothness"))
+            self._node_budget_label.setText(t("Node budget"))
+            self._aa_rejection_label.setText(t("AA artifact rejection"))
             self._presets_box.setTitle(t("Presets"))
             self._mode_label.setText(t("Mode"))
             self._auto_quality_label.setText(t("Quality"))
@@ -571,10 +898,42 @@ class SettingsPanel(QWidget):
             )
             self.preserve_transparency.setToolTip(
                 t(
-                    "Keep existing alpha. If unchecked, alpha is composited onto the background color."
+                    "Keep the image alpha, including a real soft mask. Uncheck to flatten: "
+                    "composite the artwork onto the background color. This does not knock "
+                    "out a solid backdrop."
+                )
+            )
+            self._refill_combo(
+                self.aa_artifact_rejection,
+                (
+                    ("None", AaArtifactRejection.NONE),
+                    ("Moderate", AaArtifactRejection.MODERATE),
+                    ("Aggressive", AaArtifactRejection.AGGRESSIVE),
+                ),
+            )
+            self.aa_artifact_rejection.setToolTip(
+                t(
+                    "Drop anti-aliased fringe slivers that are not real features. "
+                    "Moderate is the default. Aggressive absorbs a wider fringe. "
+                    "This is not a minimum-pixel filter."
+                )
+            )
+            self.contour_smoothness.setToolTip(
+                t(
+                    "How closely curves follow the pixels. Lower keeps wiggles; higher "
+                    "flattens them. Scales blend fitting and the VTracer length threshold. "
+                    "Path precision stays the number of decimal places."
+                )
+            )
+            self.node_budget.setToolTip(
+                t(
+                    "How many points to keep on fitted contours. Higher keeps more nodes; "
+                    "lower simplifies with a Douglas–Peucker pass. Separate from contour smoothness."
                 )
             )
             self._apply_notes_text()
+            self._apply_transparency_advice()
+            self._sync_basic_guide_from_controls()
             self._update_bg_button()
         finally:
             self._updating = False
@@ -590,8 +949,10 @@ class SettingsPanel(QWidget):
         combo.blockSignals(False)
 
     def _emit_changed(self, *_args) -> None:
-        if not self._updating:
-            self.settings_changed.emit()
+        if self._updating:
+            return
+        self._sync_basic_guide_from_controls()
+        self.settings_changed.emit()
 
     def _on_remove_bg_toggled(self, checked: bool) -> None:
         self.bg_tolerance.setEnabled(checked)
@@ -608,14 +969,22 @@ class SettingsPanel(QWidget):
 
     def _on_workflow_changed(self) -> None:
         mode = self.workflow.currentData()
+        advanced = mode == WorkflowMode.ADVANCED
+        basic = mode == WorkflowMode.BASIC
         # Background + Colors stay visible in every mode.
         self._preprocess_box.setVisible(True)
         self._colors_box.setVisible(True)
+        self._basic_guide.setVisible(basic)
         self._basic_box.setVisible(mode in {WorkflowMode.BASIC, WorkflowMode.ADVANCED})
-        self._advanced_box.setVisible(mode == WorkflowMode.ADVANCED)
+        self._palette_box.setVisible(advanced)
+        self._segments_box.setVisible(advanced)
+        self._curves_box.setVisible(advanced)
+        self._engine_box.setVisible(advanced)
+        self._place_mode_controls(advanced)
         auto = mode == WorkflowMode.AUTOMATIC
         self.auto_quality.setVisible(auto)
         self._auto_quality_label.setVisible(auto)
+        self._apply_transparency_advice()
         self._emit_changed()
         if not self._updating and auto:
             self.automatic_quality_changed.emit()
@@ -633,11 +1002,46 @@ class SettingsPanel(QWidget):
         self.workflow.setEnabled(not busy)
         self.auto_quality.setEnabled(not busy)
         self._basic_box.setEnabled(not busy)
+        self._basic_guide.setEnabled(not busy)
         self._preprocess_box.setEnabled(not busy)
         self._colors_box.setEnabled(not busy)
-        self._advanced_box.setEnabled(not busy)
+        self._palette_box.setEnabled(not busy)
+        self._segments_box.setEnabled(not busy)
+        self._curves_box.setEnabled(not busy)
+        self._engine_box.setEnabled(not busy)
         if not busy:
             self._on_remove_bg_toggled(self.remove_background.isChecked())
+
+    def set_transparency_advice(self, note: str) -> None:
+        """Show the analyzer's flatten / leave-transparent recommendation."""
+        self._transparency_advice_en = (note or "").strip()
+        self._apply_transparency_advice()
+        self._refresh_basic_badges()
+
+    def set_analysis_hints(
+        self,
+        suggested: TraceSettings | None,
+        *,
+        transparency_note: str = "",
+        transparency_recommendation: str = "",
+    ) -> None:
+        """Remember the last analysis so the Basic guide can mark differences."""
+        self._guide_suggested = suggested
+        self._transparency_recommendation = transparency_recommendation or ""
+        self.set_transparency_advice(transparency_note)
+
+    def _apply_transparency_advice(self) -> None:
+        note = self._transparency_advice_en
+        text = t(note) if note else ""
+        guide = self.workflow.currentData() == WorkflowMode.BASIC
+        if text:
+            self._transparency_hint.setText(text)
+            self._basic_transparency.setText(text)
+        else:
+            self._transparency_hint.clear()
+            self._basic_transparency.setText(t("No transparency recommendation yet."))
+        self._transparency_hint.setVisible(bool(text) and not guide)
+        self._basic_transparency.setVisible(True)
 
     def set_notes(self, text: str) -> None:
         """Store English note lines and show them in the active language."""
@@ -788,6 +1192,9 @@ class SettingsPanel(QWidget):
             self.max_iterations.setValue(settings.max_iterations)
             self.splice_threshold.setValue(settings.splice_threshold)
             self.path_precision.setValue(settings.path_precision)
+            self.contour_smoothness.setValue(settings.contour_smoothness)
+            self.node_budget.setValue(settings.node_budget)
+            self._set_combo(self.aa_artifact_rejection, settings.aa_artifact_rejection)
             self.preserve_transparency.setChecked(settings.preserve_transparency)
             self.remove_background.setChecked(settings.remove_background)
             self.bg_tolerance.setValue(settings.background_tolerance)
@@ -798,7 +1205,15 @@ class SettingsPanel(QWidget):
             self.smooth_noise.setChecked(settings.smooth_noise)
             self._set_combo(self.edge_treatment, settings.edge_treatment)
             self._set_combo(self.svg_style, settings.svg_paint_style)
+            self.gap_filler_width.setValue(settings.gap_filler_width)
+            self.gap_filler_non_scaling.setChecked(settings.gap_filler_non_scaling)
+            self.parameterized_shapes.setChecked(settings.parameterized_shapes)
+            self.palette_tolerance.setValue(settings.palette_tolerance)
             self._set_combo(self.dxf_mode, settings.dxf_curve_mode)
+            self._set_combo(self.dxf_density, settings.dxf_line_density)
+            self._set_combo(self.eps_level, settings.eps_compatibility)
+            self.cluster_similar.setChecked(settings.cluster_similar_colors)
+            self.max_side.setValue(settings.max_side)
             self._trace_palette = list(settings.palette)
             self._refresh_trace_palette()
             self._select_palette_choice(settings.palette)
@@ -806,6 +1221,9 @@ class SettingsPanel(QWidget):
             self._on_workflow_changed()
             self._on_remove_bg_toggled(settings.remove_background)
             self._sync_optional_color_rows()
+            self._sync_gap_filler_rows()
+            self._sync_dxf_density()
+            self._sync_basic_guide_from_controls()
         finally:
             self._updating = False
 
@@ -824,6 +1242,11 @@ class SettingsPanel(QWidget):
             max_iterations=self.max_iterations.value(),
             splice_threshold=self.splice_threshold.value(),
             path_precision=self.path_precision.value(),
+            contour_smoothness=self.contour_smoothness.value(),
+            node_budget=self.node_budget.value(),
+            aa_artifact_rejection=(
+                self.aa_artifact_rejection.currentData() or AaArtifactRejection.MODERATE
+            ),
             preserve_transparency=self.preserve_transparency.isChecked(),
             remove_background=self.remove_background.isChecked(),
             background_r=self._bg_color.red(),
@@ -834,9 +1257,268 @@ class SettingsPanel(QWidget):
             smooth_noise=self.smooth_noise.isChecked(),
             edge_treatment=self.edge_treatment.currentData() or EdgeTreatment.AUTO,
             palette=tuple(self._trace_palette),
+            palette_tolerance=self.palette_tolerance.value(),
             svg_paint_style=self.svg_style.currentData() or SvgPaintStyle.FILL,
+            gap_filler_width=float(self.gap_filler_width.value()),
+            gap_filler_non_scaling=self.gap_filler_non_scaling.isChecked(),
+            parameterized_shapes=self.parameterized_shapes.isChecked(),
             dxf_curve_mode=self.dxf_mode.currentData() or DxfCurveMode.LINES,
+            dxf_line_density=self.dxf_density.currentData() or DxfLineDensity.NORMAL,
+            eps_compatibility=self.eps_level.currentData() or EpsCompatibility.COMPACT,
+            cluster_similar_colors=self.cluster_similar.isChecked(),
+            max_side=self.max_side.value(),
         ).validated()
+
+    def _on_engine_toggled(self, checked: bool) -> None:
+        self._engine_body.setVisible(bool(checked))
+        self._sync_engine_toggle_text()
+
+    def _sync_engine_toggle_text(self) -> None:
+        open_ = self._engine_toggle.isChecked()
+        self._engine_toggle.setArrowType(
+            Qt.ArrowType.DownArrow if open_ else Qt.ArrowType.RightArrow
+        )
+        self._engine_toggle.setText(
+            t("Hide parameters") if open_ else t("Show parameters")
+        )
+
+    def _move_form_row(
+        self,
+        widget: QWidget,
+        source: QFormLayout,
+        dest: QFormLayout,
+        *,
+        insert_at: int | None = None,
+    ) -> None:
+        """Reparent a form row without deleting the widget.
+
+        ``QFormLayout.removeRow`` deletes the widget. ``takeRow`` does not, as
+        long as the widget is reparented before the taken row is discarded.
+        """
+        host = dest.parentWidget() or self
+        taken = source.takeRow(widget)
+        widget.setParent(host)
+        del taken
+        if insert_at is None:
+            dest.addRow(widget)
+        else:
+            dest.insertRow(insert_at, widget)
+        widget.setVisible(True)
+
+    def _place_mode_controls(self, advanced: bool) -> None:
+        """Move shared rows between the always-visible groups and Advanced groups.
+
+        Dispatch still reads the same widgets. Only the parent group changes.
+        """
+        if advanced != self._cluster_in_palette:
+            if self._cluster_in_palette:
+                self._move_form_row(
+                    self.cluster_similar,
+                    self._palette_form,
+                    self._colors_form,
+                    insert_at=self._cluster_row,
+                )
+            else:
+                self._move_form_row(
+                    self.cluster_similar,
+                    self._colors_form,
+                    self._palette_form,
+                )
+            self._cluster_in_palette = advanced
+        if advanced != self._noise_in_engine and self._noise_wrap is not None:
+            if self._noise_in_engine:
+                self._move_form_row(
+                    self._noise_wrap,
+                    self._engine_form,
+                    self._basic_form,
+                    insert_at=self._noise_row,
+                )
+            else:
+                self._move_form_row(
+                    self._noise_wrap,
+                    self._basic_form,
+                    self._engine_form,
+                    insert_at=2,
+                )
+            self._noise_in_engine = advanced
+
+    def _on_basic_image_type(self, _index: int = 0) -> None:
+        if self._updating:
+            return
+        edge = self.basic_image_type.currentData()
+        if edge is None:
+            return
+        if self.edge_treatment.currentData() != edge:
+            self._set_combo(self.edge_treatment, edge)
+        else:
+            self._refresh_basic_badges()
+
+    def _on_basic_quality(self, _index: int = 0) -> None:
+        if self._updating:
+            return
+        quality = self.basic_quality.currentData()
+        if quality is None:
+            return
+        if self.auto_quality.currentData() != quality:
+            self._set_combo(self.auto_quality, quality)
+        else:
+            self._refresh_basic_badges()
+
+    def _on_basic_color(self, _index: int = 0) -> None:
+        if self._updating:
+            return
+        choice = self.basic_color.currentData()
+        self._updating = True
+        try:
+            if choice == "unlimited":
+                self._trace_palette = []
+                self._set_combo(self.colormode, ColorMode.COLOR)
+                self._set_combo(self.palette_choice, 0)
+                self.target_colors.setValue(0)
+                self._refresh_trace_palette()
+            elif choice == "two":
+                colors = self._palette_suggestions.get(2) or ()
+                if colors:
+                    self._set_combo(self.colormode, ColorMode.COLOR)
+                    self._trace_palette = list(colors)
+                    self.target_colors.setValue(2)
+                    self._set_combo(self.palette_choice, 2)
+                    self._refresh_trace_palette()
+                else:
+                    self._set_combo(self.colormode, ColorMode.BINARY)
+                    self.target_colors.setValue(0)
+                    self._trace_palette = []
+                    self._set_combo(self.palette_choice, 0)
+                    self._refresh_trace_palette()
+            elif choice == "custom":
+                self._set_combo(self.colormode, ColorMode.COLOR)
+                self._set_combo(self.palette_choice, -2)
+                self._sync_optional_color_rows()
+        finally:
+            self._updating = False
+        self._emit_changed()
+
+    def _set_guide_combo(self, combo: QComboBox, value: object) -> None:
+        combo.blockSignals(True)
+        try:
+            self._set_combo(combo, value)
+        finally:
+            combo.blockSignals(False)
+
+    def _current_guide_color(self) -> str:
+        return guide_color_choice(
+            colormode=self.colormode.currentData() or ColorMode.COLOR,
+            palette=tuple(self._trace_palette),
+            target_colors=self.target_colors.value(),
+            palette_choice=self.palette_choice.currentData(),
+        )
+
+    def _recommended_edge(self) -> EdgeTreatment | None:
+        suggested = self._guide_suggested
+        if suggested is None:
+            return None
+        try:
+            edge = EdgeTreatment(suggested.edge_treatment)
+        except ValueError:
+            return None
+        if edge == EdgeTreatment.AUTO:
+            return None
+        return edge
+
+    def _choice_label(self, value: object) -> str:
+        keys = {
+            EdgeTreatment.HARD: "Artwork without blending",
+            EdgeTreatment.BLENDED: "Artwork with blending",
+            EdgeTreatment.PHOTO: "Photograph",
+            AutomaticQuality.FAST: "Fast",
+            AutomaticQuality.BALANCED: "Balanced",
+            AutomaticQuality.HIGH: "High detail",
+        }
+        key = keys.get(value)  # type: ignore[arg-type]
+        return t(key) if key else ""
+
+    def _sync_basic_guide_from_controls(self) -> None:
+        edge = self.edge_treatment.currentData()
+        if edge not in {EdgeTreatment.HARD, EdgeTreatment.BLENDED, EdgeTreatment.PHOTO}:
+            edge = self._recommended_edge() or EdgeTreatment.BLENDED
+        self._set_guide_combo(self.basic_image_type, edge)
+        self._set_guide_combo(
+            self.basic_quality,
+            self.auto_quality.currentData() or AutomaticQuality.BALANCED,
+        )
+        self._set_guide_combo(self.basic_color, self._current_guide_color())
+        self._refresh_basic_badges()
+
+    def _transparency_differs(self) -> bool:
+        recommendation = self._transparency_recommendation
+        if recommendation in {"", "none"}:
+            return False
+        keep = self.preserve_transparency.isChecked()
+        if recommendation == "leave":
+            return not keep
+        if recommendation in {"flatten_white", "flatten_custom"}:
+            return keep
+        return False
+
+    def _show_badge(self, badge: QLabel, show: bool, choice: str) -> None:
+        badge.setVisible(bool(show))
+        badge.setToolTip(tf("Recommended: {choice}", choice=choice) if choice else "")
+
+    def _refresh_basic_badges(self) -> None:
+        if not hasattr(self, "_basic_edge_badge"):
+            return
+        suggested = self._guide_suggested
+        edge = self._recommended_edge()
+        self._show_badge(
+            self._basic_edge_badge,
+            edge is not None and self.edge_treatment.currentData() != edge,
+            self._choice_label(edge),
+        )
+        quality = None
+        if suggested is not None:
+            try:
+                quality = AutomaticQuality(suggested.automatic_quality)
+            except ValueError:
+                quality = None
+        self._show_badge(
+            self._basic_quality_badge,
+            quality is not None and self.auto_quality.currentData() != quality,
+            self._choice_label(quality),
+        )
+        color = None
+        if suggested is not None:
+            color = guide_color_choice(
+                colormode=suggested.colormode,
+                palette=suggested.palette,
+                target_colors=suggested.target_colors,
+            )
+        color_labels = {
+            "two": t("2 colors"),
+            "custom": t("Custom"),
+            "unlimited": t("Unlimited"),
+        }
+        self._show_badge(
+            self._basic_color_badge,
+            color is not None and self._current_guide_color() != color,
+            color_labels.get(color or "", ""),
+        )
+        self._show_badge(
+            self._basic_transparency_badge,
+            self._transparency_differs(),
+            t(self._transparency_advice_en) if self._transparency_advice_en else "",
+        )
+
+    def _sync_dxf_density(self, *_args) -> None:
+        lines = self.dxf_mode.currentData() == DxfCurveMode.LINES
+        self.dxf_density.setEnabled(lines)
+        self._dxf_density_label.setEnabled(lines)
+
+    def _sync_gap_filler_rows(self) -> None:
+        style = self.svg_style.currentData()
+        show = style in {SvgPaintStyle.GAP_FILLER, SvgPaintStyle.STROKE_EDGES}
+        self.gap_filler_width.setEnabled(show)
+        self.gap_filler_non_scaling.setEnabled(show)
+        self._gap_width_label.setEnabled(show)
 
     def refresh_presets(self) -> None:
         current = self.preset_combo.currentText()

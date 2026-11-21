@@ -22,8 +22,28 @@ from vectorizer.domain.settings import (
     PathFitMode,
     TraceSettings,
     WorkflowMode,
+    artwork_input_width_px,
 )
 from vectorizer.raster.palette import suggest_palettes
+
+
+class TransparencyRecommendation(str, Enum):
+    """What to do with an existing alpha channel. Not a knockout."""
+
+    NONE = "none"
+    LEAVE = "leave"
+    FLATTEN_WHITE = "flatten_white"
+    FLATTEN_CUSTOM = "flatten_custom"
+
+
+@dataclass(frozen=True)
+class TransparencyAdvice:
+    """1-bit mask versus true transparent anti-aliasing, plus a flatten hint."""
+
+    hard_mask: bool = False
+    recommendation: TransparencyRecommendation = TransparencyRecommendation.NONE
+    blend_rgb: tuple[int, int, int] | None = None
+    note: str = ""
 
 
 class ContentKind(str, Enum):
@@ -62,6 +82,9 @@ class ImageMetrics:
     flat_mass: float
     # Dark ink-like outline energy — high for cel cartoons, low for photos.
     ink_outline_score: float
+    # Share of locally flat pixels that still drift over a few dozen pixels.
+    # High for smooth gradients that a 12-color probe mistakes for flat art.
+    slow_ramp: float
 
 
 @dataclass(frozen=True)
@@ -76,6 +99,24 @@ class ImageAnalysis:
     content_kind: ContentKind
     metrics: ImageMetrics
     notes: tuple[str, ...]
+    transparency: TransparencyAdvice = TransparencyAdvice()
+
+
+def _photo_shape_budget(kind: ContentKind, treatment: EdgeTreatment) -> bool:
+    """Photographs spend quality on shape count, not on blend width."""
+    if kind in {ContentKind.PHOTO, ContentKind.GRADIENT}:
+        return True
+    return treatment == EdgeTreatment.PHOTO
+
+
+def _resolve_treatment(kind: ContentKind, treatment: EdgeTreatment) -> EdgeTreatment:
+    if treatment != EdgeTreatment.AUTO:
+        return treatment
+    if kind in {ContentKind.PHOTO, ContentKind.GRADIENT}:
+        return EdgeTreatment.PHOTO
+    if kind in {ContentKind.PIXEL_ART, ContentKind.BINARY_MARK, ContentKind.LINE_ART}:
+        return EdgeTreatment.HARD
+    return EdgeTreatment.BLENDED
 
 
 def apply_automatic_quality(
@@ -85,64 +126,86 @@ def apply_automatic_quality(
     photo_like: bool = False,
     content_kind: ContentKind | None = None,
 ) -> TraceSettings:
-    """Tune analyzer defaults for Fast / Balanced / High detail."""
+    """Refine a content recipe for Fast / Balanced / High.
+
+    Balanced is the recipe itself (about 2 px of blend for uncertain artwork,
+    a medium shape budget for photos). Fast and High do not share one global
+    "more iterations" delta:
+
+    - Blended / hard artwork: step the input noise floor toward ~1 px (high)
+      or wider than the recipe (fast). Fringe absorption width is applied
+      later from `automatic_quality` in the blend tracer.
+    - Photographs: change the output shape budget (`target_colors`,
+      `filter_speckle`, `layer_difference`) only.
+    """
     quality = AutomaticQuality(quality)
     base = settings.validated()
     kind = content_kind or (ContentKind.PHOTO if photo_like else ContentKind.ILLUSTRATION)
-
+    treatment = _resolve_treatment(kind, base.edge_treatment)
+    tuned = replace(base, automatic_quality=quality, workflow=WorkflowMode.AUTOMATIC)
     if quality == AutomaticQuality.BALANCED:
-        return replace(base, automatic_quality=quality, workflow=WorkflowMode.AUTOMATIC)
-
-    if quality == AutomaticQuality.FAST:
-        tuned = replace(
-            base,
-            automatic_quality=quality,
-            workflow=WorkflowMode.AUTOMATIC,
-            filter_speckle=min(64, base.filter_speckle + 4),
-            color_precision=max(1, base.color_precision - 1),
-            layer_difference=min(128, base.layer_difference + 8),
-            corner_threshold=min(180, base.corner_threshold + 15),
-            length_threshold=min(10.0, base.length_threshold + 0.5),
-            max_iterations=max(1, min(6, base.max_iterations)),
-            path_precision=max(0, base.path_precision - 1),
-            splice_threshold=min(180, base.splice_threshold + 10),
-        )
-        if kind in {ContentKind.PHOTO, ContentKind.GRADIENT} and tuned.target_colors == 0:
-            tuned = replace(tuned, target_colors=20)
-        # Illustrations already constrain via palette — do not double-posterize.
         return tuned.validated()
 
-    # High detail — preserve structure; spend more fitting budget.
-    # Cel illustrations must keep a positive layer_difference: High used to
-    # drive it to 0 (base 4 − 4), which shredded flat yellow curtains into
-    # white/orange VTracer shards.
-    layer_floor = 4 if kind == ContentKind.ILLUSTRATION else 0
-    tuned = replace(
+    if _photo_shape_budget(kind, treatment):
+        return _apply_photo_shape_budget(tuned, quality, kind).validated()
+    return _apply_artwork_noise(tuned, quality, treatment).validated()
+
+
+def _apply_artwork_noise(
+    base: TraceSettings,
+    quality: AutomaticQuality,
+    treatment: EdgeTreatment,
+) -> TraceSettings:
+    """Step filter_speckle toward the artwork input width. Leave fit knobs."""
+    speckle = int(base.filter_speckle)
+    width = artwork_input_width_px(quality)
+    if quality == AutomaticQuality.HIGH:
+        # Toward ~1 px. A recipe that already keeps hairlines (0) stays there.
+        if speckle > width:
+            speckle = max(width, speckle - 2)
+    elif quality == AutomaticQuality.FAST:
+        # Wider than the ~2 px medium. Hard recipes that disable speckle
+        # (pixel art, sharp ink) stay at 0 so strokes are not deleted.
+        if speckle <= 0 and treatment == EdgeTreatment.HARD:
+            speckle = 0
+        elif speckle <= 0:
+            speckle = 2
+        else:
+            speckle = min(64, speckle + 2)
+    return replace(base, filter_speckle=int(speckle))
+
+
+def _apply_photo_shape_budget(
+    base: TraceSettings,
+    quality: AutomaticQuality,
+    kind: ContentKind,
+) -> TraceSettings:
+    """Fewer / more shapes. Does not retune artwork blend width or iterations.
+
+    Cel illustrations that only borrow the photo tracer keep target_colors at
+    the recipe value (usually 0); speckle and layer difference still move.
+    """
+    keep_colors = kind == ContentKind.ILLUSTRATION
+    colors = int(base.target_colors)
+    speckle = int(base.filter_speckle)
+    layer = int(base.layer_difference)
+    if quality == AutomaticQuality.FAST:
+        if not keep_colors:
+            colors = 16 if colors <= 0 else max(8, int(round(colors * 0.65)))
+        speckle = min(64, speckle + 4)
+        layer = min(128, layer + 8)
+    else:
+        if not keep_colors and colors > 0:
+            colors = min(64, colors + 12)
+        speckle = max(0, speckle - 2)
+        # Stay positive: a zero layer difference shreds flat regions.
+        layer = max(4, layer - 4)
+    return replace(
         base,
-        automatic_quality=quality,
-        workflow=WorkflowMode.AUTOMATIC,
-        filter_speckle=max(0, base.filter_speckle - 2),
-        color_precision=min(8, base.color_precision + 1),
-        layer_difference=max(layer_floor, base.layer_difference - 4),
-        corner_threshold=max(0, base.corner_threshold - 10),
-        length_threshold=max(3.5, base.length_threshold - 0.3),
-        max_iterations=min(64, base.max_iterations + 6),
-        path_precision=min(12, base.path_precision + 1),
-        splice_threshold=max(0, base.splice_threshold - 5),
+        target_colors=int(colors),
+        filter_speckle=int(speckle),
+        layer_difference=int(layer),
     )
-    if kind in {ContentKind.PHOTO, ContentKind.GRADIENT} and tuned.target_colors:
-        # High detail: allow a richer palette before tracing.
-        tuned = replace(tuned, target_colors=min(64, tuned.target_colors + 12))
-    if kind == ContentKind.ILLUSTRATION and tuned.palette and len(tuned.palette) < 24:
-        # Prefer the analyzer's richer suggestion when High detail is chosen.
-        # Palette expansion itself happens in analyze_image; here we only
-        # tighten geometry further for ink-heavy cartoons.
-        tuned = replace(
-            tuned,
-            corner_threshold=max(0, tuned.corner_threshold - 4),
-            path_precision=min(12, tuned.path_precision + 1),
-        )
-    return tuned.validated()
 
 
 def analyze_image(
@@ -154,7 +217,9 @@ def analyze_image(
     # mattes so icons classify as logos/binary instead of sparse illustrations.
     from vectorizer.raster.preprocess import scrub_chroma_key_alpha, solidify_black_matte
 
-    image = solidify_black_matte(scrub_chroma_key_alpha(image))
+    scrubbed = scrub_chroma_key_alpha(image)
+    transparency = _transparency_advice(scrubbed)
+    image = solidify_black_matte(scrubbed)
     metrics = _compute_metrics(image)
     kind = _classify(metrics)
     photo_like = kind in {ContentKind.PHOTO, ContentKind.GRADIENT}
@@ -215,33 +280,46 @@ def analyze_image(
                     ink_budget,
                     min(palette_cap, max(scene_floor, suggestions.best)),
                 )
-            # Flat logos with hard left/right shading need more than 3 inks
-            # (light + dark orange, white + off-white, black). Soft app icons
-            # with gradients need a richer posterize budget than `best` alone.
+            # Flat logos: do not force a 5-colour floor. AA mixes (pale blue
+            # between a blue tile and a white mark) were promoted into real
+            # inks and traced as 1 px rings. Crisp marks follow the
+            # reconstruction count; glossy icons keep a richer budget.
             if kind == ContentKind.FLAT_LOGO:
                 soft_logo = metrics.flat_mass < 0.85
-                logo_floor = 12 if soft_logo else (8 if metrics.flat_mass < 0.92 else 5)
-                if soft_logo:
-                    ink_budget = max(
-                        ink_budget,
-                        min(16, max(logo_floor, metrics.palette_estimate // 2)),
+                near_binary = (
+                    soft_logo
+                    and metrics.palette_estimate <= 4
+                    and metrics.corner_sharpness >= 0.65
+                )
+                if near_binary:
+                    # Black canvases dominate the 12-colour probe (estimate→2)
+                    # while AA greys on the glyph still need ladder slots.
+                    logo_target = max(2, metrics.palette_estimate)
+                    unique = metrics.unique_colors or 0
+                    if unique >= 8 and metrics.palette_estimate <= 3:
+                        logo_target = max(
+                            logo_target,
+                            min(12, max(suggestions.best, 8)),
+                        )
+                elif soft_logo:
+                    logo_target = min(
+                        12,
+                        max(4, suggestions.best, min(12, metrics.palette_estimate)),
                     )
                 else:
-                    ink_budget = max(ink_budget, min(16, max(suggestions.best, logo_floor)))
-            count = (
-                min(count, ink_budget)
-                if kind != ContentKind.ILLUSTRATION
-                else min(palette_cap, max(count, ink_budget))
-            )
-            if kind == ContentKind.FLAT_LOGO:
-                soft_logo = metrics.flat_mass < 0.85
-                logo_floor = 12 if soft_logo else (8 if metrics.flat_mass < 0.92 else 5)
-                target = (
-                    min(16, max(logo_floor, metrics.palette_estimate // 2))
-                    if soft_logo
-                    else min(16, max(suggestions.best, logo_floor))
+                    # suggestions.best often stops at 2 and folds a third solid
+                    # (white play button, red needle, orange shade) into the
+                    # dominant ink. Ask for two extra slots; mix-pruning drops
+                    # the ones that are only anti-aliased rims.
+                    logo_target = max(2, min(8, metrics.palette_estimate + 2))
+                ink_budget = logo_target
+                count = logo_target
+            else:
+                count = (
+                    min(count, ink_budget)
+                    if kind != ContentKind.ILLUSTRATION
+                    else min(palette_cap, max(count, ink_budget))
                 )
-                count = max(count, target)
             # Snap to a palette we actually built.
             if count not in suggestions.palettes:
                 count = min(
@@ -250,17 +328,14 @@ def analyze_image(
                 )
         palette = suggestions.palettes.get(count, ())
         cel_flats = False
+        used_soft_ramp = False
         cutout_badge = (
             metrics.has_alpha
             and metrics.opaque_ratio < 0.92
             and metrics.opaque_ratio >= 0.50
             and ink_heavy
         )
-        if (
-            treatment == EdgeTreatment.PHOTO
-            and kind == ContentKind.ILLUSTRATION
-            and ink_heavy
-        ):
+        if kind == ContentKind.ILLUSTRATION and ink_heavy:
             # Cel scenes on the VTracer path: pick inks from flat interiors so
             # small distinct fills (white sails, gold frames) keep a slot and
             # brown outline fringe does not.
@@ -288,6 +363,42 @@ def analyze_image(
                 cel_flats = True
                 palette = flats
                 palette_cap = 16
+        elif (
+            treatment == EdgeTreatment.BLENDED
+            and kind == ContentKind.FLAT_LOGO
+            and ink_heavy
+            and metrics.palette_estimate <= 10
+        ):
+            # Simple inked marks (a rooster, a crest) lose red/orange when the
+            # quantizer spends slots on AA browns. Flat interiors recover them.
+            from vectorizer.raster.palette import cel_fill_palette
+
+            flats = cel_fill_palette(image, max_colors=8, min_share=0.0004)
+            if len(flats) >= 3:
+                cel_flats = True
+                palette = flats
+                palette_cap = 12
+        elif (
+            treatment == EdgeTreatment.BLENDED
+            and kind == ContentKind.FLAT_LOGO
+            and metrics.flat_mass < 0.85
+            and not ink_heavy
+        ):
+            # Glossy app icons (sheens, lit propellers): stepped ramps from
+            # smooth interiors instead of AA blend colours; High gets the
+            # finest steps so the sheen does not posterize into shards.
+            from vectorizer.raster.palette import soft_ramp_palette
+
+            ramp_colors = {
+                AutomaticQuality.FAST: 12,
+                AutomaticQuality.BALANCED: 16,
+                AutomaticQuality.HIGH: 24,
+            }[AutomaticQuality(quality)]
+            ramps = soft_ramp_palette(image, max_colors=ramp_colors, accents=palette)
+            if len(ramps) >= max(4, len(palette) // 2):
+                used_soft_ramp = True
+                palette = ramps
+                palette_cap = max(palette_cap, ramp_colors)
         # When the scene fill stays in the output, pin the exact detected
         # background colour so walls/skies cannot collapse to near-white.
         if (
@@ -328,11 +439,24 @@ def analyze_image(
         # Do not median-refine the whole palette here: averaging JPEG shadow
         # into orange couches turns them muddy brown. Chroma-aware snap at
         # label time is enough to keep pink walls off salmon fills.
+        # Do not area-thin-prune here. Box-downsampling makes solid marks
+        # (play buttons, lion orange, rooster navy) look like 1 px rims and
+        # the pruner deletes them. Flat logos drop only true AA mixes.
+        if (
+            palette
+            and treatment == EdgeTreatment.BLENDED
+            and kind == ContentKind.FLAT_LOGO
+            and not cel_flats
+            and not used_soft_ramp
+        ):
+            from vectorizer.raster.palette import prune_aa_fringe
+
+            palette = prune_aa_fringe(image, palette)
     base = replace(base, edge_treatment=treatment, palette=palette)
     suggested = apply_automatic_quality(
         base, quality, photo_like=photo_like, content_kind=kind
     )
-    notes = _build_notes(kind, metrics, quality, suggested)
+    notes = _build_notes(kind, metrics, quality, suggested, transparency)
 
     return ImageAnalysis(
         width=metrics.width,
@@ -345,6 +469,7 @@ def analyze_image(
         content_kind=kind,
         metrics=metrics,
         notes=tuple(notes),
+        transparency=transparency,
     )
 
 
@@ -378,7 +503,8 @@ def _compute_metrics(image: Image.Image) -> ImageMetrics:
     corner_sharpness = _corner_sharpness(rgb)
     minority_ratio = _minority_color_ratio(rgb, unique)
     flat_mass, palette_estimate = _flat_mass_and_palette(rgb, unique, exact)
-    ink_outline_score = _ink_outline_score(rgb)
+    ink_outline_score = _ink_outline_score(rgb, alpha if has_alpha else None)
+    slow_ramp = _slow_ramp_fraction(rgb)
 
     return ImageMetrics(
         width=width,
@@ -400,6 +526,7 @@ def _compute_metrics(image: Image.Image) -> ImageMetrics:
         foreground_coverage=foreground_coverage,
         flat_mass=flat_mass,
         ink_outline_score=ink_outline_score,
+        slow_ramp=slow_ramp,
     )
 
 
@@ -523,6 +650,37 @@ def _minority_color_ratio(rgb: Image.Image, unique: int | None) -> float:
     return smallest / float(total)
 
 
+def _slow_ramp_fraction(rgb: Image.Image) -> float:
+    """Share of locally flat pixels that change modestly ~40 px away.
+
+    A topographic wash or a full-bleed blue ramp is flat inside a 5×5 window,
+    so `flat_mass` treats it as solid ink and the blend tracer emits rectangles.
+    Hard logos stay near zero: away from an edge the colour does not drift.
+    """
+    probe = _analysis_probe(rgb, max_side=256)
+    arr = np.asarray(probe, dtype=np.int16)
+    height, width = arr.shape[:2]
+    if height < 48 or width < 48:
+        return 0.0
+    hi = np.asarray(probe.filter(ImageFilter.MaxFilter(5)), dtype=np.int16)
+    lo = np.asarray(probe.filter(ImageFilter.MinFilter(5)), dtype=np.int16)
+    local = (hi - lo).max(axis=2)
+    shift = 40
+    vertical = np.abs(arr[shift:, :, :] - arr[:-shift, :, :]).max(axis=2)
+    horizontal = np.abs(arr[:, shift:, :] - arr[:, :-shift, :]).max(axis=2)
+    delta = np.zeros((height, width), dtype=np.int16)
+    delta[shift // 2 : shift // 2 + vertical.shape[0], : vertical.shape[1]] = np.maximum(
+        delta[shift // 2 : shift // 2 + vertical.shape[0], : vertical.shape[1]],
+        vertical,
+    )
+    delta[: horizontal.shape[0], shift // 2 : shift // 2 + horizontal.shape[1]] = np.maximum(
+        delta[: horizontal.shape[0], shift // 2 : shift // 2 + horizontal.shape[1]],
+        horizontal,
+    )
+    slow = (local <= 10) & (delta >= 18) & (delta <= 120)
+    return float(slow.mean())
+
+
 def _corner_sharpness(rgb: Image.Image) -> float:
     """Higher when edges are crisp (logos) vs soft (photos / heavy AA)."""
     gray = rgb.convert("L")
@@ -544,21 +702,21 @@ def _corner_sharpness(rgb: Image.Image) -> float:
     return max(0.0, min(1.0, strong / (strong + mid + 1e-6)))
 
 
-def _ink_outline_score(rgb: Image.Image) -> float:
+def _ink_outline_score(rgb: Image.Image, alpha: Image.Image | None = None) -> float:
     """Share of dark outline pixels abutting much brighter fills.
 
     Cel cartoons score high (brown/black ink between flat colours). Photographs
     with large dark regions score near zero because their dark neighbours are
-    also dark.
+    also dark. Transparent pixels (black RGB, drop shadows) are not ink.
     """
     gray = rgb.convert("L")
     w, h = gray.size
     if max(w, h) > 512:
         scale = 512 / float(max(w, h))
-        gray = gray.resize(
-            (max(1, int(w * scale)), max(1, int(h * scale))),
-            Image.Resampling.BOX,
-        )
+        size = (max(1, int(w * scale)), max(1, int(h * scale)))
+        gray = gray.resize(size, Image.Resampling.BOX)
+        if alpha is not None:
+            alpha = alpha.resize(size, Image.Resampling.BOX)
     arr = np.asarray(gray, dtype=np.int16)
     padded = np.pad(arr, 1, mode="edge")
     neigh_max = np.maximum.reduce(
@@ -576,6 +734,8 @@ def _ink_outline_score(rgb: Image.Image) -> float:
     contrast = neigh_max - arr
     # Dark-ish ink (including brown) with a substantially brighter neighbour.
     outline = (arr <= 100) & (contrast >= 45)
+    if alpha is not None:
+        outline &= np.asarray(alpha, dtype=np.uint8) >= 128
     return float(outline.mean())
 
 
@@ -822,17 +982,18 @@ def _edge_for_kind(kind: ContentKind, m: ImageMetrics) -> EdgeTreatment:
         return EdgeTreatment.PHOTO
     if kind == ContentKind.BINARY_MARK and m.corner_sharpness >= 0.45:
         return EdgeTreatment.HARD
-    if kind == ContentKind.LINE_ART and m.corner_sharpness >= 0.55:
+    # 0.55 left crisp line drawings on the blend path, which turned strokes
+    # into stacked compound fills. Hard snap once corners are merely decent.
+    if kind == ContentKind.LINE_ART and m.corner_sharpness >= 0.38:
         return EdgeTreatment.HARD
-    # Large ink-heavy cel scenes: BlendTracer hard-cel collapses to ~one path
-    # per palette colour (broken outlines, splotchy fills). VTracer on a
-    # stroke-solidified snap keeps continuous ink and flat fills.
-    # Transparent badges/patches must stay on the blend path — VTracer has no
-    # alpha channel and would paint chroma-key / empty pixels as solid fills.
+    # Busy megapixel cel/JPEG (flat_mass often 0.6–0.8, rich palette) → VTracer.
+    # Simple flat cartoons (flat_mass≈0.99, tiny palette) stay on blend.
+    # Transparent badges stay blended — VTracer has no alpha channel.
     if (
         kind == ContentKind.ILLUSTRATION
         and m.ink_outline_score >= 0.008
         and (m.width * m.height) >= 180_000
+        and (m.flat_mass < 0.85 or m.palette_estimate >= 12)
         and not (m.has_alpha and m.opaque_ratio < 0.92)
     ):
         return EdgeTreatment.PHOTO
@@ -865,6 +1026,19 @@ def _fold_background_into(
     return (normalize_hex(rgb_to_hex(bg)), *palette)
 
 
+def _near_black_opaque_share(image: Image.Image, *, luma_max: float = 45.0) -> float:
+    """Share of opaque pixels that are near-black (real ink / dark fills)."""
+    rgba = np.asarray(image.convert("RGBA"), dtype=np.int16)
+    opaque = rgba[..., 3] >= 128
+    total = int(opaque.sum())
+    if total < 16:
+        return 0.0
+    luma = (
+        0.299 * rgba[..., 0] + 0.587 * rgba[..., 1] + 0.114 * rgba[..., 2]
+    )
+    return float(((luma <= luma_max) & opaque).sum()) / float(total)
+
+
 def _ensure_dark_ink(
     palette: tuple[str, ...],
     image: Image.Image,
@@ -889,6 +1063,11 @@ def _ensure_dark_ink(
     if existing:
         ink = min(existing, key=_luma)
     else:
+        # Dropbox-style logos have dark-blue AA fringe but no real black ink.
+        # `_sample_dark_ink` falls back to synthetic #1a0a00 and paints false
+        # black rings — only invent a slot when the raster actually has mass.
+        if _near_black_opaque_share(image) < 0.004:
+            return palette
         ink = _sample_dark_ink(image)
     # Drop muddy-brown stroke impostors: JPEG outline pixels otherwise snap to
     # them and break the black line work. High-chroma oranges (couch shadows
@@ -1025,16 +1204,26 @@ def _classify(m: ImageMetrics) -> ContentKind:
     if unique is not None and unique <= 2:
         return ContentKind.BINARY_MARK
 
-    # Thin strokes before pixel-art: both can be small + limited palette.
+    # Thin strokes before pixel-art. Anti-aliasing pushes unique colors well
+    # past 16; that gate turned line drawings into blended compound paths.
+    limited_line = (unique is not None and unique <= 48) or (
+        m.palette_estimate <= 8
+        and m.flat_mass >= 0.80
+        and (unique is None or unique <= 400)
+    )
+    thin_strokes = m.foreground_coverage < 0.20 or (
+        m.fill_ratio < 0.58 and m.edge_density > 0.16
+    )
     if (
-        unique is not None
-        and unique <= 16
-        and m.noise_score < 0.4
-        and m.edge_density > 0.22
-        and (
-            m.foreground_coverage < 0.14
-            or (m.fill_ratio < 0.55 and m.edge_density > 0.28)
-        )
+        limited_line
+        and m.noise_score < 0.40
+        and m.edge_density > 0.12
+        and thin_strokes
+        # Binary-ish strokes on a full white field report fill_ratio≈1.0;
+        # still treat them as line art when foreground coverage is tiny.
+        and (m.fill_ratio < 0.75 or m.foreground_coverage < 0.08)
+        and m.foreground_coverage < 0.45
+        and (m.ink_outline_score < 0.04 or m.foreground_coverage < 0.08)
     ):
         return ContentKind.LINE_ART
 
@@ -1047,6 +1236,29 @@ def _classify(m: ImageMetrics) -> ContentKind:
         and m.foreground_coverage >= 0.14
     ):
         return ContentKind.PIXEL_ART
+
+    # Smooth ramps look "flat" to a 12-color probe (high flat_mass) and were
+    # traced as stacked rectangles. A local neighbourhood stays flat while the
+    # colour still drifts across the frame — that is a gradient, not a logo.
+    # Alpha cutouts (map badges, OpenCPN-style marks) keep sharp glyphs that
+    # GradientTracer shreds — those stay on the logo/blend + soft_ramp path.
+    alpha_cutout_mark = bool(
+        m.has_alpha and 0.50 <= m.opaque_ratio < 0.95
+    )
+    if (
+        m.slow_ramp >= 0.12
+        and m.flat_mass < 0.93
+        and effective >= 8
+        # Busy marks on a ramp (white waves, ink, high edge density) are not
+        # a single gradient field — GradientTracer drops the mark.
+        and m.noise_score < 0.22
+        and m.corner_sharpness < 0.65
+        and m.ink_outline_score < 0.02
+        and m.edge_density < 0.14
+        and m.fill_ratio >= 0.70
+        and not alpha_cutout_mark
+    ):
+        return ContentKind.GRADIENT
 
     # Cel / cartoon with ink outlines — check before flat-logo so large scenes
     # with pink walls do not get the aggressive logo speckle recipe.
@@ -1069,9 +1281,23 @@ def _classify(m: ImageMetrics) -> ContentKind:
         and (m.flat_mass >= 0.40 or strong_ink)
     )
 
+    # Smooth gradients: many unique colours but a tiny reconstruction palette
+    # and near-zero noise. Must beat the flat-logo `flat_mass≥0.95` clause,
+    # which otherwise posterizes ramps into a handful of <rect>s.
+    if (
+        (unique is None or unique > 48)
+        and m.noise_score < 0.28
+        and m.corner_sharpness < 0.35
+        and m.edge_density < 0.35
+        and not cel_like
+    ):
+        return ContentKind.GRADIENT
+
     # Flat logos: either a hard limited palette, or a small solid palette with
     # anti-aliased / JPEG fringe that looks like "many colors". Large multi-
     # colour scenes with ink outlines are illustrations, not logos.
+    # True gradients are caught earlier (low corner_sharpness); AA logos often
+    # report unique=None from fringe but keep high corners + flat_mass.
     if (
         not cel_like
         and m.corner_sharpness >= 0.35
@@ -1081,19 +1307,38 @@ def _classify(m: ImageMetrics) -> ContentKind:
             logo_matte
             or (unique is not None and unique <= 32 and m.pixel_count <= 250_000)
             or (m.flat_mass >= 0.90 and effective <= 8 and m.pixel_count <= 500_000)
-            or (m.flat_mass >= 0.95 and effective <= 6)
+            or (m.flat_mass >= 0.95 and effective <= 8)
         )
+    ):
+        return ContentKind.FLAT_LOGO
+
+    # Glossy app icons (propellers, sheens) are not photographs. A mid flat_mass
+    # and low ink means soft_ramp should posterize the gradients, not VTracer.
+    # Continuous-tone photo probes (thousands of unique colours) must not land
+    # here — they share mid flat_mass after a 12-colour probe.
+    if (
+        not cel_like
+        and 0.55 <= m.flat_mass < 0.90
+        and m.ink_outline_score < 0.008
+        and m.corner_sharpness >= 0.45
+        and m.noise_score < 0.30
+        and m.fill_ratio >= 0.70
+        and m.pixel_count <= 500_000
+        and effective <= 24
+        and (unique is None or unique <= 512)
     ):
         return ContentKind.FLAT_LOGO
 
     # Transparent cutout badges/crests with a limited solid palette are logos,
     # not megapixel cel scenes — keep them on the blend/logo recipe so alpha
     # stays empty and thin ink rings are not VTracer-posterized.
-    # palette_estimate often lands ~24 from AA fringe even when solids are ≤10.
+    # Require real flat mass: soft photographic cutouts (flat_mass~0.3) used to
+    # land here with effective=32 and explode into fringe rings.
     if (
         m.has_alpha
         and 0.55 <= m.opaque_ratio <= 0.92
-        and effective <= 32
+        and effective <= 14
+        and m.flat_mass >= 0.55
         and m.corner_sharpness >= 0.40
         and m.noise_score < 0.45
         and m.fill_ratio >= 0.40
@@ -1129,13 +1374,113 @@ def _classify(m: ImageMetrics) -> ContentKind:
     ):
         return ContentKind.ILLUSTRATION
 
-    # Continuous tone: separate smooth gradients from photographic noise.
+    # Continuous tone leftover (early gradient gate already caught clean ramps).
     if m.noise_score < 0.28 and m.corner_sharpness < 0.3 and m.edge_density < 0.35:
         return ContentKind.GRADIENT
     return ContentKind.PHOTO
 
 
+def _prune_fringe_palette(
+    image: Image.Image,
+    palette: tuple[str, ...],
+    *,
+    preserve_dark_ink: bool = False,
+    flat_mass: float = 0.0,
+    min_share: float = 0.0025,
+    max_thin: float = 0.92,
+) -> tuple[str, ...]:
+    """Drop palette slots that only cover AA fringe or near-empty snaps.
+
+    Soft iso-contours paint every kept colour. Ghost greys/yellows that win
+    only along 1-px rims become hundreds of micro-subpaths; remove them here
+    before blend tracing.
+
+    Hard nearest-colour under-counts soft AA logo inks (they lose to the paper
+    colour). On high flat_mass logos only drop *empty* slots; never thin-prune.
+    """
+    from vectorizer.raster.color import hex_to_rgb, nearest_oklab, srgb_u8_to_oklab
+
+    if len(palette) <= 2:
+        return palette
+    rgba = np.asarray(image.convert("RGBA"))
+    rgb = rgba[..., :3]
+    alpha = rgba[..., 3] >= 8
+    opaque = int(alpha.sum())
+    if opaque < 16:
+        return palette
+    labs = srgb_u8_to_oklab(
+        np.asarray([hex_to_rgb(c) for c in palette], dtype=np.uint8)
+    )
+    # Downsample large rasters — pruning only needs area/thin ratios.
+    h, w = rgb.shape[:2]
+    if max(h, w) > 640:
+        scale = 640.0 / float(max(h, w))
+        small = image.convert("RGBA").resize(
+            (max(1, int(round(w * scale))), max(1, int(round(h * scale)))),
+            Image.Resampling.BOX,
+        )
+        arr = np.asarray(small)
+        rgb = arr[..., :3]
+        alpha = arr[..., 3] >= 8
+        opaque = int(alpha.sum())
+        if opaque < 16:
+            return palette
+    idx, _ = nearest_oklab(rgb, labs)
+    idx = np.where(alpha, idx, -1)
+    # Clean AA logos: only remove colours that win zero opaque pixels.
+    conservative = flat_mass >= 0.88
+    keep: list[str] = []
+    for i, color in enumerate(palette):
+        mask = idx == i
+        area = int(mask.sum())
+        share = area / float(opaque)
+        if area <= 0:
+            if preserve_dark_ink:
+                r, g, b = hex_to_rgb(color)
+                if 0.299 * r + 0.587 * g + 0.114 * b <= 42:
+                    keep.append(color)
+            continue
+        if conservative:
+            keep.append(color)
+            continue
+        if share < min_share:
+            if preserve_dark_ink:
+                r, g, b = hex_to_rgb(color)
+                if 0.299 * r + 0.587 * g + 0.114 * b <= 42:
+                    keep.append(color)
+            continue
+        # Opening residual: pixels with no same-label 3×3 core.
+        pad = np.pad(mask, 1, constant_values=False)
+        core = (
+            pad[1:-1, 1:-1]
+            & pad[:-2, 1:-1]
+            & pad[2:, 1:-1]
+            & pad[1:-1, :-2]
+            & pad[1:-1, 2:]
+        )
+        thin_ratio = float((mask & ~core).sum()) / float(area)
+        if thin_ratio >= max_thin and share < 0.04:
+            if preserve_dark_ink:
+                r, g, b = hex_to_rgb(color)
+                if 0.299 * r + 0.587 * g + 0.114 * b <= 42:
+                    keep.append(color)
+            continue
+        keep.append(color)
+    if len(keep) < 2:
+        # Fall back to the largest areas so tracing still has contrast.
+        areas = [(int((idx == i).sum()), palette[i]) for i in range(len(palette))]
+        areas.sort(reverse=True)
+        keep = [c for _, c in areas[: max(2, min(4, len(palette)))]]
+    return tuple(keep)
+
+
 def _settings_for_kind(kind: ContentKind, m: ImageMetrics) -> TraceSettings:
+    """Balanced recipe for `kind`.
+
+    Fast / High do not rebuild this. `apply_automatic_quality` refines it:
+    blended and hard artwork step the noise floor around ~1 px / ~2 px / wider,
+    and photographs change the shape budget (colors, speckle, layer difference).
+    """
     area_scale = _speckle_scale(m.pixel_count)
     bg = m.background_rgb or (255, 255, 255)
     remove_bg = _should_remove_background(kind, m)
@@ -1295,19 +1640,28 @@ def _settings_for_kind(kind: ContentKind, m: ImageMetrics) -> TraceSettings:
         ink_heavy = m.ink_outline_score >= 0.008
         # Prefer smooth, faithful fills over ultra-tight "keen" geometry that
         # turned cel couches muddy and edges crunchy at megapixel sizes.
-        # Large ink-heavy cels route to VTracer (PHOTO edge): favour slightly
-        # smoother corners so solidified ink ribbons do not look stair-stepped.
-        large_cel = ink_heavy and (m.width * m.height) >= 180_000
+        # Only low-flat scenes still use VTracer. Flat cel stays on blend, and
+        # hard_cel requires corner_threshold <= 45 — 48 disabled it and the
+        # outlines fell apart.
+        # Match _edge_for_kind: only the VTracer route uses the loose corner
+        # and the high speckle floor. Alpha cutouts stay on blend even when
+        # flat_mass is low, and hard_cel needs corner_threshold <= 45.
+        routed_photo = (
+            ink_heavy
+            and (m.width * m.height) >= 180_000
+            and (m.flat_mass < 0.85 or m.palette_estimate >= 12)
+            and not (m.has_alpha and m.opaque_ratio < 0.92)
+        )
         # Transparent badges/crests stay on BlendTracer soft iso
         # (preserve_transparency disables hard_cel). Corner stays low so
         # letterforms keep sharp apexes; crack-edge is what caused ghost rings.
         cutout_badge = m.has_alpha and m.opaque_ratio < 0.92
         if cutout_badge:
             corner = 32
-        elif large_cel:
-            corner = 48
+        elif routed_photo:
+            corner = 60
         elif ink_heavy:
-            corner = 38
+            corner = 40
         else:
             corner = 50
         return TraceSettings(
@@ -1315,15 +1669,26 @@ def _settings_for_kind(kind: ContentKind, m: ImageMetrics) -> TraceSettings:
             colormode=ColorMode.COLOR,
             hierarchical=HierarchyMode.STACKED,
             mode=PathFitMode.SPLINE,
-            # Speckle must stay tiny on cel art — filter_speckle≥4 eats 1–2 px
-            # ink outlines on megapixel scenes and the couch loses its contour.
-            filter_speckle=0 if ink_heavy else max(0, int(1 * area_scale)),
-            color_precision=8 if large_cel else 7,
-            layer_difference=4 if large_cel else (8 if ink_heavy else 10),
+            # Speckle is a component-area floor, not a stroke width. A continuous
+            # outline stays; isolated 1 px JPEG/AA islands become micro-paths
+            # and invalid arcs. Flat cel at megapixel size uses a small floor.
+            # Busy photo-like cels on VTracer need a higher floor or freckles
+            # become thousands of paths.
+            filter_speckle=(
+                min(16, max(8, (m.width * m.height) // 200_000))
+                if routed_photo
+                else (
+                    6
+                    if ink_heavy and (m.width * m.height) >= 180_000
+                    else (0 if ink_heavy else max(0, int(1 * area_scale)))
+                )
+            ),
+            color_precision=6 if routed_photo else 7,
+            layer_difference=12 if routed_photo else (8 if ink_heavy else 10),
             corner_threshold=corner,
-            length_threshold=3.5 if ink_heavy else 3.6,
-            max_iterations=14 if ink_heavy else 12,
-            splice_threshold=30 if large_cel else (28 if ink_heavy else 35),
+            length_threshold=4.0 if routed_photo else (3.5 if ink_heavy else 3.6),
+            max_iterations=10 if routed_photo else (14 if ink_heavy else 12),
+            splice_threshold=45 if routed_photo else (28 if ink_heavy else 35),
             path_precision=4 if ink_heavy else 3,
             preserve_transparency=m.has_alpha,
             remove_background=illustration_remove,
@@ -1425,11 +1790,159 @@ def _bg_tolerance(m: ImageMetrics, *, binary: bool = False) -> int:
     return max(12, min(64, base))
 
 
+def _transparency_advice(image: Image.Image) -> TransparencyAdvice:
+    """Detect a GIF-like hard mask and whether edges blend toward a matte.
+
+    Flattening (composite onto a color) is separate from background knockout.
+    This only recommends which of those the user should pick.
+    """
+    rgba = np.asarray(image.convert("RGBA"), dtype=np.int16)
+    alpha = rgba[..., 3]
+    height, width = alpha.shape
+    if height < 2 or width < 2:
+        return TransparencyAdvice()
+    transparent = alpha <= 12
+    opaque = alpha >= 243
+    soft = ~transparent & ~opaque
+    trans_count = int(transparent.sum())
+    soft_count = int(soft.sum())
+    if trans_count < 8 and soft_count < 8:
+        return TransparencyAdvice()
+    hard_mask = trans_count >= 8 and soft_count <= max(4, int(0.004 * alpha.size))
+
+    padded = np.pad(~opaque, 1, mode="constant", constant_values=False)
+    touch = np.zeros(alpha.shape, dtype=bool)
+    for dy in range(3):
+        for dx in range(3):
+            if dy == 1 and dx == 1:
+                continue
+            touch |= padded[dy : dy + height, dx : dx + width]
+    rim = opaque & touch
+    interior = opaque & ~touch
+    if int(interior.sum()) < 4:
+        interior = opaque
+
+    def _median(mask: np.ndarray) -> tuple[int, int, int] | None:
+        if int(mask.sum()) < 4:
+            return None
+        med = np.median(rgba[..., :3][mask], axis=0)
+        return int(med[0]), int(med[1]), int(med[2])
+
+    def _dist(a: tuple[int, int, int], b: tuple[int, int, int]) -> int:
+        return abs(a[0] - b[0]) + abs(a[1] - b[1]) + abs(a[2] - b[2])
+
+    def _near_white(rgb: tuple[int, int, int]) -> bool:
+        return rgb[0] >= 220 and rgb[1] >= 220 and rgb[2] >= 220
+
+    white = (255, 255, 255)
+    interior_rgb = _median(interior)
+    recommendation = TransparencyRecommendation.LEAVE
+    blend_rgb: tuple[int, int, int] | None = None
+
+    if hard_mask:
+        near_white_frac = 0.0
+        far_frac = 0.0
+        far_rgb: tuple[int, int, int] | None = None
+        if int(rim.sum()) >= 4 and interior_rgb is not None:
+            rim_cols = rgba[..., :3][rim]
+            near_white_frac = float(
+                (
+                    (rim_cols[:, 0] >= 220)
+                    & (rim_cols[:, 1] >= 220)
+                    & (rim_cols[:, 2] >= 220)
+                ).mean()
+            )
+            delta = np.abs(rim_cols - np.asarray(interior_rgb, dtype=np.int16)).sum(axis=1)
+            far = delta >= 70
+            far_frac = float(far.mean())
+            if int(far.sum()) >= 4:
+                med = np.median(rim_cols[far], axis=0)
+                far_rgb = (int(med[0]), int(med[1]), int(med[2]))
+        interior_is_white = interior_rgb is not None and _near_white(interior_rgb)
+        if interior_rgb is not None and not interior_is_white and near_white_frac >= 0.12:
+            recommendation = TransparencyRecommendation.FLATTEN_WHITE
+            blend_rgb = white
+        elif (
+            far_rgb is not None
+            and far_frac >= 0.15
+            and interior_rgb is not None
+            and not interior_is_white
+        ):
+            if _near_white(far_rgb):
+                recommendation = TransparencyRecommendation.FLATTEN_WHITE
+                blend_rgb = white
+            else:
+                recommendation = TransparencyRecommendation.FLATTEN_CUSTOM
+                blend_rgb = far_rgb
+        else:
+            recommendation = TransparencyRecommendation.LEAVE
+    else:
+        soft_rgb = _median(soft)
+        if soft_rgb is None or (
+            interior_rgb is not None and _dist(soft_rgb, interior_rgb) <= 80
+        ):
+            recommendation = TransparencyRecommendation.LEAVE
+        elif _near_white(soft_rgb) or (
+            interior_rgb is not None
+            and _dist(soft_rgb, white) + 30 < _dist(soft_rgb, interior_rgb)
+        ):
+            recommendation = TransparencyRecommendation.FLATTEN_WHITE
+            blend_rgb = white
+        else:
+            recommendation = TransparencyRecommendation.FLATTEN_CUSTOM
+            blend_rgb = soft_rgb
+
+    return TransparencyAdvice(
+        hard_mask=hard_mask,
+        recommendation=recommendation,
+        blend_rgb=blend_rgb,
+        note=_transparency_note(hard_mask, recommendation, blend_rgb),
+    )
+
+
+def _transparency_note(
+    hard_mask: bool,
+    recommendation: TransparencyRecommendation,
+    blend_rgb: tuple[int, int, int] | None,
+) -> str:
+    if recommendation == TransparencyRecommendation.NONE:
+        return ""
+    hex_color = ""
+    if blend_rgb is not None:
+        hex_color = f"#{blend_rgb[0]:02x}{blend_rgb[1]:02x}{blend_rgb[2]:02x}"
+    if hard_mask and recommendation == TransparencyRecommendation.FLATTEN_WHITE:
+        return (
+            "Hard 1-bit alpha (GIF-style mask). Edges blend toward white — "
+            "flatten onto white instead of keeping the mask."
+        )
+    if hard_mask and recommendation == TransparencyRecommendation.FLATTEN_CUSTOM:
+        return (
+            f"Hard 1-bit alpha (GIF-style mask). Edges blend toward {hex_color} — "
+            "flatten onto that color."
+        )
+    if hard_mask:
+        return (
+            "Hard 1-bit alpha (GIF-style mask) with crisp edges. "
+            "Leaving transparency is appropriate."
+        )
+    if recommendation == TransparencyRecommendation.FLATTEN_WHITE:
+        return (
+            "Soft edges blend toward white rather than transparency. Flatten onto white."
+        )
+    if recommendation == TransparencyRecommendation.FLATTEN_CUSTOM:
+        return (
+            f"Soft edges blend toward {hex_color} rather than transparency. "
+            "Flatten onto that color."
+        )
+    return "Soft edges are true transparent anti-aliasing. Leave transparency on."
+
+
 def _build_notes(
     kind: ContentKind,
     m: ImageMetrics,
     quality: AutomaticQuality,
     suggested: TraceSettings,
+    transparency: TransparencyAdvice | None = None,
 ) -> list[str]:
     notes: list[str] = []
     labels = {
@@ -1475,8 +1988,11 @@ def _build_notes(
         notes.append(
             f"Scene background kept as fill (#{r:02x}{g:02x}{b:02x})."
         )
-    elif m.has_alpha:
+    elif m.has_alpha and not (transparency and transparency.note):
         notes.append("Source transparency will be preserved.")
+
+    if transparency and transparency.note:
+        notes.append(transparency.note)
 
     if suggested.hierarchical == HierarchyMode.CUTOUT:
         notes.append("Using cutout hierarchy so holes stay clean.")
@@ -1512,11 +2028,18 @@ def _build_notes(
         notes.append("Light noise smoothing enabled before tracing.")
 
     quality = AutomaticQuality(quality)
-    if quality == AutomaticQuality.FAST:
-        notes.append("Automatic quality: Fast — fewer paths, quicker result.")
+    photo_budget = _photo_shape_budget(kind, suggested.edge_treatment)
+    if photo_budget and quality == AutomaticQuality.FAST:
+        notes.append("Automatic quality: Fast — fewer, larger shapes.")
+    elif photo_budget and quality == AutomaticQuality.HIGH:
+        notes.append("Automatic quality: High detail — more, smaller shapes.")
+    elif photo_budget:
+        notes.append("Automatic quality: Balanced — medium shape budget.")
+    elif quality == AutomaticQuality.FAST:
+        notes.append("Automatic quality: Fast — wider noise and blend absorption.")
     elif quality == AutomaticQuality.HIGH:
-        notes.append("Automatic quality: High detail — finer colors and paths.")
+        notes.append("Automatic quality: High detail — about 1 px of edge blend.")
     else:
-        notes.append("Automatic quality: Balanced.")
+        notes.append("Automatic quality: Balanced — about 2 px of edge blend.")
 
     return notes

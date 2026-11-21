@@ -69,6 +69,41 @@ def export_png_preview(
     return path
 
 
+def linked_export_size(
+    source_width: int,
+    source_height: int,
+    *,
+    width: int | None = None,
+    height: int | None = None,
+    scale: float | None = None,
+) -> tuple[int, int, float]:
+    """Link PNG width, height, and scale to the source pixel size.
+
+    Pass one of ``width``, ``height``, or ``scale``. The other two follow the
+    source aspect ratio. ``scale`` is 1.0 at the source pixel size. When
+    ``scale`` is omitted and ``width`` drives the result, the returned scale is
+    ``width / source_width`` (height uses ``height / source_height``).
+    """
+    src_w = max(1, int(source_width))
+    src_h = max(1, int(source_height))
+    if scale is not None:
+        factor = float(scale)
+        if factor <= 0:
+            factor = 1.0 / float(src_w)
+        out_w = max(1, int(round(src_w * factor)))
+        out_h = max(1, int(round(src_h * factor)))
+        return out_w, out_h, factor
+    if width is not None:
+        out_w = max(1, int(width))
+        out_h = max(1, int(round(src_h * (out_w / float(src_w)))))
+        return out_w, out_h, out_w / float(src_w)
+    if height is not None:
+        out_h = max(1, int(height))
+        out_w = max(1, int(round(src_w * (out_h / float(src_h)))))
+        return out_w, out_h, out_h / float(src_h)
+    return src_w, src_h, 1.0
+
+
 def _resolve_size(
     src_w: int,
     src_h: int,

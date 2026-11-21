@@ -33,10 +33,19 @@ class SyncSideBySide(QWidget):
         row.addLayout(right_col, 1)
         self.left.view_changed.connect(lambda: self._mirror(self.left, self.right))
         self.right.view_changed.connect(lambda: self._mirror(self.right, self.left))
+        self._left_caption_key: str | None = None
+        self.retranslate_ui()
+
+    def set_left_caption(self, source: str | None) -> None:
+        """English source string for the left caption, or None for Original."""
+        self._left_caption_key = source
         self.retranslate_ui()
 
     def retranslate_ui(self) -> None:
-        self._left_label.setText(t("Original"))
+        if self._left_caption_key:
+            self._left_label.setText(t(self._left_caption_key))
+        else:
+            self._left_label.setText(t("Original"))
         self._right_label.setText(t("Vector"))
 
     def _mirror(self, source: ImageCanvas, target: ImageCanvas) -> None:
@@ -76,10 +85,19 @@ class SplitCompare(QWidget):
         layout.addWidget(self.preview, 1)
         layout.addLayout(slider_row)
         self.slider.valueChanged.connect(self._refresh)
+        self._left_caption_key: str | None = None
+        self.retranslate_ui()
+
+    def set_left_caption(self, source: str | None) -> None:
+        """English source string for the left wipe caption, or None for Original."""
+        self._left_caption_key = source
         self.retranslate_ui()
 
     def retranslate_ui(self) -> None:
-        self._wipe_left.setText(t("Original"))
+        if self._left_caption_key:
+            self._wipe_left.setText(t(self._left_caption_key))
+        else:
+            self._wipe_left.setText(t("Original"))
         self._wipe_right.setText(t("Vector"))
         self.slider.setToolTip(
             t("Drag to wipe between original (left) and vector (right).")

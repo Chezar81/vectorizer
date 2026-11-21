@@ -33,6 +33,7 @@ from vectorizer.segmentation.ops import (
     pick_color,
     remove_small_regions,
     separate_with_stroke,
+    zap_component,
     zap_fringes,
 )
 
@@ -42,6 +43,7 @@ class SegTool(str, Enum):
     BRUSH = "brush"
     FILL = "fill"
     RECOLOR = "recolor"
+    ZAP = "zap"  # click a component and dissolve it into its neighbors
     ERASER = "eraser"  # transparent cut / separate
     JOIN = "join"  # brush with current color (connect)
 
@@ -117,6 +119,7 @@ class SegmentationEditor(QWidget):
             SegTool.BRUSH: "Brush",
             SegTool.FILL: "Fill",
             SegTool.RECOLOR: "Recolor",
+            SegTool.ZAP: "Zap",
             SegTool.JOIN: "Connect",
             SegTool.ERASER: "Separate",
         }
@@ -195,7 +198,10 @@ class SegmentationEditor(QWidget):
         self._zap_act.setToolTip(zap_tip)
         self.find_btn.setText(t("Find problems"))
         self._find_act.setText(t("Find problems"))
-        find_tip = t("Mark one-pixel gaps and pinched strokes so you can paint them closed.")
+        find_tip = t(
+            "Mark one-pixel gaps and pinched strokes. Paint across a gap so regions "
+            "connect; open a one-pixel gap on a pinch to separate them."
+        )
         self.find_btn.setToolTip(find_tip)
         self._find_act.setToolTip(find_tip)
         self.cleanup_btn.setText(t("Clean up"))
@@ -235,6 +241,7 @@ class SegmentationEditor(QWidget):
                 SegTool.BRUSH: "Paint with the current color.",
                 SegTool.FILL: "Flood-fill a contiguous region.",
                 SegTool.RECOLOR: "Recolor the clicked region.",
+                SegTool.ZAP: "Dissolve the clicked segment into the neighboring colors.",
                 SegTool.JOIN: "Paint a bridge to connect separated regions of the current color.",
                 SegTool.ERASER: "Paint transparency to separate accidentally connected regions.",
             }[tool]
@@ -354,6 +361,7 @@ class SegmentationEditor(QWidget):
             return
         self._problems = []
         self._commit(remove_small_regions(self._map, self.small_spin.value()))
+        self.status_message.emit(t("Removed small regions from the segmentation."))
 
     def _zap(self) -> None:
         if self._map is None:
@@ -368,12 +376,15 @@ class SegmentationEditor(QWidget):
             return
         self._problems = find_problems(self._map)
         self.canvas.update()
+        if not self._problems:
+            self.status_message.emit(t("No pinched gaps found."))
+            return
         self.status_message.emit(
-            t("No pinched gaps found.")
-            if not self._problems
-            else t("Problem spots are marked. Paint across a pinch or gap, then retrace.")
+            t(
+                "Problem spots are marked. Paint across a one-pixel gap so regions "
+                "connect. Open a one-pixel gap on a pinch to keep those regions separate."
+            )
         )
-        self.status_message.emit(t("Removed small regions from the segmentation."))
 
     def fit_view(self) -> None:
         if self._map is None:
@@ -418,8 +429,23 @@ class SegmentationEditor(QWidget):
         if self._tool in {SegTool.FILL, SegTool.RECOLOR}:
             self._commit(flood_fill(self._map, x, y, self._color))
             return
+        if self._tool == SegTool.ZAP:
+            self._zap_at(x, y)
+            return
         self._drawing = True
         self._stroke = [pixel]
+
+    def _zap_at(self, x: int, y: int) -> None:
+        if self._map is None:
+            return
+        before = pick_color(self._map, x, y)
+        updated = zap_component(self._map, x, y)
+        if pick_color(updated, x, y) == before:
+            self.status_message.emit(t("Nothing to zap here."))
+            return
+        self._problems = []
+        self._commit(updated)
+        self.status_message.emit(t("Clicked segment split into neighboring colors."))
 
     def _on_move(self, pos: QPoint) -> None:
         if self._panning:

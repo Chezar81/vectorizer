@@ -64,6 +64,46 @@ def _fill_from_attrib(attrib: dict[str, str]) -> FillStyle | None:
     return FillStyle(color=fill, opacity=opacity)
 
 
+def _circle_to_path_d(element: ET.Element) -> str:
+    cx = _parse_length(element.get("cx") or "0") or 0.0
+    cy = _parse_length(element.get("cy") or "0") or 0.0
+    r = _parse_length(element.get("r") or "0") or 0.0
+    if r <= 0:
+        return ""
+    x0, x1 = cx - r, cx + r
+    return (
+        f"M {x0:.4g} {cy:.4g} "
+        f"A {r:.4g} {r:.4g} 0 0 1 {x1:.4g} {cy:.4g} "
+        f"A {r:.4g} {r:.4g} 0 0 1 {x0:.4g} {cy:.4g} Z"
+    )
+
+
+def _ellipse_to_path_d(element: ET.Element) -> str:
+    cx = _parse_length(element.get("cx") or "0") or 0.0
+    cy = _parse_length(element.get("cy") or "0") or 0.0
+    rx = _parse_length(element.get("rx") or "0") or 0.0
+    ry = _parse_length(element.get("ry") or "0") or 0.0
+    if rx <= 0 or ry <= 0:
+        return ""
+    x0, x1 = cx - rx, cx + rx
+    return (
+        f"M {x0:.4g} {cy:.4g} "
+        f"A {rx:.4g} {ry:.4g} 0 0 1 {x1:.4g} {cy:.4g} "
+        f"A {rx:.4g} {ry:.4g} 0 0 1 {x0:.4g} {cy:.4g} Z"
+    )
+
+
+def _rect_to_path_d(element: ET.Element) -> str:
+    x = _parse_length(element.get("x") or "0") or 0.0
+    y = _parse_length(element.get("y") or "0") or 0.0
+    width = _parse_length(element.get("width") or "0") or 0.0
+    height = _parse_length(element.get("height") or "0") or 0.0
+    if width <= 0 or height <= 0:
+        return ""
+    x1, y1 = x + width, y + height
+    return f"M {x:.4g} {y:.4g} L {x1:.4g} {y:.4g} L {x1:.4g} {y1:.4g} L {x:.4g} {y1:.4g} Z"
+
+
 def parse_svg_document(svg_text: str, *, backend_name: str) -> VectorDocument:
     if not svg_text or not svg_text.strip():
         raise SvgParseError("Backend returned empty SVG.")
@@ -88,9 +128,16 @@ def parse_svg_document(svg_text: str, *, backend_name: str) -> VectorDocument:
     grouped: dict[str, list[VectorPath]] = defaultdict(list)
     order = 0
     for element in root.iter():
-        if _local(element.tag) != "path":
-            continue
-        d = (element.get("d") or "").strip()
+        tag = _local(element.tag)
+        d = ""
+        if tag == "path":
+            d = (element.get("d") or "").strip()
+        elif tag == "circle":
+            d = _circle_to_path_d(element)
+        elif tag == "rect":
+            d = _rect_to_path_d(element)
+        elif tag == "ellipse":
+            d = _ellipse_to_path_d(element)
         if not d:
             continue
         fill = _fill_from_attrib(element.attrib)
@@ -111,7 +158,7 @@ def parse_svg_document(svg_text: str, *, backend_name: str) -> VectorDocument:
     )
     notes = ()
     if order == 0:
-        notes = ("SVG parsed but contained no <path> elements.",)
+        notes = ("SVG parsed but contained no drawable shape elements.",)
 
     return VectorDocument(
         width=width,

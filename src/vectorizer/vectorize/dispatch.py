@@ -86,24 +86,37 @@ def trace_prepared(
         working = _vtracer_input(image, validated, palette)
         tuned = validated
         if palette:
+            # Photo quality is an output shape budget already stored on
+            # target_colors / filter_speckle / layer_difference. The caps
+            # below only protect cel ink; they are not the artwork blend-width
+            # adjustment (that stays on the blend tracer).
             # Cel ink prep already quantized fills; keep layers tight so thin
             # outlines are not merged into neighbouring flats.
             layer_cap = 4 if _palette_has_cel_ink(palette) else 6
+            # Small cel badges keep a 1 px speckle floor so hairlines survive.
+            # Large scenes do not: the analyzer's floor is what stops JPEG
+            # freckles from becoming one path each.
+            speckle = validated.filter_speckle
+            if _palette_has_cel_ink(palette) and image.width * image.height < 180_000:
+                speckle = min(speckle, 1)
             tuned = replace(
                 validated,
                 color_precision=8,
                 layer_difference=min(validated.layer_difference, layer_cap),
-                filter_speckle=min(validated.filter_speckle, 1)
-                if _palette_has_cel_ink(palette)
-                else validated.filter_speckle,
+                filter_speckle=speckle,
             )
         report(STAGE_CONTOURS, 0.30)
         result = VTracerBackend().trace(
             working, tuned, on_progress=_scaled_progress(report, 0.30, 0.90)
         )
-        if palette:
+        if palette or validated.palette_remaps:
             report(STAGE_SVG, 0.93)
-            snapped = snap_fills_to_palette(result.document, palette)
+            snapped = snap_fills_to_palette(
+                result.document,
+                palette or (),
+                tolerance=validated.palette_tolerance,
+                remaps=validated.palette_remaps,
+            )
             return _with_progress_tail(
                 replace(result, document=snapped, settings=validated), report
             )
@@ -147,9 +160,14 @@ def trace_prepared(
     result = VTracerBackend().trace(
         working, tuned, on_progress=_scaled_progress(report, 0.30, 0.90)
     )
-    if palette:
+    if palette or validated.palette_remaps:
         report(STAGE_SVG, 0.93)
-        snapped = snap_fills_to_palette(result.document, palette)
+        snapped = snap_fills_to_palette(
+            result.document,
+            palette or (),
+            tolerance=validated.palette_tolerance,
+            remaps=validated.palette_remaps,
+        )
         return _with_progress_tail(
             replace(result, document=snapped, settings=validated), report
         )
@@ -258,19 +276,24 @@ def _vtracer_input(
         working = preprocess_image(image, settings)
     else:
         working = image.convert("RGBA")
-    if not palette:
+    if not palette and not settings.palette_remaps:
         return working
     # Ink-heavy cel scenes: solidify outlines before the hard snap so JPEG
     # browns do not dissolve into orange fills and VTracer keeps continuous ink.
-    if _palette_has_cel_ink(palette) and (
+    if palette and _palette_has_cel_ink(palette) and (
         settings.filter_speckle <= 1 and settings.target_colors == 0
     ):
         from vectorizer.raster.color import hex_to_rgb
         from vectorizer.raster.preprocess import prepare_cel_ink
 
         ink = _darkest_palette_rgb(palette)
-        return prepare_cel_ink(working, palette, ink_rgb=ink)
-    return snap_image_to_palette(working, palette)
+        working = prepare_cel_ink(working, palette, ink_rgb=ink)
+    return snap_image_to_palette(
+        working,
+        palette or (),
+        tolerance=settings.palette_tolerance,
+        remaps=settings.palette_remaps,
+    )
 
 
 def _palette_has_cel_ink(palette: tuple[str, ...]) -> bool:
@@ -312,5 +335,17 @@ def _scaled_progress(
 
 def _with_progress_tail(result: TraceResult, report: ProgressCallback) -> TraceResult:
     report(STAGE_CURVES if result.backend_name != "vtracer" else STAGE_SVG, 0.95)
+    settings = result.settings
+    # Only unlimited traces (no locked palette, target_colors 0). Default off.
+    if (
+        settings.cluster_similar_colors
+        and not settings.palette
+        and int(settings.target_colors) == 0
+    ):
+        from vectorizer.svg.edit import cluster_similar_fills
+
+        clustered = cluster_similar_fills(result.document)
+        if clustered is not result.document:
+            result = replace(result, document=clustered)
     report(STAGE_FINALIZE, 1.0)
     return result

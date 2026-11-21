@@ -14,7 +14,8 @@ def preprocess_image(image: Image.Image, settings: TraceSettings) -> Image.Image
     - scrub chroma-key fringe (magenta/near-transparent junk)
     - solidify near-black transparent mattes (icon “black backgrounds”)
     - optional flattening of existing alpha when preserve_transparency is False
-    - optional background removal by color + tolerance
+      (composite onto background_*; this is not background knockout)
+    - optional background removal by color + tolerance (remove_background only)
     - optional light noise smoothing (median) while preserving alpha
     - optional color quantization (soft palette / target color count, no dither)
     """
@@ -746,6 +747,19 @@ def scrub_chroma_key_alpha(image: Image.Image) -> Image.Image:
     soft = (alpha2 >= 16) & (alpha2 < 96)
     if np.any(soft):
         promote = soft & (alpha2 >= 48)
+        # Translucent pure black away from opaque dark ink is an app-icon drop
+        # shadow; promoting it invents a solid black ink ring.
+        dark = np.maximum(np.maximum(r, g), b) <= 24
+        ink = dark & (alpha2 >= 96)
+        padded_ink = np.pad(ink, 1, constant_values=False)
+        near_ink = (
+            ink
+            | padded_ink[:-2, 1:-1]
+            | padded_ink[2:, 1:-1]
+            | padded_ink[1:-1, :-2]
+            | padded_ink[1:-1, 2:]
+        )
+        promote &= ~(dark & ~near_ink)
         clear = soft & ~promote
         out[clear, 3] = 0
         out[promote, 3] = 255
@@ -805,15 +819,24 @@ def solidify_black_matte(image: Image.Image) -> Image.Image:
     threshold = 0.55 if opaque_ratio <= 0.35 else 0.70
     if float(dark_matte.mean()) < threshold:
         return image.convert("RGBA")
-    # Cutout badges/crests (colourful opaque subject + empty corners) must keep
-    # real transparency. Only solidify when the mark is sparse or itself mostly
-    # near-black (ChatGPT / Brave style black mattes).
+    # Colourful cutouts (YouTube red, Brave orange, Dropbox blue) often store
+    # empty corners as RGBA(0,0,0,0). Solidifying those into an opaque black
+    # canvas paints a full-bleed black underlay and destroys RMSE/look.
+    # Only bake the matte when the *opaque* subject itself is mostly near-black
+    # (sparse dark glyphs on a transparent black canvas).
     opaque = rgba[alpha >= 128, :3].astype(np.int16)
-    if opaque_ratio >= 0.50 and len(opaque):
+    if len(opaque):
         opaque_luma = (
             0.299 * opaque[:, 0] + 0.587 * opaque[:, 1] + 0.114 * opaque[:, 2]
         )
-        if float((opaque_luma <= 55).mean()) < 0.55:
+        dark_opaque_share = float((opaque_luma <= 55).mean())
+        if dark_opaque_share < 0.55:
+            return image.convert("RGBA")
+        # Dark rounded badges (ChatGPT-style) already own most of the frame as
+        # opaque near-black. Transparent corners are the silhouette, not a matte
+        # to bake — solidifying them squares off the cutout and tanks RMSE on
+        # white composites.
+        if opaque_ratio >= 0.50:
             return image.convert("RGBA")
     out = rgba.copy()
     ys, xs = np.nonzero(transparent)

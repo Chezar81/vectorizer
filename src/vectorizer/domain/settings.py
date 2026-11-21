@@ -14,11 +14,27 @@ class WorkflowMode(str, Enum):
 
 
 class AutomaticQuality(str, Enum):
-    """Quality presets used only while workflow is Automatic."""
+    """Quality presets used only while workflow is Automatic.
+
+    The same three labels mean different things by image type. For blended or
+    hard artwork they describe the input (noise and blend width). For
+    photographs they describe the output (how many shapes to keep).
+    """
 
     FAST = "fast"
     BALANCED = "balanced"
     HIGH = "high"
+
+
+class AaArtifactRejection(str, Enum):
+    """How hard to drop anti-aliased fringe that is not a real feature.
+
+    This is not a minimum-pixel filter; `filter_speckle` already covers that.
+    """
+
+    NONE = "none"
+    MODERATE = "moderate"
+    AGGRESSIVE = "aggressive"
 
 
 class ColorMode(str, Enum):
@@ -47,17 +63,49 @@ class EdgeTreatment(str, Enum):
 
 
 class SvgPaintStyle(str, Enum):
-    """Export paint. Stroke+fill hides hairline gaps between adjacent fills."""
+    """Export paint style for SVG (and SVG-derived previews).
+
+    FILL — filled shapes only.
+    STROKE_FILL — fill plus a same-color hairline (simple gap workaround).
+    GAP_FILLER — filled shapes over average-color understrokes along shared edges.
+    STROKE_EDGES — one stroke per shared edge, no fills (laser / vinyl cutting).
+    """
 
     FILL = "fill"
     STROKE_FILL = "stroke_fill"
+    GAP_FILLER = "gap_filler"
+    STROKE_EDGES = "stroke_edges"
 
 
 class DxfCurveMode(str, Enum):
-    """DXF geometry. Fills are omitted in both modes."""
+    """DXF geometry. Fills are omitted in every mode."""
 
     LINES = "lines"
+    LINES_AND_ARCS = "lines_and_arcs"
     SPLINES = "splines"
+
+
+class DxfLineDensity(str, Enum):
+    """Sample count for LINES mode only.
+
+    Lines-and-arcs and splines keep their own geometry and ignore this.
+    """
+
+    FEW = "few"
+    NORMAL = "normal"
+    MANY = "many"
+
+
+class EpsCompatibility(str, Enum):
+    """PostScript level Inkscape uses for EPS.
+
+    COMPACT is Level 3 (smaller files; Inkscape's own default, so existing
+    EPS output stays the same size). COMPATIBLE is Level 2, which opens in
+    more tools.
+    """
+
+    COMPACT = "compact"
+    COMPATIBLE = "compatible"
 
 
 @dataclass(frozen=True)
@@ -101,8 +149,36 @@ class TraceSettings:
     edge_treatment: EdgeTreatment = EdgeTreatment.AUTO
     # Exact output colors. Empty means the tracer may choose.
     palette: tuple[str, ...] = ()
+    # Max sRGB distance (0–255) for palette snap. 255 = always snap (legacy).
+    # Lower values leave unmatched fringe colors unchanged until remapped/removed.
+    palette_tolerance: int = 255
+    # Optional (source, target) remaps applied after snap. Target #00000000 drops.
+    palette_remaps: tuple[tuple[str, str], ...] = ()
     svg_paint_style: SvgPaintStyle = SvgPaintStyle.FILL
+    # Gap-filler / stroke-edge stroke width in CSS px (used by GAP_FILLER + STROKE_EDGES).
+    gap_filler_width: float = 2.0
+    gap_filler_non_scaling: bool = True
+    # Prefer native circle/rect geometry when a contour fits (blend/gradient tracers).
+    parameterized_shapes: bool = True
     dxf_curve_mode: DxfCurveMode = DxfCurveMode.LINES
+    # LINES mode only: few ≈ 4 samples, normal ≈ 8 (historic default), many ≈ 16.
+    dxf_line_density: DxfLineDensity = DxfLineDensity.NORMAL
+    eps_compatibility: EpsCompatibility = EpsCompatibility.COMPACT
+    # Post-pass for unlimited traces (empty palette and target_colors == 0).
+    # Off by default: Automatic free-color already snaps to a suggested palette
+    # when it has one, and merging near-duplicate fills without a request would
+    # hide intentional steps. Medium OKLab radius lives in svg.edit.
+    cluster_similar_colors: bool = False
+    # 0 = loader default (GUI prompts, CLI/batch reject past ~25 megapixels).
+    # A positive value shrinks the working copy; the source file is unchanged.
+    max_side: int = 0
+    # Curve follow vs wiggle flattening. 0 hugs pixels, 100 flattens them.
+    # Scales blend fit tolerance/blur and the VTracer length threshold.
+    # `path_precision` stays decimal places and is not a smoothness control.
+    contour_smoothness: int = 50
+    # Post-fit node density. Higher keeps more nodes (less Douglas–Peucker).
+    node_budget: int = 50
+    aa_artifact_rejection: AaArtifactRejection = AaArtifactRejection.MODERATE
 
     def background_rgb_tuple(self) -> tuple[int, int, int]:
         return (int(self.background_r), int(self.background_g), int(self.background_b))
@@ -136,7 +212,18 @@ class TraceSettings:
             errors.append("background_tolerance must be between 0 and 255")
         if not (0 <= int(self.target_colors) <= 256):
             errors.append("target_colors must be between 0 and 256 (0 = off)")
+        if not (0 <= int(self.palette_tolerance) <= 255):
+            errors.append("palette_tolerance must be between 0 and 255")
+        if not (0.0 <= float(self.gap_filler_width) <= 5.0):
+            errors.append("gap_filler_width must be between 0 and 5")
+        if not (0 <= int(self.contour_smoothness) <= 100):
+            errors.append("contour_smoothness must be between 0 and 100")
+        if not (0 <= int(self.node_budget) <= 100):
+            errors.append("node_budget must be between 0 and 100")
+        if not (0 <= int(self.max_side) <= 16384):
+            errors.append("max_side must be between 0 and 16384 (0 = prompt)")
         palette = _normalize_palette(self.palette, errors)
+        remaps = _normalize_remaps(self.palette_remaps, errors)
         if errors:
             raise ValueError("; ".join(errors))
         return replace(
@@ -165,8 +252,20 @@ class TraceSettings:
             apply_preprocess=bool(self.apply_preprocess),
             edge_treatment=EdgeTreatment(self.edge_treatment),
             palette=palette,
+            palette_tolerance=int(self.palette_tolerance),
+            palette_remaps=remaps,
             svg_paint_style=SvgPaintStyle(self.svg_paint_style),
+            gap_filler_width=float(self.gap_filler_width),
+            gap_filler_non_scaling=bool(self.gap_filler_non_scaling),
+            parameterized_shapes=bool(self.parameterized_shapes),
             dxf_curve_mode=DxfCurveMode(self.dxf_curve_mode),
+            dxf_line_density=DxfLineDensity(self.dxf_line_density),
+            eps_compatibility=EpsCompatibility(self.eps_compatibility),
+            cluster_similar_colors=bool(self.cluster_similar_colors),
+            max_side=int(self.max_side),
+            contour_smoothness=int(self.contour_smoothness),
+            node_budget=int(self.node_budget),
+            aa_artifact_rejection=AaArtifactRejection(self.aa_artifact_rejection),
         )
 
     def to_backend_kwargs(self) -> dict[str, Any]:
@@ -179,7 +278,9 @@ class TraceSettings:
             "color_precision": s.color_precision,
             "layer_difference": s.layer_difference,
             "corner_threshold": s.corner_threshold,
-            "length_threshold": s.length_threshold,
+            "length_threshold": scaled_length_threshold(
+                s.length_threshold, s.contour_smoothness
+            ),
             "max_iterations": s.max_iterations,
             "splice_threshold": s.splice_threshold,
             "path_precision": s.path_precision,
@@ -195,7 +296,11 @@ class TraceSettings:
         data["edge_treatment"] = self.edge_treatment.value
         data["svg_paint_style"] = self.svg_paint_style.value
         data["dxf_curve_mode"] = self.dxf_curve_mode.value
+        data["dxf_line_density"] = DxfLineDensity(self.dxf_line_density).value
+        data["eps_compatibility"] = EpsCompatibility(self.eps_compatibility).value
+        data["aa_artifact_rejection"] = AaArtifactRejection(self.aa_artifact_rejection).value
         data["palette"] = list(self.palette)
+        data["palette_remaps"] = [list(pair) for pair in self.palette_remaps]
         return data
 
     @classmethod
@@ -222,10 +327,56 @@ class TraceSettings:
             kwargs["svg_paint_style"] = SvgPaintStyle(kwargs["svg_paint_style"])
         if "dxf_curve_mode" in kwargs:
             kwargs["dxf_curve_mode"] = DxfCurveMode(kwargs["dxf_curve_mode"])
+        if "dxf_line_density" in kwargs:
+            kwargs["dxf_line_density"] = DxfLineDensity(kwargs["dxf_line_density"])
+        if "eps_compatibility" in kwargs:
+            kwargs["eps_compatibility"] = EpsCompatibility(kwargs["eps_compatibility"])
+        if "aa_artifact_rejection" in kwargs:
+            kwargs["aa_artifact_rejection"] = AaArtifactRejection(kwargs["aa_artifact_rejection"])
         if "palette" in kwargs:
             raw = kwargs["palette"] or ()
             kwargs["palette"] = tuple(str(item) for item in raw)
+        if "palette_remaps" in kwargs:
+            raw_maps = kwargs["palette_remaps"] or ()
+            pairs: list[tuple[str, str]] = []
+            for item in raw_maps:
+                if isinstance(item, (list, tuple)) and len(item) >= 2:
+                    pairs.append((str(item[0]), str(item[1])))
+            kwargs["palette_remaps"] = tuple(pairs)
         return cls(**kwargs).validated()
+
+
+def artwork_input_width_px(quality: AutomaticQuality | str) -> int:
+    """Input noise/blend width that Automatic quality means for artwork.
+
+    High is about 1 px, balanced (the default for uncertain artwork) about 2 px,
+    and fast is wider than 2 px. Photographs do not use this width; their
+    quality is an output shape budget.
+    """
+    quality = AutomaticQuality(quality)
+    if quality == AutomaticQuality.HIGH:
+        return 1
+    if quality == AutomaticQuality.FAST:
+        return 4
+    return 2
+
+
+def scaled_length_threshold(length_threshold: float, contour_smoothness: int) -> float:
+    """Map contour smoothness 0–100 onto VTracer's 3.5–10 length threshold.
+
+    Smoothness 50 keeps `length_threshold` (the recipe / slider value). Lower
+    follows pixels more tightly; higher flattens wiggles. Decimal
+    `path_precision` is unrelated.
+    """
+    smoothness = max(0, min(100, int(contour_smoothness)))
+    base = min(10.0, max(3.5, float(length_threshold)))
+    if smoothness <= 50:
+        t = smoothness / 50.0
+        value = 3.5 + t * (base - 3.5)
+    else:
+        t = (smoothness - 50) / 50.0
+        value = base + t * (10.0 - base)
+    return max(3.5, min(10.0, value))
 
 
 def _normalize_palette(palette: tuple[str, ...] | list[str], errors: list[str]) -> tuple[str, ...]:
@@ -243,12 +394,54 @@ def _normalize_palette(palette: tuple[str, ...] | list[str], errors: list[str]) 
     return tuple(normalized)
 
 
+def _normalize_remaps(
+    remaps: tuple[tuple[str, str], ...] | list[tuple[str, str]] | list[list[str]],
+    errors: list[str],
+) -> tuple[tuple[str, str], ...]:
+    if not remaps:
+        return ()
+    if len(remaps) > 64:
+        errors.append("palette_remaps supports at most 64 entries")
+        return ()
+    out: list[tuple[str, str]] = []
+    for item in remaps:
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            errors.append(f"palette remap must be [from, to], got {item!r}")
+            continue
+        try:
+            source = normalize_hex(str(item[0]))
+            target = normalize_hex_or_transparent(str(item[1]))
+        except ValueError as exc:
+            errors.append(str(exc))
+            continue
+        out.append((source, target))
+    return tuple(out)
+
+
 def normalize_hex(value: str) -> str:
     text = value.strip().lower()
     if text.startswith("#"):
         text = text[1:]
     if len(text) == 3:
         text = "".join(ch * 2 for ch in text)
+    if len(text) != 6 or any(ch not in "0123456789abcdef" for ch in text):
+        raise ValueError(f"invalid color {value!r}")
+    return f"#{text}"
+
+
+def normalize_hex_or_transparent(value: str) -> str:
+    """Accept #rrggbb or #rrggbbaa (00 alpha means drop / transparent)."""
+    text = value.strip().lower()
+    if text.startswith("#"):
+        text = text[1:]
+    if len(text) == 3:
+        text = "".join(ch * 2 for ch in text)
+    if len(text) == 8:
+        if any(ch not in "0123456789abcdef" for ch in text):
+            raise ValueError(f"invalid color {value!r}")
+        if text[6:] == "00":
+            return "#00000000"
+        return f"#{text[:6]}"
     if len(text) != 6 or any(ch not in "0123456789abcdef" for ch in text):
         raise ValueError(f"invalid color {value!r}")
     return f"#{text}"

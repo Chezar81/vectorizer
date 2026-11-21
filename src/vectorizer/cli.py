@@ -66,6 +66,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--preset", help="Named preset for settings")
     parser.add_argument("--settings-json", help="Path to TraceSettings JSON")
+    parser.add_argument(
+        "--max-side",
+        type=int,
+        default=0,
+        help="Shrink the working copy so the long side is at most this many pixels. "
+        "0 rejects images over about 25 megapixels and prints a recommended side.",
+    )
     parser.add_argument("--stop-on-error", action="store_true")
     parser.add_argument("--version", action="store_true")
     args = parser.parse_args(raw)
@@ -80,7 +87,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.output:
         if not args.image:
             parser.error("an input image is required with --output")
-        loaded = load_image(args.image)
+        max_side = _cli_max_side(args)
+        loaded = load_image(args.image, max_side=max_side, shrink=max_side > 0)
         settings = _settings_from_args(args, loaded)
         result = run_trace_sync(loaded.image, settings)
         dest = export_svg(result.document, Path(args.output))
@@ -112,7 +120,27 @@ def _settings_from_args(args: argparse.Namespace, loaded=None) -> TraceSettings:
         payload["colormode"] = ColorMode.BINARY.value
     if args.polygon:
         payload["mode"] = PathFitMode.POLYGON.value
+    if int(getattr(args, "max_side", 0) or 0) > 0:
+        payload["max_side"] = int(args.max_side)
     return TraceSettings.from_mapping(payload)
+
+
+def _cli_max_side(args: argparse.Namespace) -> int:
+    """`--max-side` wins; otherwise a settings JSON `max_side` is used."""
+    flag = int(getattr(args, "max_side", 0) or 0)
+    if flag > 0:
+        return flag
+    path = getattr(args, "settings_json", None)
+    if not path:
+        return 0
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return 0
+    try:
+        return max(0, int(data.get("max_side") or 0))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _run_batch_cli(args: argparse.Namespace) -> int:
@@ -135,6 +163,7 @@ def _run_batch_cli(args: argparse.Namespace) -> int:
         formats=formats,
         collision=CollisionPolicy(args.collision),
         continue_on_error=not args.stop_on_error,
+        max_side=int(settings.max_side or 0),
     )
     summary = run_batch(job)
     print(

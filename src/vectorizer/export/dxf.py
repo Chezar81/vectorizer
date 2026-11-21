@@ -20,10 +20,24 @@ import tempfile
 from pathlib import Path
 
 from vectorizer.domain.document import VectorDocument, VectorPath
-from vectorizer.domain.settings import DxfCurveMode
+from vectorizer.domain.settings import DxfCurveMode, DxfLineDensity
 from vectorizer.errors import ExportError
 
 _COMMANDS = set("MmLlHhVvCcSsQqTtAaZz")
+
+
+def dxf_line_samples(density: DxfLineDensity | str) -> int:
+    """Polyline samples per curve span for LINES mode.
+
+    Few is about 4, normal keeps the historic default of 8, many is about 16.
+    Lines-and-arcs and splines do not use this count.
+    """
+    density = DxfLineDensity(density)
+    if density == DxfLineDensity.FEW:
+        return 4
+    if density == DxfLineDensity.MANY:
+        return 16
+    return 8
 
 
 def export_dxf(
@@ -34,16 +48,21 @@ def export_dxf(
     decimals: int = 3,
     flip_y: bool = True,
     curve_mode: DxfCurveMode | str = DxfCurveMode.LINES,
+    line_density: DxfLineDensity | str | None = None,
 ) -> Path:
     path = Path(destination)
     if path.exists() and path.is_dir():
         raise ExportError(f"Refusing to overwrite a directory: {path}")
     if not document.groups:
         raise ExportError("There is no vector geometry to export as DXF.")
+    mode = DxfCurveMode(curve_mode)
+    # Density overrides the sample count only for LINES. Arcs and splines keep
+    # `curve_segments` (default 8) so those modes stay unchanged.
+    if line_density is not None and mode == DxfCurveMode.LINES:
+        curve_segments = dxf_line_samples(line_density)
     curve_segments = max(2, min(64, int(curve_segments)))
     decimals = max(0, min(8, int(decimals)))
     height = float(document.height) or 0.0
-    mode = DxfCurveMode(curve_mode)
 
     entities: list[str] = []
     handle = 100
@@ -52,6 +71,17 @@ def export_dxf(
             tx, ty = _parse_translate(vp.transform)
             if mode == DxfCurveMode.SPLINES:
                 chunk, handle = _spline_entities(
+                    vp,
+                    handle=handle,
+                    decimals=decimals,
+                    flip_y=flip_y,
+                    height=height,
+                    translate=(tx, ty),
+                    curve_segments=curve_segments,
+                )
+                entities.extend(chunk)
+            elif mode == DxfCurveMode.LINES_AND_ARCS:
+                chunk, handle = _line_arc_entities(
                     vp,
                     handle=handle,
                     decimals=decimals,
@@ -80,7 +110,12 @@ def export_dxf(
     if not entities:
         raise ExportError("No convertible path geometry was found for DXF.")
 
-    payload = _wrap_dxf(entities, version="AC1015" if mode == DxfCurveMode.SPLINES else "AC1009")
+    version = "AC1009"
+    if mode == DxfCurveMode.SPLINES:
+        version = "AC1015"
+    elif mode == DxfCurveMode.LINES_AND_ARCS:
+        version = "AC1015"
+    payload = _wrap_dxf(entities, version=version)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix=".vectorizer-", suffix=".dxf", dir=str(path.parent))
     try:
@@ -147,15 +182,122 @@ def _spline_entities(
     return entities, handle
 
 
+def _line_arc_entities(
+    path: VectorPath,
+    *,
+    handle: int,
+    decimals: int,
+    flip_y: bool,
+    height: float,
+    translate: tuple[float, float],
+    curve_segments: int,
+) -> tuple[list[str], int]:
+    """Emit LINE + circular ARC. Ellipses/cubics fall back to sampled lines."""
+    entities: list[str] = []
+    tx, ty = translate
+
+    def place(point: tuple[float, float]) -> tuple[float, float]:
+        x, y = point
+        if flip_y:
+            y = height - y
+        x += tx
+        y += -ty if flip_y else ty
+        return x, y
+
+    for kind, payload in _path_primitives(
+        path.d, curve_segments=curve_segments, keep_circular_arcs=True
+    ):
+        if kind == "arc":
+            # payload: (cx, cy, radius, start_deg_svg, end_deg_svg, sweep_ccw_svg)
+            cx, cy, radius, start_deg, end_deg, sweep_ccw = payload
+            centre = place((cx, cy))
+            # Y-flip reverses the arc direction: SVG CCW becomes CAD CW.
+            if flip_y:
+                start_deg = -start_deg
+                end_deg = -end_deg
+                sweep_ccw = not sweep_ccw
+            start_deg = _norm_deg(start_deg)
+            end_deg = _norm_deg(end_deg)
+            # DXF ARC always goes CCW from start to end.
+            if not sweep_ccw:
+                start_deg, end_deg = end_deg, start_deg
+            entities.append(
+                _arc_entity(
+                    centre,
+                    float(radius),
+                    start_deg,
+                    end_deg,
+                    handle=handle,
+                    decimals=decimals,
+                )
+            )
+            handle += 1
+            continue
+        mapped = [place(point) for point in payload]
+        if kind == "line" and len(mapped) >= 2:
+            entities.append(_line_entity(mapped[0], mapped[1], handle=handle, decimals=decimals))
+            handle += 1
+        elif kind == "cubic" and len(mapped) == 4:
+            # Approximate cubic with short line segments.
+            samples = _sample_curve(mapped[0], [mapped[1], mapped[2]], mapped[3], curve_segments)
+            prev = mapped[0]
+            for point in samples:
+                entities.append(_line_entity(prev, point, handle=handle, decimals=decimals))
+                handle += 1
+                prev = point
+    return entities, handle
+
+
+def _norm_deg(angle: float) -> float:
+    value = float(angle) % 360.0
+    if value < 0:
+        value += 360.0
+    return value
+
+
+def _arc_entity(
+    centre: tuple[float, float],
+    radius: float,
+    start_deg: float,
+    end_deg: float,
+    *,
+    handle: int,
+    decimals: int,
+) -> str:
+    return "\n".join(
+        [
+            "0",
+            "ARC",
+            "5",
+            f"{handle:X}",
+            "8",
+            "0",
+            "10",
+            _fmt(centre[0], decimals),
+            "20",
+            _fmt(centre[1], decimals),
+            "30",
+            "0.0",
+            "40",
+            _fmt(radius, decimals),
+            "50",
+            _fmt(start_deg, decimals),
+            "51",
+            _fmt(end_deg, decimals),
+        ]
+    )
+
+
 def _path_primitives(
     d: str,
     *,
     curve_segments: int,
-) -> list[tuple[str, list[tuple[float, float]]]]:
+    keep_circular_arcs: bool = False,
+) -> list[tuple[str, list]]:
     tokens = re.findall(r"[MmLlHhVvCcSsQqTtAaZz]|[-+]?(?:\d*\.\d+|\d+)(?:[eE][-+]?\d+)?", d)
     if not tokens:
         return []
-    out: list[tuple[str, list[tuple[float, float]]]] = []
+    out: list[tuple[str, list]] = []
     cx = cy = 0.0
     start = (0.0, 0.0)
     last_ctrl: tuple[float, float] | None = None
@@ -265,6 +407,15 @@ def _path_primitives(
             x, y = take_float(), take_float()
             if not absolute:
                 x, y = x + cx, y + cy
+            circular = keep_circular_arcs and abs(abs(rx) - abs(ry)) <= 1e-6 * max(1.0, abs(rx), abs(ry))
+            if circular:
+                arc = _circular_arc_params((cx, cy), abs(rx), x_axis, large, sweep, (x, y))
+                if arc is not None:
+                    out.append(("arc", list(arc)))
+                    cx, cy = x, y
+                    last_ctrl = None
+                    last_cmd = cmd
+                    continue
             samples = _sample_arc((cx, cy), rx, ry, x_axis, large, sweep, (x, y), curve_segments)
             prev = (cx, cy)
             for point in samples:
@@ -276,6 +427,98 @@ def _path_primitives(
             break
         last_cmd = cmd
     return out
+
+
+def _circular_arc_params(
+    p0: tuple[float, float],
+    radius: float,
+    x_axis: float,
+    large: bool,
+    sweep: bool,
+    p1: tuple[float, float],
+) -> tuple[float, float, float, float, float, bool] | None:
+    """Return (cx, cy, r, start_deg, end_deg, sweep_ccw) for a circular SVG arc."""
+    if radius < 1e-9:
+        return None
+    # Reuse elliptical centre math with rx=ry.
+    samples_meta = _arc_center(p0, radius, radius, x_axis, large, sweep, p1)
+    if samples_meta is None:
+        return None
+    cx, cy, start_ang, delta = samples_meta
+    start_deg = math.degrees(start_ang)
+    end_deg = math.degrees(start_ang + delta)
+    # SVG sweep=1 is positive angle in y-down space (clockwise on screen).
+    # For DXF we track mathematical CCW in the same SVG coordinate system first.
+    sweep_ccw = delta > 0
+    return (cx, cy, radius, start_deg, end_deg, sweep_ccw)
+
+
+def _arc_center(
+    p0: tuple[float, float],
+    rx: float,
+    ry: float,
+    x_axis: float,
+    large: bool,
+    sweep: bool,
+    p1: tuple[float, float],
+) -> tuple[float, float, float, float] | None:
+    """SVG arc centre parameterization → (cx, cy, start_ang, delta_ang)."""
+    x1, y1 = p0
+    x2, y2 = p1
+    if abs(rx) < 1e-9 or abs(ry) < 1e-9 or (abs(x1 - x2) < 1e-12 and abs(y1 - y2) < 1e-12):
+        return None
+    rx = abs(float(rx))
+    ry = abs(float(ry))
+    phi = math.radians(float(x_axis) % 360.0)
+    cos_phi = math.cos(phi)
+    sin_phi = math.sin(phi)
+    dx = (x1 - x2) / 2.0
+    dy = (y1 - y2) / 2.0
+    x1p = cos_phi * dx + sin_phi * dy
+    y1p = -sin_phi * dx + cos_phi * dy
+    lam = (x1p * x1p) / (rx * rx) + (y1p * y1p) / (ry * ry)
+    if lam > 1.0:
+        scale = math.sqrt(lam)
+        rx *= scale
+        ry *= scale
+    rx_sq = rx * rx
+    ry_sq = ry * ry
+    x1p_sq = x1p * x1p
+    y1p_sq = y1p * y1p
+    denom = rx_sq * y1p_sq + ry_sq * x1p_sq
+    if denom == 0.0:
+        return None
+    num = rx_sq * ry_sq - denom
+    coeff = math.sqrt(max(0.0, num / denom))
+    if large == sweep:
+        coeff = -coeff
+    cxp = coeff * (rx * y1p) / ry
+    cyp = coeff * (-(ry * x1p) / rx)
+    cx = cos_phi * cxp - sin_phi * cyp + (x1 + x2) / 2.0
+    cy = sin_phi * cxp + cos_phi * cyp + (y1 + y2) / 2.0
+
+    def _angle(ux: float, uy: float, vx: float, vy: float) -> float:
+        n = math.hypot(ux, uy) * math.hypot(vx, vy)
+        if n == 0.0:
+            return 0.0
+        cos_a = max(-1.0, min(1.0, (ux * vx + uy * vy) / n))
+        ang = math.acos(cos_a)
+        if ux * vy - uy * vx < 0.0:
+            ang = -ang
+        return ang
+
+    start_ang = _angle(1.0, 0.0, (x1p - cxp) / rx, (y1p - cyp) / ry)
+    delta = _angle(
+        (x1p - cxp) / rx,
+        (y1p - cyp) / ry,
+        (-x1p - cxp) / rx,
+        (-y1p - cyp) / ry,
+    )
+    if not sweep and delta > 0.0:
+        delta -= 2.0 * math.pi
+    elif sweep and delta < 0.0:
+        delta += 2.0 * math.pi
+    return cx, cy, start_ang, delta
 
 
 def _line_entity(
