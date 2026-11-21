@@ -69,7 +69,8 @@ from vectorizer.export.png import export_png_preview, linked_export_size
 from vectorizer.export.svg import document_has_transparent_paint, export_svg
 from vectorizer.gui.batch_dialog import BatchDialog
 from vectorizer.gui.canvas import ImageCanvas, first_drop_path
-from vectorizer.gui.compare_view import SplitCompare, SyncSideBySide
+from vectorizer.gui.compare_view import CompareHost
+from vectorizer.gui.export_dialogs import DxfExportDialog, EpsExportDialog, SvgExportDialog
 from vectorizer.gui.i18n import (
     SUPPORTED_LANGUAGES,
     current_language,
@@ -169,23 +170,22 @@ class MainWindow(QMainWindow):
         self.panel = SettingsPanel()
         self.original_canvas = ImageCanvas()
         self.vector_canvas = ImageCanvas()
-        self.side_by_side = SyncSideBySide()
-        self.split_compare = SplitCompare()
+        self.compare_host = CompareHost()
+        self.side_by_side = self.compare_host.side_by_side
+        self.split_compare = self.compare_host.split_compare
         self.seg_editor = SegmentationEditor()
         self._restore_sidebar_defaults(prefs)
 
         tabs = QTabWidget()
         tabs.addTab(self.original_canvas, "")
         tabs.addTab(self.vector_canvas, "")
-        tabs.addTab(self.side_by_side, "")
-        tabs.addTab(self.split_compare, "")
+        tabs.addTab(self.compare_host, "")
         tabs.addTab(self.seg_editor, "")
         self.preview_tabs = tabs
         # Allow the window to shrink to golden-ratio defaults on smaller screens.
         tabs.setMinimumWidth(MIN_CANVAS_WIDTH)
         self.seg_editor.setMinimumWidth(MIN_CANVAS_WIDTH)
-        self.side_by_side.setMinimumWidth(MIN_CANVAS_WIDTH)
-        self.split_compare.setMinimumWidth(MIN_CANVAS_WIDTH)
+        self.compare_host.setMinimumWidth(MIN_CANVAS_WIDTH)
 
         self.welcome = WelcomeView()
         self.welcome.open_requested.connect(self.open_file_dialog)
@@ -545,9 +545,8 @@ class MainWindow(QMainWindow):
         tabs = self.preview_tabs
         tabs.setTabText(0, t("Original"))
         tabs.setTabText(1, t("Vector"))
-        tabs.setTabText(2, t("Side by side"))
-        tabs.setTabText(3, t("Compare"))
-        tabs.setTabText(4, t("Segmentation"))
+        tabs.setTabText(2, t("Compare"))
+        tabs.setTabText(3, t("Segmentation"))
         self._refresh_placeholders()
         self.welcome.retranslate_ui()
 
@@ -556,8 +555,7 @@ class MainWindow(QMainWindow):
 
         self.panel.retranslate_ui()
         self.seg_editor.retranslate_ui()
-        self.side_by_side.retranslate_ui()
-        self.split_compare.retranslate_ui()
+        self.compare_host.retranslate_ui()
         self._trace_overlay.retranslate_ui()
         self._apply_recent_menu()
         self._update_undo_actions()
@@ -581,6 +579,15 @@ class MainWindow(QMainWindow):
                 current,
                 workflow=prefs.workflow,
                 automatic_quality=prefs.automatic_quality,
+                svg_paint_style=prefs.svg_paint_style,
+                gap_filler_width=prefs.gap_filler_width,
+                gap_filler_non_scaling=prefs.gap_filler_non_scaling,
+                parameterized_shapes=prefs.parameterized_shapes,
+                palette_tolerance=prefs.palette_tolerance,
+                dxf_curve_mode=prefs.dxf_curve_mode,
+                dxf_line_density=prefs.dxf_line_density,
+                eps_compatibility=prefs.eps_compatibility,
+                max_side=prefs.max_side,
             )
         )
 
@@ -624,6 +631,7 @@ class MainWindow(QMainWindow):
         prefs = current_preferences()
         self._history.set_max_steps(prefs.session_history_steps)
         self._export_dir = prefs.resolved_export_dir()
+        self.panel.apply_output_defaults(prefs)
         self._update_eps_availability()
 
     def _update_eps_availability(self) -> None:
@@ -730,8 +738,7 @@ class MainWindow(QMainWindow):
         self.preview_tabs.setMinimumWidth(canvas_min)
         self._preview_stack.setMinimumWidth(canvas_min)
         self.seg_editor.setMinimumWidth(canvas_min)
-        self.side_by_side.setMinimumWidth(canvas_min)
-        self.split_compare.setMinimumWidth(canvas_min)
+        self.compare_host.setMinimumWidth(canvas_min)
 
         if avail is not None:
             frame = self.frameGeometry()
@@ -1282,15 +1289,24 @@ class MainWindow(QMainWindow):
         self._current_token = handle.token
 
     def export_svg_dialog(self) -> None:
-        dest = self._ask_export_path(t("Export SVG"), f"{t('SVG')} (*.svg)", ".svg")
-        if dest is None or self._result is None:
+        if self._result is None:
+            self._error(t("Vectorize an image before exporting."))
             return
         try:
-            export_svg(
-                self._result.document,
-                dest,
-                settings=self.panel.settings(),
-            )
+            settings = self.panel.settings()
+        except ValueError as exc:
+            self._error(str(exc))
+            return
+        options = SvgExportDialog(self, settings)
+        if options.exec() != QDialog.DialogCode.Accepted:
+            return
+        settings = options.applied(settings)
+        self._remember_export_settings(settings)
+        dest = self._ask_export_path(t("Export SVG"), f"{t('SVG')} (*.svg)", ".svg")
+        if dest is None:
+            return
+        try:
+            export_svg(self._result.document, dest, settings=settings)
         except ExportError as exc:
             self._error(str(exc))
             return
@@ -1356,13 +1372,25 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(tf("Saved PNG preview {path}", path=dest), 4000)
 
     def export_dxf_dialog(self) -> None:
-        if not self._confirm_lossy_alpha_export("DXF"):
+        if self._result is None:
+            self._error(t("Vectorize an image before exporting."))
             return
-        dest = self._ask_export_path(t("Export DXF"), f"{t('DXF')} (*.dxf)", ".dxf")
-        if dest is None or self._result is None:
+        if not self._confirm_lossy_alpha_export("DXF"):
             return
         try:
             settings = self.panel.settings()
+        except ValueError as exc:
+            self._error(str(exc))
+            return
+        options = DxfExportDialog(self, settings)
+        if options.exec() != QDialog.DialogCode.Accepted:
+            return
+        settings = options.applied(settings)
+        self._remember_export_settings(settings)
+        dest = self._ask_export_path(t("Export DXF"), f"{t('DXF')} (*.dxf)", ".dxf")
+        if dest is None:
+            return
+        try:
             curve_mode = settings.dxf_curve_mode
             export_dxf(
                 self._result.document,
@@ -1388,18 +1416,46 @@ class MainWindow(QMainWindow):
                 t("EPS export requires Inkscape on PATH or a path set in Preferences.")
             )
             return
+        if self._result is None:
+            self._error(t("Vectorize an image before exporting."))
+            return
         if not self._confirm_lossy_alpha_export("EPS"):
             return
+        try:
+            settings = self.panel.settings()
+        except ValueError as exc:
+            self._error(str(exc))
+            return
+        options = EpsExportDialog(self, settings)
+        if options.exec() != QDialog.DialogCode.Accepted:
+            return
+        settings = options.applied(settings)
+        self._remember_export_settings(settings)
         dest = self._ask_export_path(t("Export EPS"), f"{t('EPS')} (*.eps)", ".eps")
-        if dest is None or self._result is None:
+        if dest is None:
             return
         try:
-            export_eps(self._result.document, dest, settings=self.panel.settings())
+            export_eps(self._result.document, dest, settings=settings)
         except ExportError as exc:
             self._error(str(exc))
             return
         self._remember_export_dir(dest)
         self.statusBar().showMessage(tf("Saved EPS {path}", path=dest), 4000)
+
+    def _remember_export_settings(self, settings: TraceSettings) -> None:
+        """Keep sidebar/session settings and Preferences export defaults in sync."""
+        self.panel.set_settings(settings)
+        update_preferences(
+            svg_paint_style=settings.svg_paint_style,
+            gap_filler_width=settings.gap_filler_width,
+            gap_filler_non_scaling=settings.gap_filler_non_scaling,
+            parameterized_shapes=settings.parameterized_shapes,
+            palette_tolerance=settings.palette_tolerance,
+            dxf_curve_mode=settings.dxf_curve_mode,
+            dxf_line_density=settings.dxf_line_density,
+            eps_compatibility=settings.eps_compatibility,
+            max_side=settings.max_side,
+        )
 
     def open_batch_dialog(self) -> None:
         try:
@@ -1680,7 +1736,8 @@ class MainWindow(QMainWindow):
         rebuild = not self._retrace_from_segmentation
         label = "Retrace" if self._retrace_from_segmentation else "Vectorize"
         self._apply_result(result, rebuild_segmentation=rebuild, history_label=label)
-        self.preview_tabs.setCurrentWidget(self.side_by_side)
+        self.compare_host.show_side_by_side()
+        self.preview_tabs.setCurrentWidget(self.compare_host)
         if self._retrace_from_segmentation:
             self.statusBar().showMessage(t("Retrace from segmentation complete."), 4000)
 
@@ -2070,7 +2127,8 @@ class MainWindow(QMainWindow):
         self.side_by_side.set_left_caption("Palette")
         self.split_compare.set_left_caption("Palette")
         self.split_compare.set_images(pixmap, self._vector_pixmap)
-        self.preview_tabs.setCurrentWidget(self.split_compare)
+        self.compare_host.show_wipe()
+        self.preview_tabs.setCurrentWidget(self.compare_host)
         self.statusBar().showMessage(t("Palette compare is showing the snapped bitmap."), 4000)
 
     def _compare_palette_colors(self, settings: TraceSettings) -> tuple[str, ...]:

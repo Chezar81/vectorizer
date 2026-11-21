@@ -13,7 +13,14 @@ from pathlib import Path
 from PySide6.QtCore import QObject, QSettings, QStandardPaths, Signal
 
 from vectorizer.batch.engine import CollisionPolicy, ExportFormat
-from vectorizer.domain.settings import AutomaticQuality, WorkflowMode
+from vectorizer.domain.settings import (
+    AutomaticQuality,
+    DxfCurveMode,
+    DxfLineDensity,
+    EpsCompatibility,
+    SvgPaintStyle,
+    WorkflowMode,
+)
 from vectorizer.errors import VectorizerError
 from vectorizer.gui.session_history import DEFAULT_MAX_STEPS as SESSION_DEFAULT_STEPS
 from vectorizer.hardware.policy import ComputeMode
@@ -77,6 +84,17 @@ class AppPreferences:
     png_width: int = 0
     png_height: int = 0
     png_background: str = ""  # "", "transparent", "#ffffff", "#000000", "#1f9ede"
+
+    # 13b — export / working-copy defaults (sidebar no longer shows these)
+    svg_paint_style: SvgPaintStyle = SvgPaintStyle.FILL
+    gap_filler_width: float = 2.0
+    gap_filler_non_scaling: bool = True
+    parameterized_shapes: bool = True
+    palette_tolerance: int = 255
+    dxf_curve_mode: DxfCurveMode = DxfCurveMode.LINES
+    dxf_line_density: DxfLineDensity = DxfLineDensity.NORMAL
+    eps_compatibility: EpsCompatibility = EpsCompatibility.COMPACT
+    max_side: int = 0
 
     # 14 — history depth
     session_history_steps: int = SESSION_DEFAULT_STEPS
@@ -143,6 +161,41 @@ class AppPreferences:
         session_steps = max(2, min(500, int(self.session_history_steps)))
         seg_steps = max(2, min(500, int(self.segmentation_history_steps)))
         seg_mib = max(8, min(512, int(self.segmentation_history_mib)))
+        try:
+            svg_style = (
+                self.svg_paint_style
+                if isinstance(self.svg_paint_style, SvgPaintStyle)
+                else SvgPaintStyle(str(self.svg_paint_style))
+            )
+        except ValueError:
+            svg_style = SvgPaintStyle.FILL
+        try:
+            dxf_mode = (
+                self.dxf_curve_mode
+                if isinstance(self.dxf_curve_mode, DxfCurveMode)
+                else DxfCurveMode(str(self.dxf_curve_mode))
+            )
+        except ValueError:
+            dxf_mode = DxfCurveMode.LINES
+        try:
+            dxf_density = (
+                self.dxf_line_density
+                if isinstance(self.dxf_line_density, DxfLineDensity)
+                else DxfLineDensity(str(self.dxf_line_density))
+            )
+        except ValueError:
+            dxf_density = DxfLineDensity.NORMAL
+        try:
+            eps_level = (
+                self.eps_compatibility
+                if isinstance(self.eps_compatibility, EpsCompatibility)
+                else EpsCompatibility(str(self.eps_compatibility))
+            )
+        except ValueError:
+            eps_level = EpsCompatibility.COMPACT
+        gap_w = max(0.0, min(5.0, float(self.gap_filler_width)))
+        palette_tol = max(0, min(255, int(self.palette_tolerance)))
+        max_side = max(0, min(16384, int(self.max_side)))
         return replace(
             self,
             workflow=workflow,
@@ -167,6 +220,15 @@ class AppPreferences:
             last_preset=str(self.last_preset or "").strip(),
             inkscape_path=str(self.inkscape_path or "").strip(),
             png_background=str(self.png_background or "").strip(),
+            svg_paint_style=svg_style,
+            gap_filler_width=gap_w,
+            gap_filler_non_scaling=bool(self.gap_filler_non_scaling),
+            parameterized_shapes=bool(self.parameterized_shapes),
+            palette_tolerance=palette_tol,
+            dxf_curve_mode=dxf_mode,
+            dxf_line_density=dxf_density,
+            eps_compatibility=eps_level,
+            max_side=max_side,
         )
 
 
@@ -237,6 +299,29 @@ def load_preferences() -> AppPreferences:
         png_width=_read_int(store, f"{PREF_PREFIX}png_width", 0),
         png_height=_read_int(store, f"{PREF_PREFIX}png_height", 0),
         png_background=_read_str(store, f"{PREF_PREFIX}png_background"),
+        svg_paint_style=_read_str(
+            store, f"{PREF_PREFIX}svg_paint_style", SvgPaintStyle.FILL.value
+        ),
+        gap_filler_width=float(
+            store.value(f"{PREF_PREFIX}gap_filler_width", 2.0) or 2.0
+        ),
+        gap_filler_non_scaling=_read_bool(
+            store, f"{PREF_PREFIX}gap_filler_non_scaling", True
+        ),
+        parameterized_shapes=_read_bool(
+            store, f"{PREF_PREFIX}parameterized_shapes", True
+        ),
+        palette_tolerance=_read_int(store, f"{PREF_PREFIX}palette_tolerance", 255),
+        dxf_curve_mode=_read_str(
+            store, f"{PREF_PREFIX}dxf_curve_mode", DxfCurveMode.LINES.value
+        ),
+        dxf_line_density=_read_str(
+            store, f"{PREF_PREFIX}dxf_line_density", DxfLineDensity.NORMAL.value
+        ),
+        eps_compatibility=_read_str(
+            store, f"{PREF_PREFIX}eps_compatibility", EpsCompatibility.COMPACT.value
+        ),
+        max_side=_read_int(store, f"{PREF_PREFIX}max_side", 0),
         session_history_steps=_read_int(
             store, f"{PREF_PREFIX}session_history_steps", SESSION_DEFAULT_STEPS
         ),
@@ -278,6 +363,15 @@ def save_preferences(prefs: AppPreferences, *, emit: bool = True) -> AppPreferen
     store.setValue(f"{PREF_PREFIX}png_width", prefs.png_width)
     store.setValue(f"{PREF_PREFIX}png_height", prefs.png_height)
     store.setValue(f"{PREF_PREFIX}png_background", prefs.png_background)
+    store.setValue(f"{PREF_PREFIX}svg_paint_style", prefs.svg_paint_style.value)
+    store.setValue(f"{PREF_PREFIX}gap_filler_width", prefs.gap_filler_width)
+    store.setValue(f"{PREF_PREFIX}gap_filler_non_scaling", prefs.gap_filler_non_scaling)
+    store.setValue(f"{PREF_PREFIX}parameterized_shapes", prefs.parameterized_shapes)
+    store.setValue(f"{PREF_PREFIX}palette_tolerance", prefs.palette_tolerance)
+    store.setValue(f"{PREF_PREFIX}dxf_curve_mode", prefs.dxf_curve_mode.value)
+    store.setValue(f"{PREF_PREFIX}dxf_line_density", prefs.dxf_line_density.value)
+    store.setValue(f"{PREF_PREFIX}eps_compatibility", prefs.eps_compatibility.value)
+    store.setValue(f"{PREF_PREFIX}max_side", prefs.max_side)
     store.setValue(f"{PREF_PREFIX}session_history_steps", prefs.session_history_steps)
     store.setValue(
         f"{PREF_PREFIX}segmentation_history_steps", prefs.segmentation_history_steps
@@ -336,6 +430,10 @@ def preferences_as_dict(prefs: AppPreferences | None = None) -> dict[str, object
     data["automatic_quality"] = prefs.automatic_quality.value
     data["compute_mode"] = prefs.compute_mode.value
     data["batch_collision"] = prefs.batch_collision.value
+    data["svg_paint_style"] = prefs.svg_paint_style.value
+    data["dxf_curve_mode"] = prefs.dxf_curve_mode.value
+    data["dxf_line_density"] = prefs.dxf_line_density.value
+    data["eps_compatibility"] = prefs.eps_compatibility.value
     return data
 
 

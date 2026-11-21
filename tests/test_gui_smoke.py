@@ -41,10 +41,12 @@ def test_main_window_smoke(qapp: QApplication, fixtures: dict[str, Path]) -> Non
     window.open_path(fixtures["mono_logo.png"])
     qapp.processEvents()
     assert window._loaded is not None
-    assert window.preview_tabs.count() == 5
+    assert window.preview_tabs.count() == 4
     from vectorizer.gui.i18n import t
 
-    assert window.preview_tabs.tabText(3) == t("Compare")
+    assert window.preview_tabs.tabText(2) == t("Compare")
+    assert window.preview_tabs.tabText(3) == t("Segmentation")
+    assert window.compare_host.current_mode() == window.compare_host.MODE_SIDE
     assert window._preview_stack.currentWidget() is window.preview_tabs
     assert window.panel.vectorize_btn.isEnabled()
     assert window.seg_editor.has_map()
@@ -122,8 +124,12 @@ def test_session_undo_after_apply_result(qapp: QApplication, fixtures: dict[str,
 
 
 def test_view_menu_appearance_override(qapp: QApplication, monkeypatch: pytest.MonkeyPatch) -> None:
+    from vectorizer.gui import i18n as i18n_mod
     from vectorizer.gui import theme as theme_mod
+    from vectorizer.gui.i18n import LANG_EN, set_language, t
 
+    monkeypatch.setattr(i18n_mod, "load_language", lambda: set_language(LANG_EN, persist=False))
+    set_language(LANG_EN, persist=False)
     saved: list[str] = []
     monkeypatch.setattr(theme_mod, "appearance_mode", lambda: "system")
     monkeypatch.setattr(theme_mod, "set_appearance_mode", lambda mode: saved.append(mode) or mode)
@@ -131,9 +137,9 @@ def test_view_menu_appearance_override(qapp: QApplication, monkeypatch: pytest.M
 
     window = MainWindow()
     assert window._appearance_actions["system"].isChecked()
-    assert window._appearance_actions["system"].text() == "&System setting"
-    assert window._appearance_actions["light"].text() == "&Light mode"
-    assert window._appearance_actions["dark"].text() == "&Dark mode"
+    assert window._appearance_actions["system"].text() == t("&System setting")
+    assert window._appearance_actions["light"].text() == t("&Light mode")
+    assert window._appearance_actions["dark"].text() == t("&Dark mode")
     assert not window._appearance_actions["light"].isChecked()
 
     window._appearance_actions["dark"].trigger()

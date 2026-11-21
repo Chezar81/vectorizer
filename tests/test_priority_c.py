@@ -166,13 +166,27 @@ def test_settings_panel_advanced_and_basic_guide(qapp: QApplication, tmp_path) -
             TraceSettings(workflow=WorkflowMode.BASIC, edge_treatment=EdgeTreatment.HARD)
         )
         assert panel._basic_guide.isVisible()
+        assert not panel._colors_box.isVisible()
+        assert not panel._output_box.isVisible()
         assert not panel._curves_box.isVisible()
+        assert panel._presets_box.isVisible()
         assert not panel._noise_in_engine
         assert not panel._cluster_in_palette
         assert panel.settings().edge_treatment == EdgeTreatment.HARD
         assert panel.settings().filter_speckle == TraceSettings().filter_speckle
         assert panel.settings().contour_smoothness == 50
 
+        panel.set_settings(TraceSettings(workflow=WorkflowMode.AUTOMATIC))
+        assert not panel._basic_guide.isVisible()
+        assert not panel._colors_box.isVisible()
+        assert not panel._presets_box.isVisible()
+        assert not panel._output_box.isVisible()
+        assert panel._preprocess_box.isVisible()
+        assert panel.auto_quality.isVisible()
+
+        panel.set_settings(
+            TraceSettings(workflow=WorkflowMode.BASIC, edge_treatment=EdgeTreatment.HARD)
+        )
         panel.set_analysis_hints(
             TraceSettings(
                 edge_treatment=EdgeTreatment.BLENDED,
@@ -182,6 +196,7 @@ def test_settings_panel_advanced_and_basic_guide(qapp: QApplication, tmp_path) -
             transparency_note="Soft edges are true transparent anti-aliasing. Leave transparency on.",
             transparency_recommendation="leave",
         )
+        assert panel._basic_guide.isVisible()
         assert panel._basic_edge_badge.isVisible()
         assert panel._basic_color_badge.isVisible()
         photo = panel.basic_image_type.findData(EdgeTreatment.PHOTO)

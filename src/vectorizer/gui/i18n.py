@@ -43,6 +43,26 @@ _DE: dict[str, str] = {
     "&Language": "&Sprache",
     "&Preferences…": "&Präferenzen…",
     "Preferences": "Präferenzen",
+    "General": "Allgemein",
+    "Export": "Export",
+    "Batch": "Stapel",
+    "Advanced": "Erweitert",
+    "Layout": "Anordnung",
+    "Wipe": "Wischer",
+    "Result colors": "Ergebnis-Farben",
+    "SVG defaults": "SVG-Vorgaben",
+    "DXF / EPS defaults": "DXF-/EPS-Vorgaben",
+    "History and limits": "Verlauf und Limits",
+    "After vectorize — recolor without retracing:": (
+        "Nach dem Vektorisieren — umfärben ohne Nachzeichnen:"
+    ),
+    "Automatic classifies the image and chooses tracing defaults. "
+    "Basic shows a short guide. Advanced unlocks expert knobs. "
+    "Export options live in the export dialogs and Preferences.": (
+        "Automatisch klassifiziert das Bild und wählt Trace-Vorgaben. "
+        "Einfach zeigt eine kurze Anleitung. Erweitert schaltet Expertenregler frei. "
+        "Exportoptionen liegen in den Export-Dialogen und den Präferenzen."
+    ),
     "Defaults": "Vorgaben",
     "Default mode": "Standardmodus",
     "Default Automatic quality": "Standardqualität (Automatisch)",
