@@ -93,6 +93,36 @@ def test_absorb_blends_assigns_mixed_pixels_to_stable_neighbors() -> None:
     assert set(int(v) for v in np.unique(labels[:, 2])) <= {0, 1}
 
 
+def test_aa_artifact_rejection_none_skips_blend_absorb() -> None:
+    import numpy as np
+
+    from vectorizer.domain.settings import AaArtifactRejection, TraceSettings
+    from vectorizer.vectorize.blend_trace import _absorb_blends, label_regions
+
+    image = Image.new("RGBA", (5, 3), (255, 255, 255, 255))
+    for y in range(3):
+        image.putpixel((0, y), (200, 30, 30, 255))
+        image.putpixel((1, y), (200, 30, 30, 255))
+        image.putpixel((2, y), (110, 35, 105, 255))
+        image.putpixel((3, y), (30, 40, 200, 255))
+        image.putpixel((4, y), (30, 40, 200, 255))
+    palette = ("#c81e1e", "#1e28c8")
+    settings = TraceSettings(
+        filter_speckle=0,
+        remove_background=False,
+        aa_artifact_rejection=AaArtifactRejection.NONE,
+    ).validated()
+    labels, pixels_lab, palette_lab, _bg = label_regions(image, palette, settings)
+    stable = np.zeros(labels.shape, dtype=bool)
+    stable[:, :2] = True
+    stable[:, 3:] = True
+    labels[:, 2] = 0
+    before = labels.copy()
+    _absorb_blends(labels, stable, pixels_lab, palette_lab, settings=settings)
+    assert np.array_equal(labels, before)
+    assert not np.any(stable[:, 2])
+
+
 def test_blended_trace_places_a_fractional_edge() -> None:
     image = Image.new("RGB", (64, 64), (255, 255, 255))
     draw = ImageDraw.Draw(image)
@@ -404,3 +434,30 @@ def test_dxf_spline_mode_writes_a_cubic(tmp_path) -> None:
     lines = tmp_path / "lines.dxf"
     export_dxf(document, lines, curve_mode=DxfCurveMode.LINES)
     assert "LWPOLYLINE" in lines.read_text(encoding="utf-8")
+
+
+def test_restore_bright_specks_keeps_white_off_yellow() -> None:
+    import numpy as np
+
+    from vectorizer.vectorize.blend_trace import _restore_bright_specks
+
+    palette_rgb = np.asarray([[255, 255, 255], [255, 214, 19]], dtype=np.uint8)
+    rgb = np.full((4, 4, 3), 255, dtype=np.uint8)
+    labels = np.ones((4, 4), dtype=np.int16)
+    _restore_bright_specks(labels, rgb, palette_rgb, [0, 1])
+    assert (labels == 0).all()
+
+
+def test_icon_drop_shadow_is_not_a_palette_ink() -> None:
+    import numpy as np
+
+    rgba = np.zeros((80, 80, 4), dtype=np.uint8)
+    rgba[10:60, 10:60] = (30, 150, 230, 255)
+    rgba[30:40, 15:55] = (255, 255, 255, 255)
+    # Pure-black translucent shadow below/right of the body.
+    rgba[60:68, 14:66, 3] = 60
+    rgba[14:66, 60:68, 3] = 60
+    image = Image.fromarray(rgba, "RGBA")
+    suggestions = suggest_palettes(image)
+    for colors in suggestions.palettes.values():
+        assert "#000000" not in colors

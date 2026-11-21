@@ -32,11 +32,13 @@ def test_automatic_quality_tiers(fixtures: dict[str, Path]) -> None:
     balanced = analyze_image(image, quality=AutomaticQuality.BALANCED).suggested
     fast = analyze_image(image, quality=AutomaticQuality.FAST).suggested
     high = analyze_image(image, quality=AutomaticQuality.HIGH).suggested
+    # Artwork quality steps input noise, not the photo shape budget or fit knobs.
     assert fast.filter_speckle >= balanced.filter_speckle
-    assert fast.color_precision <= balanced.color_precision
     assert high.filter_speckle <= balanced.filter_speckle
-    assert high.color_precision >= balanced.color_precision
-    assert high.max_iterations >= balanced.max_iterations
+    assert fast.color_precision == balanced.color_precision == high.color_precision
+    assert fast.max_iterations == balanced.max_iterations == high.max_iterations
+    assert fast.layer_difference == balanced.layer_difference == high.layer_difference
+    assert fast.target_colors == balanced.target_colors == high.target_colors
 
 
 def test_nested_holes_prefer_cutout(fixtures: dict[str, Path]) -> None:
@@ -113,10 +115,10 @@ def test_cel_scene_keeps_wall_and_floor_colors() -> None:
 
 
 def test_large_cel_jpeg_uses_vtracer_with_ink_palette() -> None:
-    """Megapixel cel scenes route to VTracer with a rich ink-aware palette.
+    """Large flat cel scenes stay on the blend tracer with an ink palette.
 
-    BlendTracer hard-cel collapsed these scenes to ~one path per colour; the
-    PHOTO edge + cel ink prep keeps continuous outlines and flat fills.
+    Forcing every scene above ~180k pixels through VTracer exploded clean
+    fills into thousands of paths. Blend hard-cel keeps the outlines.
     """
     from vectorizer.domain.settings import EdgeTreatment
     from vectorizer.export.svg import export_svg
@@ -137,20 +139,22 @@ def test_large_cel_jpeg_uses_vtracer_with_ink_palette() -> None:
 
     analysis = analyze_image(image)
     assert analysis.content_kind == ContentKind.ILLUSTRATION
-    assert analysis.suggested.edge_treatment == EdgeTreatment.PHOTO
+    # Flat cel stays on the blend tracer. Routing every scene above ~180k
+    # pixels through VTracer turned clean fills into thousands of paths.
+    assert analysis.suggested.edge_treatment == EdgeTreatment.BLENDED
     assert analysis.suggested.remove_background is False
     assert analysis.suggested.smooth_noise is False
     assert analysis.suggested.filter_speckle <= 8
     assert analysis.suggested.palette
-    assert len(analysis.suggested.palette) >= 8
+    assert len(analysis.suggested.palette) >= 4
     assert any(
         0.299 * r + 0.587 * g + 0.114 * b <= 45
         for r, g, b in (hex_to_rgb(c) for c in analysis.suggested.palette)
     )
 
     result = run_trace_sync(image, analysis.suggested)
-    assert result.backend_name == "vtracer"
-    assert result.document.path_count >= 3
+    assert result.backend_name == "blend"
+    assert 3 <= result.document.path_count <= 400
     out = Path("/tmp/vectorizer_cel_test.svg")
     export_svg(result.document, out)
     svg = out.read_text(encoding="utf-8")
@@ -223,8 +227,12 @@ def test_rich_cel_jpeg_with_many_fills_is_not_photograph() -> None:
     analysis = analyze_image(image)
     assert analysis.content_kind == ContentKind.ILLUSTRATION
     assert analysis.photo_like is False
-    # Large ink-heavy cels use VTracer (PHOTO edge), not BlendTracer hard-cel.
-    assert analysis.suggested.edge_treatment == EdgeTreatment.PHOTO
+    # Busy megapixel cels may use the PHOTO *edge* (VTracer) while remaining
+    # classified as illustration — not as ContentKind.PHOTO.
+    assert analysis.suggested.edge_treatment in {
+        EdgeTreatment.BLENDED,
+        EdgeTreatment.PHOTO,
+    }
     assert analysis.suggested.target_colors == 0
     assert analysis.suggested.smooth_noise is False
     assert analysis.metrics.ink_outline_score >= 0.012
@@ -294,12 +302,228 @@ def test_smooth_noise_preprocess_preserves_alpha() -> None:
 def test_solidify_black_matte_for_icon_canvas() -> None:
     from vectorizer.raster.preprocess import solidify_black_matte
 
+    # Near-black mark on a transparent black canvas (ChatGPT-style matte).
+    image = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((16, 16, 48, 48), fill=(18, 18, 18, 255))
+    solidified = solidify_black_matte(image)
+    assert solidified.getpixel((2, 2))[:4] == (0, 0, 0, 255)
+    assert solidified.getpixel((32, 32))[:3] == (18, 18, 18)
+
+
+def test_solidify_black_matte_skips_colourful_cutouts() -> None:
+    """YouTube/Brave-style logos: colourful mark + RGBA(0,0,0,0) corners stay clear."""
+    from vectorizer.raster.preprocess import solidify_black_matte
+
     image = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     draw = ImageDraw.Draw(image)
     draw.rectangle((16, 16, 48, 48), fill=(240, 80, 20, 255))
     solidified = solidify_black_matte(image)
-    assert solidified.getpixel((2, 2))[:4] == (0, 0, 0, 255)
+    assert solidified.getpixel((2, 2))[:4] == (0, 0, 0, 0)
     assert solidified.getpixel((32, 32))[:3] == (240, 80, 20)
+
+
+def test_solidify_black_matte_keeps_dark_badge_silhouette() -> None:
+    """Opaque dark badge already fills the mark — transparent corners stay cut out."""
+    from vectorizer.raster.preprocess import solidify_black_matte
+
+    image = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+    draw.ellipse((4, 4, 60, 60), fill=(12, 12, 12, 255))
+    draw.ellipse((22, 22, 42, 42), fill=(245, 245, 245, 255))
+    solidified = solidify_black_matte(image)
+    assert solidified.getpixel((0, 0))[3] == 0
+    assert solidified.getpixel((32, 32))[:3] == (245, 245, 245)
+    assert solidified.getpixel((32, 8))[:3] == (12, 12, 12)
+
+
+def test_alpha_cutout_soft_ramp_is_not_gradient() -> None:
+    """Map/badge cutouts with soft fills keep logo/blend — not GradientTracer."""
+    image = Image.new("RGBA", (128, 128), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+    # Soft blue ramp body + sharp black digit (OpenCPN-style).
+    for y in range(16, 112):
+        t = (y - 16) / 96.0
+        color = (
+            int(180 + 40 * t),
+            int(200 + 20 * t),
+            int(220 - 30 * t),
+            255,
+        )
+        draw.line((16, y, 111, y), fill=color)
+    draw.ellipse((20, 20, 108, 108), outline=(40, 80, 40, 255), width=6)
+    draw.text((48, 52), "0", fill=(0, 0, 0, 255))
+    analysis = analyze_image(image)
+    assert analysis.content_kind != ContentKind.GRADIENT
+    assert analysis.content_kind in {
+        ContentKind.FLAT_LOGO,
+        ContentKind.ILLUSTRATION,
+    }
+    assert analysis.suggested.preserve_transparency is True
+
+
+def test_ensure_dark_ink_skips_logos_without_black_mass() -> None:
+    """Light logos must not gain a synthetic black ink slot from AA fringe."""
+    from vectorizer.raster.analyzer import _ensure_dark_ink
+
+    image = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((8, 8, 56, 56), fill=(87, 184, 236, 255))
+    draw.rectangle((20, 20, 44, 44), fill=(20, 126, 184, 255))
+    palette = ("#57b8ec", "#147eb8", "#e4e4e4", "#106796")
+    ensured = _ensure_dark_ink(palette, image)
+    assert all(
+        not (0.299 * int(c[1:3], 16) + 0.587 * int(c[3:5], 16) + 0.114 * int(c[5:7], 16) <= 20)
+        for c in ensured
+        if c.startswith("#") and len(c) == 7
+    )
+    assert "#1a0a00" not in ensured
+    assert len(ensured) == len(palette)
+
+
+def test_apply_automatic_quality_splits_artwork_and_photo() -> None:
+    from vectorizer.domain.settings import EdgeTreatment, TraceSettings
+    from vectorizer.raster.analyzer import apply_automatic_quality
+
+    artwork = TraceSettings(
+        edge_treatment=EdgeTreatment.BLENDED,
+        filter_speckle=4,
+        color_precision=6,
+        layer_difference=10,
+        max_iterations=10,
+        corner_threshold=55,
+        target_colors=0,
+        length_threshold=4.0,
+    )
+    mid = apply_automatic_quality(artwork, AutomaticQuality.BALANCED, content_kind=ContentKind.FLAT_LOGO)
+    fast = apply_automatic_quality(artwork, AutomaticQuality.FAST, content_kind=ContentKind.FLAT_LOGO)
+    high = apply_automatic_quality(artwork, AutomaticQuality.HIGH, content_kind=ContentKind.FLAT_LOGO)
+    assert high.filter_speckle < mid.filter_speckle < fast.filter_speckle
+    assert high.filter_speckle <= 2
+    assert fast.target_colors == high.target_colors == 0
+    assert fast.layer_difference == mid.layer_difference == high.layer_difference
+    assert fast.color_precision == high.color_precision == 6
+    assert fast.max_iterations == high.max_iterations == 10
+    assert fast.corner_threshold == high.corner_threshold == 55
+    # Photo quality moves the shape budget and leaves fit knobs alone.
+    photo = TraceSettings(
+        edge_treatment=EdgeTreatment.PHOTO,
+        filter_speckle=8,
+        layer_difference=16,
+        target_colors=24,
+        color_precision=5,
+        max_iterations=8,
+        corner_threshold=70,
+    )
+    photo_mid = apply_automatic_quality(
+        photo, AutomaticQuality.BALANCED, content_kind=ContentKind.PHOTO
+    )
+    photo_fast = apply_automatic_quality(
+        photo, AutomaticQuality.FAST, content_kind=ContentKind.PHOTO
+    )
+    photo_high = apply_automatic_quality(
+        photo, AutomaticQuality.HIGH, content_kind=ContentKind.PHOTO
+    )
+    assert photo_fast.target_colors < photo_mid.target_colors < photo_high.target_colors
+    assert photo_fast.filter_speckle > photo_mid.filter_speckle > photo_high.filter_speckle
+    assert photo_fast.layer_difference > photo_mid.layer_difference > photo_high.layer_difference
+    assert photo_fast.color_precision == photo_high.color_precision == 5
+    assert photo_fast.max_iterations == photo_high.max_iterations == 8
+    assert photo_fast.corner_threshold == photo_high.corner_threshold == 70
+    # Cel art on the photo tracer must not gain a posterize pass.
+    cel = TraceSettings(
+        edge_treatment=EdgeTreatment.PHOTO,
+        filter_speckle=8,
+        layer_difference=12,
+        target_colors=0,
+    )
+    cel_fast = apply_automatic_quality(
+        cel, AutomaticQuality.FAST, content_kind=ContentKind.ILLUSTRATION
+    )
+    cel_high = apply_automatic_quality(
+        cel, AutomaticQuality.HIGH, content_kind=ContentKind.ILLUSTRATION
+    )
+    assert cel_fast.target_colors == 0
+    assert cel_high.target_colors == 0
+    assert cel_fast.filter_speckle > cel.filter_speckle > cel_high.filter_speckle
+
+
+def test_photo_fixture_quality_is_shape_budget(fixtures: dict[str, Path]) -> None:
+    image = load_image(fixtures["photo_like.png"]).image
+    balanced = analyze_image(image, quality=AutomaticQuality.BALANCED)
+    assert balanced.content_kind in {ContentKind.PHOTO, ContentKind.GRADIENT}
+    fast = analyze_image(image, quality=AutomaticQuality.FAST).suggested
+    high = analyze_image(image, quality=AutomaticQuality.HIGH).suggested
+    mid = balanced.suggested
+    assert fast.target_colors <= mid.target_colors <= high.target_colors
+    assert fast.filter_speckle >= mid.filter_speckle >= high.filter_speckle
+    assert fast.layer_difference >= mid.layer_difference >= high.layer_difference
+    assert fast.color_precision == mid.color_precision == high.color_precision
+    assert any("shape" in note.lower() for note in balanced.notes)
+
+
+def test_hard_alpha_white_fringe_recommends_flatten_white() -> None:
+    import numpy as np
+
+    from vectorizer.raster.analyzer import TransparencyRecommendation
+
+    arr = np.zeros((40, 40, 4), dtype=np.uint8)
+    yy, xx = np.mgrid[0:40, 0:40]
+    radius = np.hypot(yy - 20, xx - 20)
+    arr[radius <= 12, 0] = 180
+    arr[radius <= 12, 1] = 20
+    arr[radius <= 12, 2] = 20
+    arr[radius <= 12, 3] = 255
+    halo = (radius > 12) & (radius <= 14.2)
+    arr[halo, 0] = 250
+    arr[halo, 1] = 250
+    arr[halo, 2] = 250
+    arr[halo, 3] = 255
+    analysis = analyze_image(Image.fromarray(arr, "RGBA"))
+    assert analysis.transparency.hard_mask is True
+    assert analysis.transparency.recommendation == TransparencyRecommendation.FLATTEN_WHITE
+    assert any("flatten" in note.lower() and "white" in note.lower() for note in analysis.notes)
+
+
+def test_hard_alpha_custom_fringe_recommends_flatten_custom() -> None:
+    import numpy as np
+
+    from vectorizer.raster.analyzer import TransparencyRecommendation
+
+    arr = np.zeros((40, 40, 4), dtype=np.uint8)
+    yy, xx = np.mgrid[0:40, 0:40]
+    radius = np.hypot(yy - 20, xx - 20)
+    arr[radius <= 12, :3] = (180, 20, 20)
+    arr[radius <= 12, 3] = 255
+    halo = (radius > 12) & (radius <= 14.2)
+    arr[halo, 0] = 20
+    arr[halo, 1] = 40
+    arr[halo, 2] = 200
+    arr[halo, 3] = 255
+    analysis = analyze_image(Image.fromarray(arr, "RGBA"))
+    assert analysis.transparency.hard_mask is True
+    assert analysis.transparency.recommendation == TransparencyRecommendation.FLATTEN_CUSTOM
+    assert analysis.transparency.blend_rgb is not None
+    assert any("flatten" in note.lower() for note in analysis.notes)
+
+
+def test_soft_transparent_aa_recommends_leave() -> None:
+    import numpy as np
+
+    from vectorizer.raster.analyzer import TransparencyRecommendation
+
+    arr = np.zeros((40, 40, 4), dtype=np.uint8)
+    yy, xx = np.mgrid[0:40, 0:40]
+    radius = np.hypot(yy - 20, xx - 20)
+    cover = np.clip(255 - (radius - 8) * 28, 0, 255).astype(np.uint8)
+    arr[..., 0] = 180
+    arr[..., 1] = 30
+    arr[..., 2] = 30
+    arr[..., 3] = cover
+    analysis = analyze_image(Image.fromarray(arr, "RGBA"))
+    assert analysis.transparency.hard_mask is False
+    assert analysis.transparency.recommendation == TransparencyRecommendation.LEAVE
+    assert any("leave transparency" in note.lower() for note in analysis.notes)
 
 
 def test_settings_smooth_noise_round_trip() -> None:

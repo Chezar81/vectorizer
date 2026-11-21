@@ -13,7 +13,13 @@ import time
 import numpy as np
 from PIL import Image
 
-from vectorizer.domain.settings import TraceSettings, normalize_hex
+from vectorizer.domain.settings import (
+    AaArtifactRejection,
+    AutomaticQuality,
+    TraceSettings,
+    artwork_input_width_px,
+    normalize_hex,
+)
 from vectorizer.errors import TraceError
 from vectorizer.jobs.progress import STAGE_COLORS, STAGE_CONTOURS, STAGE_CURVES, ProgressCallback
 from vectorizer.raster.color import (
@@ -25,7 +31,12 @@ from vectorizer.raster.color import (
 )
 from vectorizer.svg.parse import parse_svg_document
 from vectorizer.vectorize.backend import TraceResult
-from vectorizer.vectorize.curves import fit_closed_contour, segments_to_path_d
+from vectorizer.vectorize.curves import (
+    fit_closed_contour,
+    node_budget_epsilon,
+    segments_to_path_d,
+    simplify_closed_ring,
+)
 from vectorizer.vectorize.iso_contour import (
     _dilate4,
     coverage_field,
@@ -44,6 +55,14 @@ _CUTOUT_SIGMA = 0.9
 # Along-contour smoothing of cutout iso rings: removes residual pixel-stair
 # wobble on long letter / shield edges without eroding thin strokes.
 _CUTOUT_RING_PASSES = 8
+# Opaque pixel centres in parts of a cutout layer thinner than 3 px stay
+# inside its iso ring. Thin ramp bands (stepped sheens) otherwise blur below
+# 0.5 and leave pinholes no neighbour covers, since underlap stops 1 px short
+# of lower layers. Thicker parts keep the sub-pixel AA edge.
+_CUTOUT_OWN_FLOOR = 0.65
+# Squared OKLab distance under which two cutout inks count as steps of one
+# ramp (≈ 0.06 ΔE: sheen blues, propeller yellows; never ink vs fill).
+_RAMP_TWIN_DIST2 = float(__import__("os").environ.get("TWIN", "0.0036"))
 
 
 class BlendTracer:
@@ -108,8 +127,9 @@ class BlendTracer:
         else:
             labels, pixels_lab, palette_lab, bg_lab = label_regions(rgba, colors, validated)
             labels = _drop_specks(labels, validated.filter_speckle)
-            if validated.preserve_transparency and float((labels < 0).mean()) >= 0.02:
-                _absorb_between_fringe(labels, pixels_lab, palette_lab)
+            # Opaque logos never entered this before, so a 1 px AA colour that
+            # survived the palette became a ring around every edge.
+            _absorb_between_fringe(labels, pixels_lab, palette_lab, validated)
         report(STAGE_CONTOURS, 0.22)
         soft_lab = None
         if soft_for_labels is not None:
@@ -164,6 +184,8 @@ def label_regions(
     labels = index.astype(np.int16)
     alpha = rgba[..., 3]
     labels[alpha < 8] = _EMPTY
+    if settings.preserve_transparency:
+        _drop_soft_shadow(labels, rgba)
 
     # True ink only: dark AND low-chroma. Chromatic dark fills (teal body,
     # navy logo) must not be treated as outline ink or they collapse to black.
@@ -213,7 +235,9 @@ def label_regions(
         stable |= bright_mask
     unstable_fraction = float((~stable & (labels >= 0)).mean()) if height and width else 0.0
     if unstable_fraction <= 0.45:
-        _absorb_blends(labels, stable, pixels_lab, palette_lab, protect=protect_ids)
+        _absorb_blends(
+            labels, stable, pixels_lab, palette_lab, protect=protect_ids, settings=settings
+        )
     # Light spatial cleanup only — aggressive passes merged accents into fills.
     _spatial_clean_labels(labels, protect=protect_ids, passes=1, majority=7)
     # Final stroke pass after cleanup — outlines must win (bright stays bright).
@@ -236,6 +260,23 @@ def label_regions(
         closer_than_ink = bg_dist + 1e-8 < dist
         labels[(bg_dist <= max(limit, 0.004)) & closer_than_ink] = _EMPTY
     return labels, pixels_lab, palette_lab, bg_lab
+
+
+def _drop_soft_shadow(labels: np.ndarray, rgba: np.ndarray) -> None:
+    """Empty translucent black drop-shadow pixels around cutout icons.
+
+    App-icon shadows are pure black at alpha ≲ 60. Labelled, they claim an ink
+    slot and let lighter fills underlap outward into a lumpy silhouette.
+    Translucent black that touches opaque black is the AA rim of real ink and
+    stays.
+    """
+    alpha = rgba[..., 3]
+    dark = rgba[..., :3].max(axis=2) <= 24
+    soft = (labels >= 0) & (alpha < 128) & dark
+    if not np.any(soft):
+        return
+    ink_core = dark & (alpha >= 128)
+    labels[soft & ~_dilate4(ink_core, rings=1)] = _EMPTY
 
 
 def _spatial_clean_labels(
@@ -373,11 +414,12 @@ def _restore_bright_specks(
         return
     bright = np.asarray(bright_ids, dtype=np.int16)
     # Nearest bright palette entry in RGB for those pixels.
-    pix = rgb[candidates].astype(np.int16)
+    # int32: squared channel deltas (up to 255²) overflow int16.
+    pix = rgb[candidates].astype(np.int32)
     best = np.full(pix.shape[0], bright[0], dtype=np.int16)
     best_d = np.full(pix.shape[0], np.inf, dtype=np.float32)
     for bid in bright_ids:
-        center = palette_rgb[bid].astype(np.int16)
+        center = palette_rgb[bid].astype(np.int32)
         d = ((pix - center) ** 2).sum(axis=1).astype(np.float32)
         take = d < best_d
         best[take] = bid
@@ -542,6 +584,51 @@ def labels_to_image(labels: np.ndarray, palette: tuple[str, ...]) -> Image.Image
     return Image.fromarray(out, mode="RGBA")
 
 
+def _rejection_passes(settings: TraceSettings | None) -> int | None:
+    """Absorb passes for AA rejection. None means skip fringe absorption."""
+    if settings is None:
+        return 3
+    rejection = AaArtifactRejection(settings.aa_artifact_rejection)
+    if rejection == AaArtifactRejection.NONE:
+        return None
+    quality = AutomaticQuality(settings.automatic_quality)
+    passes = 3
+    if quality == AutomaticQuality.HIGH:
+        passes = 2
+    elif quality == AutomaticQuality.FAST:
+        passes = 5
+    if rejection == AaArtifactRejection.AGGRESSIVE:
+        passes += 2
+    return passes
+
+
+def _fringe_radius_strength(settings: TraceSettings | None) -> tuple[int, float] | None:
+    """Pixel radius and distance gate for blend-fringe folding.
+
+    Artwork quality sets the width (about 1 px / 2 px / wider). Rejection
+    strength scales that. None skips the fold. A missing settings object
+    keeps the historical 2 px / 0.5 gate.
+    """
+    if settings is None:
+        return 2, 0.5
+    rejection = AaArtifactRejection(settings.aa_artifact_rejection)
+    if rejection == AaArtifactRejection.NONE:
+        return None
+    quality = AutomaticQuality(settings.automatic_quality)
+    width = artwork_input_width_px(quality)
+    radius = 1 if width <= 1 else (2 if width <= 2 else 3)
+    if quality == AutomaticQuality.HIGH:
+        strength = 0.35
+    elif quality == AutomaticQuality.FAST:
+        strength = 0.85
+    else:
+        strength = 0.5
+    if rejection == AaArtifactRejection.AGGRESSIVE:
+        radius += 1
+        strength = min(1.15, strength + 0.35)
+    return radius, strength
+
+
 def _absorb_blends(
     labels: np.ndarray,
     stable: np.ndarray,
@@ -549,8 +636,19 @@ def _absorb_blends(
     palette_lab: np.ndarray,
     *,
     protect: list[int] | None = None,
+    settings: TraceSettings | None = None,
 ) -> None:
     """Give mixed edge pixels the neighboring solid color they belong to."""
+    passes = _rejection_passes(settings)
+    if passes is None:
+        return
+    aggressive = (
+        settings is not None
+        and AaArtifactRejection(settings.aa_artifact_rejection) == AaArtifactRejection.AGGRESSIVE
+    )
+    neighbors = ((-1, 0), (1, 0), (0, -1), (0, 1))
+    if aggressive:
+        neighbors = neighbors + ((-1, -1), (-1, 1), (1, -1), (1, 1))
     height, width = labels.shape
     unstable = ~stable & (labels >= 0)
     if protect:
@@ -560,7 +658,7 @@ def _absorb_blends(
     if count == 0 or count > 1_500_000:
         return
     ys, xs = np.nonzero(unstable)
-    for _pass in range(3):
+    for _pass in range(passes):
         active = ~stable[ys, xs] & (labels[ys, xs] >= 0)
         if protect:
             active &= ~np.isin(labels[ys, xs], np.asarray(protect, dtype=np.int16))
@@ -572,7 +670,7 @@ def _absorb_blends(
         best_label = labels[ay, ax].astype(np.int16, copy=True)
         found = np.zeros(ay.shape[0], dtype=bool)
         pix = pixels_lab[ay, ax]
-        for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+        for dy, dx in neighbors:
             ny = ay + dy
             nx = ax + dx
             inside = (ny >= 0) & (ny < height) & (nx >= 0) & (nx < width)
@@ -608,6 +706,7 @@ def _absorb_between_fringe(
     labels: np.ndarray,
     pixels_lab: np.ndarray,
     palette_lab: np.ndarray,
+    settings: TraceSettings | None = None,
 ) -> None:
     """Fold thin AA slivers into the inks they blend between.
 
@@ -616,6 +715,10 @@ def _absorb_between_fringe(
     on the segment between the labels on either side of it is fringe, not a
     feature; real thin ink (lion strokes, claw tips) is not "between" anything.
     """
+    span = _fringe_radius_strength(settings)
+    if span is None:
+        return
+    radius, strength = span
     height, width = labels.shape
     if height < 5 or width < 5:
         return
@@ -641,13 +744,14 @@ def _absorb_between_fringe(
     pix = pixels_lab[ys, xs]
     own = palette_lab[current]
     own_d = np.einsum("nc,nc->n", pix - own, pix - own)
-    best_d = own_d * 0.5
+    best_d = own_d * strength
     best_label = current.copy()
-    pad2 = np.pad(labels, 2, mode="constant", constant_values=_EMPTY)
-    for r in (1, 2):
+    pad_n = max(2, int(radius))
+    pad2 = np.pad(labels, pad_n, mode="constant", constant_values=_EMPTY)
+    for r in range(1, int(radius) + 1):
         for dy, dx in ((0, r), (r, 0), (r, r), (r, -r)):
-            a = pad2[ys + 2 - dy, xs + 2 - dx]
-            b = pad2[ys + 2 + dy, xs + 2 + dx]
+            a = pad2[ys + pad_n - dy, xs + pad_n - dx]
+            b = pad2[ys + pad_n + dy, xs + pad_n + dx]
             ok = (a >= 0) & (b >= 0) & (a != b) & (a != current) & (b != current)
             if not np.any(ok):
                 continue
@@ -727,6 +831,12 @@ def _majority_neighbor(labels: np.ndarray, y: int, x: int, *, avoid: int) -> int
     return max(counts.items(), key=lambda item: item[1])[0]
 
 
+def _smoothness_scales(smoothness: int) -> tuple[float, float]:
+    """Tolerance and blur scales. 50 → 1 so the balanced fit stays put."""
+    s = max(0, min(100, int(smoothness))) / 100.0
+    return 0.55 + s * 0.90, 0.40 + s * 1.20
+
+
 def _svg_from_labels(
     image: Image.Image,
     labels: np.ndarray,
@@ -777,21 +887,20 @@ def _svg_from_labels(
         and float(settings.corner_threshold) <= 45
         and not cutout_precision
     )
-    if settings.automatic_quality.value == "high":
-        tolerance = (1.15 if hard_cel else 0.55) * min(1.8, geom_scale)
-        blur = 0.55
-    elif settings.automatic_quality.value == "fast":
-        tolerance = 1.35 * min(2.2, geom_scale)
-        blur = 0.85
+    # Contour smoothness (0–100). 50 matches the previous balanced fit.
+    # Quality no longer tightens or loosens these curves; it sets blend width.
+    tol_scale, blur_scale = _smoothness_scales(settings.contour_smoothness)
+    if hard_cel:
+        tolerance = 1.35 * min(1.9, geom_scale) * tol_scale
     else:
-        tolerance = (1.35 if hard_cel else 0.95) * min(1.9, geom_scale)
-        blur = 0.65
+        tolerance = 0.95 * min(1.9, geom_scale) * tol_scale
+    blur = min(1.35, 0.65 * blur_scale)
     cutout_sigma = _CUTOUT_SIGMA
     if cutout_precision:
         # Rings are already smooth and sit on the source edge; a loose fit
         # (≥1.2 px) let neighbouring layers drift apart into lumps and seams.
-        tolerance = 0.9 if settings.automatic_quality.value == "high" else 1.1
-        blur = min(blur, 0.40)
+        tolerance = 1.1 * tol_scale
+        blur = min(0.55, 0.40 * blur_scale)
     corner = float(settings.corner_threshold) if settings.corner_threshold else 50.0
     if hard_cel and not cutout_precision:
         corner = max(corner, 50.0)
@@ -890,8 +999,24 @@ def _svg_from_labels(
                 continue
             # Up to 2 px underlap, but never within 1 px of anything painted
             # below (or transparency) — there it would peek past thin ink.
-            exposed = _dilate4(~(above | own), rings=1)
-            stacked[label] = _dilate4(own, rings=2) & above & ~own & ~exposed
+            # A neighbouring step of the same ramp may be peeked past: the
+            # shades match, and blocking it left hairlines at band junctions.
+            below = ~(above | own)
+            twins = [
+                other
+                for other in range(len(palette))
+                if other != label
+                and float(np.sum((palette_lab[other] - palette_lab[label]) ** 2))
+                <= _RAMP_TWIN_DIST2
+            ]
+            if twins:
+                below &= ~np.isin(labels, np.asarray(twins, dtype=np.int16))
+            exposed = _dilate4(below, rings=1)
+            # Octagonal reach: a 4-connected diamond only underlaps ~1.4 px
+            # across 45° seams, and the upper layer's AA edge then conflates
+            # with ours into a translucent hairline.
+            reach = _dilate8(_dilate4(own, rings=1))
+            stacked[label] = reach & above & ~own & ~exposed
             above = above | own
     total_labels = max(1, len(paint_order))
     for index, label in enumerate(paint_order):
@@ -919,6 +1044,9 @@ def _svg_from_labels(
             )
             field = np.maximum(field, underlap[y0:y1, x0:x1].astype(np.float32))
             field = _gaussian_blur(field, sigma=cutout_sigma)
+            thin = _thin_parts(labels[y0:y1, x0:x1] == label)
+            thin &= cutout_alpha[y0:y1, x0:x1] >= 0.5
+            field = np.where(thin, np.maximum(field, _CUTOUT_OWN_FLOOR), field)
             # Keep bright holes (eye specular, letter counters) from being
             # filled in by the ink blur — force coverage to 0 there.
             color = hex_to_rgb(palette[label])
@@ -980,14 +1108,37 @@ def _svg_from_labels(
                 [(p[0] * coord_scale, p[1] * coord_scale) for p in contour]
                 for contour in contours
             ]
+        fill = rgb_to_hex(hex_to_rgb(palette[label]))
+        fit_tol = tolerance * max(1.0, coord_scale)
+        # Single simple contour → prefer native circle/rect when enabled.
+        if (
+            settings.parameterized_shapes
+            and len(contours) == 1
+        ):
+            ring = orient_clockwise(contours[0])
+            if len(ring) >= 4:
+                from vectorizer.vectorize.shapes import try_parameterized_shape
+
+                shape = try_parameterized_shape(ring, tolerance=fit_tol)
+                if shape is not None:
+                    parts.append(shape.to_svg(fill=fill, decimals=decimals))
+                    continue
         subpaths: list[str] = []
         for contour in contours:
             ring = orient_clockwise(contour)
             if len(ring) < 4:
                 continue
+            fit_ring = ring
+            if int(settings.node_budget) < 100 and len(ring) >= 8:
+                simplified = simplify_closed_ring(
+                    ring,
+                    epsilon=node_budget_epsilon(settings.node_budget, tolerance=fit_tol),
+                )
+                if len(simplified) >= 4:
+                    fit_ring = simplified
             segments = fit_closed_contour(
-                ring,
-                tolerance=tolerance * max(1.0, coord_scale),
+                fit_ring,
+                tolerance=fit_tol,
                 corner_degrees=max(22.0, corner),
             )
             path_d = segments_to_path_d(segments, decimals=decimals)
@@ -995,7 +1146,6 @@ def _svg_from_labels(
                 subpaths.append(path_d)
         if not subpaths:
             continue
-        fill = rgb_to_hex(hex_to_rgb(palette[label]))
         parts.append(
             f'<path d="{" ".join(subpaths)}" fill="{fill}" fill-rule="{fill_rule}"/>'
         )
@@ -1030,6 +1180,32 @@ def _smooth_iso_ring(
     out = [(float(x), float(y)) for x, y in pts]
     out.append(out[0])
     return out
+
+
+def _dilate8(mask: np.ndarray) -> np.ndarray:
+    """Grow a boolean mask by one 8-connected step."""
+    grown = _dilate4(mask, rings=1)
+    grown[1:, 1:] |= mask[:-1, :-1]
+    grown[1:, :-1] |= mask[:-1, 1:]
+    grown[:-1, 1:] |= mask[1:, :-1]
+    grown[:-1, :-1] |= mask[1:, 1:]
+    return grown
+
+
+def _thin_parts(mask: np.ndarray) -> np.ndarray:
+    """Pixels of `mask` not inside any 3×3 block that is entirely `mask`."""
+    height, width = mask.shape
+    padded = np.pad(mask, 1, mode="constant")
+    core = np.ones_like(mask)
+    for dy in (0, 1, 2):
+        for dx in (0, 1, 2):
+            core &= padded[dy : dy + height, dx : dx + width]
+    core_pad = np.pad(core, 1, mode="constant")
+    covered = np.zeros_like(mask)
+    for dy in (0, 1, 2):
+        for dx in (0, 1, 2):
+            covered |= core_pad[dy : dy + height, dx : dx + width]
+    return mask & ~covered
 
 
 def _soft_cutout_field(

@@ -34,6 +34,18 @@ def simplify_closed_ring(
     return _douglas_peucker_closed(ring, max(0.25, float(epsilon)))
 
 
+def node_budget_epsilon(node_budget: int, *, tolerance: float) -> float:
+    """Douglas–Peucker epsilon for a 0–100 node budget.
+
+    Higher budgets keep more nodes. 100 stays at the simplifier floor; 0
+    removes a few pixels of detail after the contour is fitted.
+    """
+    budget = max(0, min(100, int(node_budget)))
+    t = (100 - budget) / 100.0
+    tol = max(0.5, float(tolerance))
+    return 0.25 + (t * t) * (2.4 + 0.4 * tol)
+
+
 def fit_closed_contour(
     points: Sequence[Point], *, tolerance: float, corner_degrees: float
 ) -> list[PathSegment]:
@@ -277,20 +289,31 @@ def segments_to_path_d(segments: Sequence[PathSegment], *, decimals: int) -> str
     first = segments[0]
     start = first.start if isinstance(first, ArcSegment) else first[0]
     parts = [f"M {xy(start)}"]
+    cursor = start
     for segment in segments:
         if isinstance(segment, ArcSegment):
             # Always space-separate arc flags — packed flags break our DXF tokenizer.
-            large = 1 if segment.large_arc else 0
-            sweep = 1 if segment.sweep else 0
-            radius = fmt.format(segment.radius)
-            parts.append(
-                f"A {radius} {radius} 0 {large} {sweep} {xy(segment.end)}"
-            )
+            # A radius that cannot span the chord is invalid SVG; Qt then
+            # truncates the rest of the path. Fall back to a line.
+            end = segment.end
+            chord = _hypot(end[0] - cursor[0], end[1] - cursor[1])
+            if segment.radius >= 1e-3 and chord <= 2.0 * segment.radius + 1e-2:
+                large = 1 if segment.large_arc else 0
+                sweep = 1 if segment.sweep else 0
+                radius = fmt.format(segment.radius)
+                parts.append(
+                    f"A {radius} {radius} 0 {large} {sweep} {xy(end)}"
+                )
+            else:
+                parts.append(f"L {xy(end)}")
+            cursor = end
             continue
+        end = segment[3]
         if _is_nearly_linear(segment, places):
-            parts.append(f"L {xy(segment[3])}")
+            parts.append(f"L {xy(end)}")
         else:
-            parts.append(f"C {xy(segment[1])} {xy(segment[2])} {xy(segment[3])}")
+            parts.append(f"C {xy(segment[1])} {xy(segment[2])} {xy(end)}")
+        cursor = end
     parts.append("Z")
     return " ".join(parts)
 

@@ -220,18 +220,117 @@ _DE: dict[str, str] = {
     "SVG paint": "SVG-Farbe",
     "Fill only": "Nur Füllung",
     "Stroke and fill": "Strich und Füllung",
-    "Fill only is the simpler file. Stroke and fill paints a hairline of the "
-    "same color so viewers do not show thin gaps between shapes.": (
+    "Gap filler": "Lückenfüller",
+    "Stroke edges": "Kantenstriche",
+    "Fill only is the simpler file. Stroke and fill paints a same-color hairline. "
+    "Gap filler puts average-color strokes under shared edges. "
+    "Stroke edges exports cutting paths only.": (
         "Nur Füllung ergibt die einfachere Datei. Strich und Füllung malt eine Haarlinie "
-        "derselben Farbe, damit Betrachter keine dünnen Lücken zwischen Formen zeigen."
+        "derselben Farbe. Der Lückenfüller legt gemittelte Striche unter gemeinsame Kanten. "
+        "Kantenstriche exportieren nur Schnittpfade."
+    ),
+    "Gap / edge stroke width": "Lücken-/Kantenstrichbreite",
+    "Non-scaling gap / edge strokes": "Nicht skalierende Lücken-/Kantenstriche",
+    "Keep stroke width constant when zooming (SVG vector-effect).": (
+        "Strichbreite beim Zoomen konstant halten (SVG vector-effect)."
+    ),
+    "Detect circles and rectangles": "Kreise und Rechtecke erkennen",
+    "When a contour fits a circle or axis-aligned rectangle, emit native "
+    "SVG shapes instead of generic path curves.": (
+        "Wenn ein Konturverlauf zu einem Kreis oder achsparallelen Rechteck passt, "
+        "native SVG-Formen statt generischer Pfadkurven ausgeben."
+    ),
+    "Palette snap tolerance": "Paletten-Fangtoleranz",
+    "How close a color must be to snap onto the trace palette (0 = exact, "
+    "255 = always snap). Remaps still apply afterward.": (
+        "Wie nah eine Farbe an der Trace-Palette liegen muss (0 = exakt, "
+        "255 = immer fangen). Remaps gelten danach weiterhin."
     ),
     "DXF curves": "DXF-Kurven",
     "DXF lines": "DXF-Linien",
+    "DXF lines and arcs": "DXF-Linien und Bögen",
     "DXF splines": "DXF-Splines",
-    "Lines samples curves into polylines. Splines keep cubic curves. "
-    "Neither mode writes fills.": (
-        "Linien tastet Kurven als Polylinien ab. Splines behalten kubische Kurven. "
-        "Keine der beiden Arten schreibt Füllungen."
+    "Lines samples curves into polylines. Lines and arcs keep circular arcs. "
+    "Splines keep cubic curves. None of these modes write fills.": (
+        "Linien tastet Kurven als Polylinien ab. Linien und Bögen behalten Kreisbögen. "
+        "Splines behalten kubische Kurven. Keine dieser Arten schreibt Füllungen."
+    ),
+    "Few (~4)": "Wenige (~4)",
+    "Normal (~8)": "Normal (~8)",
+    "Many (~16)": "Viele (~16)",
+    "DXF line density": "DXF-Liniendichte",
+    "How many samples LINES mode uses per curve. Few is about 4, normal is 8, "
+    "many is about 16. Lines-and-arcs and splines keep their own geometry.": (
+        "Wie viele Abtastungen der Linienmodus je Kurve nutzt. Wenige ist etwa 4, "
+        "normal 8, viele etwa 16. Linien und Bögen sowie Splines behalten ihre eigene Geometrie."
+    ),
+    "EPS compatibility": "EPS-Kompatibilität",
+    "Maximize compatibility": "Kompatibilität maximieren",
+    "Minimize file size": "Dateigröße minimieren",
+    "Maximize compatibility writes PostScript Level 2. "
+    "Minimize file size writes Level 3.": (
+        "Kompatibilität maximieren schreibt PostScript Level 2. "
+        "Dateigröße minimieren schreibt Level 3."
+    ),
+    "Cluster similar colors": "Ähnliche Farben zusammenfassen",
+    "After an unlimited-palette trace, merge fills closer than a medium OKLab step. "
+    "Off by default so automatic free-color keeps its own steps.": (
+        "Nach einem Trace mit unbegrenzter Palette Füllungen zusammenfassen, die näher "
+        "als ein mittlerer OKLab-Schritt liegen. Standardmäßig aus, damit automatische "
+        "freie Farben ihre Abstufungen behalten."
+    ),
+    "Max working side": "Maximale Arbeitsseite",
+    "Prompt": "Nachfragen",
+    "0 asks before shrinking an image over the working limit. A positive value "
+    "shrinks the working copy so the long side is at most this many pixels. "
+    "The original file is not modified.": (
+        "0 fragt nach, bevor ein Bild über dem Arbeitslimit verkleinert wird. Ein "
+        "positiver Wert verkleinert die Arbeitskopie, sodass die lange Seite höchstens "
+        "so viele Pixel hat. Die Originaldatei bleibt unverändert."
+    ),
+    "Compare &palette": "&Palette vergleichen",
+    "Show the bitmap snapped to the trace palette beside the vector result.": (
+        "Die auf die Trace-Palette gefangene Bitmap neben dem Vektorergebnis zeigen."
+    ),
+    "Palette": "Palette",
+    "No palette to compare.": "Keine Palette zum Vergleichen.",
+    "Palette compare is showing the snapped bitmap.": (
+        "Der Palettenvergleich zeigt die gefangene Bitmap."
+    ),
+    "Trace as artwork": "Als Grafik nachzeichnen",
+    "Cycle detail": "Detailstufe wechseln",
+    "Make background": "Zum Hintergrund machen",
+    "Re-trace flat or logo-like art with artwork edges instead of the photograph treatment.": (
+        "Flache oder logoartige Grafik mit Grafikkanten statt der Fotobehandlung neu nachzeichnen."
+    ),
+    "Step Automatic quality (fast, balanced, high) and trace again.": (
+        "Automatische Qualität (schnell, ausgewogen, hoch) weiterschalten und erneut nachzeichnen."
+    ),
+    "Remove finished shapes whose fill matches the background color.": (
+        "Fertige Formen entfernen, deren Füllung der Hintergrundfarbe entspricht."
+    ),
+    "Transparency may be lost": "Transparenz kann verloren gehen",
+    "This result has transparent fills. EPS, PDF, and DXF do not keep that alpha. "
+    "A PNG preview preserves it.": (
+        "Dieses Ergebnis hat transparente Füllungen. EPS, PDF und DXF behalten dieses "
+        "Alpha nicht. Eine PNG-Vorschau erhält es."
+    ),
+    "Export PNG instead": "Stattdessen PNG exportieren",
+    "Continue": "Fortfahren",
+    "Image is very large": "Bild ist sehr groß",
+    "This image is {width}×{height} ({megapixels:.1f} megapixels), above the "
+    "{limit:.0f} megapixel working limit. Shrink the working copy so the long side "
+    "is {side} px? The original file is not modified.": (
+        "Dieses Bild ist {width}×{height} ({megapixels:.1f} Megapixel) und liegt über "
+        "dem Arbeitslimit von {limit:.0f} Megapixeln. Arbeitskopie so verkleinern, dass "
+        "die lange Seite {side} px hat? Die Originaldatei wird nicht verändert."
+    ),
+    "Averaged {count} pixels to {color}.": "{count} Pixel zu {color} gemittelt.",
+    "Working copy is {width}×{height} (source was {original_width}×{original_height}).": (
+        "Arbeitskopie ist {width}×{height} (Quelle war {original_width}×{original_height})."
+    ),
+    "outlines only; lines and circular arcs; fills omitted": (
+        "nur Umrisse; Linien und Kreisbögen; Füllungen weggelassen"
     ),
     "Smooth noise before tracing": "Rauschen vor dem Nachzeichnen glätten",
     "Apply a light median filter to RGB before tracing. "
@@ -241,10 +340,42 @@ _DE: dict[str, str] = {
     ),
     "Result palette (after vectorize):": "Ergebnispalette (nach dem Vektorisieren):",
     "Tracing (Basic)": "Nachzeichnen (Einfach)",
+    "Basic guide": "Leitfaden (Einfach)",
+    "Color mode": "Farbmodus",
+    "Transparency": "Transparenz",
+    "Recommended": "Empfohlen",
+    "Recommended: {choice}": "Empfohlen: {choice}",
+    "No transparency recommendation yet.": "Noch keine Transparenzempfehlung.",
+    "Choose hard edges, blended artwork, or a photograph. This sets Edges.": (
+        "Harte Kanten, Grafik mit Übergängen oder ein Foto wählen. Das setzt die Kanten."
+    ),
+    "Unlimited keeps the image colors. 2 colors uses a two-color palette, "
+    "or black and white when no palette is suggested. Custom edits the trace palette.": (
+        "Unbegrenzt behält die Bildfarben. 2 Farben nutzt eine Zweifarben-Palette "
+        "oder Schwarzweiß, wenn keine Palette vorgeschlagen ist. Benutzerdefiniert "
+        "bearbeitet die Trace-Palette."
+    ),
+    "Segments": "Segmente",
+    "Curves": "Kurven",
+    "Engine parameters": "Engine-Parameter",
+    "Show parameters": "Parameter anzeigen",
+    "Hide parameters": "Parameter ausblenden",
+    "Low-level tracer knobs. Values still apply while this section is collapsed.": (
+        "Feine Tracer-Regler. Die Werte gelten auch, solange dieser Abschnitt "
+        "eingeklappt ist."
+    ),
+    "Merge near-duplicate fills after an unlimited-color trace.": (
+        "Nahezu gleiche Füllungen nach einem Trace mit unbegrenzter Farbzahl zusammenfassen."
+    ),
+    "How regions drop anti-aliased fringe before curves are fit.": (
+        "Wie Bereiche geglättete Ränder verwerfen, bevor Kurven angepasst werden."
+    ),
+    "How tightly fitted contours follow the segmentation.": (
+        "Wie eng angepasste Konturen der Segmentierung folgen."
+    ),
     "Path fitting": "Pfadanpassung",
     "Noise removal (px)": "Rauschentfernung (px)",
     "Layering": "Schichtung",
-    "Advanced (VTracer)": "Erweitert (VTracer)",
     "Color precision (bits)": "Farbgenauigkeit (Bits)",
     "Layer difference": "Ebenendifferenz",
     "Corner threshold (°)": "Eckenschwelle (°)",
@@ -264,15 +395,17 @@ _DE: dict[str, str] = {
         "wählt Nachzeichnungs- sowie Vorverarbeitungsvorgaben. Hintergrund- und "
         "Farbsteuerungen darunter gelten immer — für Pfadoptionen zu Einfach wechseln."
     ),
-    "Fast: quicker, fewer paths. Balanced: default. "
-    "High detail: finer colors and more path detail.": (
-        "Schnell: schneller, weniger Pfade. Ausgewogen: Standard. "
-        "Hohe Detailtiefe: feinere Farben und mehr Pfaddetail."
+    "For artwork, Fast absorbs a wider blend, Balanced is about 2 px, "
+    "and High detail is about 1 px. For photographs, the same levels "
+    "change how many shapes are kept.": (
+        "Bei Grafik nimmt Schnell einen breiteren Übergang auf, Ausgewogen etwa 2 px "
+        "und Hohe Detailtiefe etwa 1 px. Bei Fotos ändern dieselben Stufen, "
+        "wie viele Formen erhalten bleiben."
     ),
-    "Make pixels near the selected background color transparent before tracing "
-    "(similar to a background knockout).": (
-        "Pixel nahe der gewählten Hintergrundfarbe vor dem Nachzeichnen transparent machen "
-        "(ähnlich einem Hintergrund-Knockout)."
+    "Knock out pixels close to the background color and treat them as empty. "
+    "This is separate from flattening existing alpha.": (
+        "Pixel nahe der Hintergrundfarbe ausstanzen und als leer behandeln. "
+        "Das ist etwas anderes als vorhandenes Alpha auf eine Farbe zu rechnen."
     ),
     "How close a pixel may be to the background color (0 = exact).": (
         "Wie nah ein Pixel an der Hintergrundfarbe liegen darf (0 = exakt)."
@@ -307,9 +440,37 @@ _DE: dict[str, str] = {
         "Gestapelt: überlappende Formen, kompakte Dateien. Ausschnitt: nicht überlappendes "
         "Mosaik, oft mehr Pfade."
     ),
-    "Keep existing alpha. If unchecked, alpha is composited onto the background color.": (
-        "Vorhandenes Alpha behalten. Wenn deaktiviert, wird Alpha auf die Hintergrundfarbe "
-        "aufgerechnet."
+    "Keep the image alpha, including a real soft mask. Uncheck to flatten: "
+    "composite the artwork onto the background color. This does not knock "
+    "out a solid backdrop.": (
+        "Das Alpha des Bildes behalten, auch eine echte weiche Maske. Deaktivieren "
+        "ebnet ab: die Grafik wird auf die Hintergrundfarbe gerechnet. Das stanzt "
+        "keinen deckenden Hintergrund aus."
+    ),
+    "Contour smoothness": "Konturglätte",
+    "Node budget": "Knotenbudget",
+    "AA artifact rejection": "AA-Artefakt-Unterdrückung",
+    "None": "Keine",
+    "Moderate": "Mittel",
+    "Aggressive": "Aggressiv",
+    "Drop anti-aliased fringe slivers that are not real features. "
+    "Moderate is the default. Aggressive absorbs a wider fringe. "
+    "This is not a minimum-pixel filter.": (
+        "Geglättete Randstreifen verwerfen, die keine echten Details sind. "
+        "Mittel ist die Vorgabe. Aggressiv nimmt einen breiteren Rand auf. "
+        "Das ist kein Mindest-Pixel-Filter."
+    ),
+    "How closely curves follow the pixels. Lower keeps wiggles; higher "
+    "flattens them. Scales blend fitting and the VTracer length threshold. "
+    "Path precision stays the number of decimal places.": (
+        "Wie eng Kurven den Pixeln folgen. Niedrig behält Zacken, hoch glättet sie. "
+        "Skaliert die Blend-Anpassung und die VTracer-Längenschwelle. "
+        "Die Pfadgenauigkeit bleibt die Anzahl der Nachkommastellen."
+    ),
+    "How many points to keep on fitted contours. Higher keeps more nodes; "
+    "lower simplifies with a Douglas–Peucker pass. Separate from contour smoothness.": (
+        "Wie viele Punkte an angepassten Konturen bleiben. Höher behält mehr Knoten, "
+        "niedriger vereinfacht mit Douglas–Peucker. Getrennt von der Konturglätte."
     ),
     "Palette": "Palette",
     "Select a palette color first.": "Zuerst eine Palettenfarbe auswählen.",
@@ -331,16 +492,29 @@ _DE: dict[str, str] = {
         "Dünne geglättete Reste in den Nachbarbereich übernehmen, statt sie zu löschen."
     ),
     "Find problems": "Probleme finden",
-    "Mark one-pixel gaps and pinched strokes so you can paint them closed.": (
-        "Ein-Pixel-Lücken und eingeschnürte Striche markieren, damit Sie sie schließen können."
+    "Mark one-pixel gaps and pinched strokes. Paint across a gap so regions "
+    "connect; open a one-pixel gap on a pinch to separate them.": (
+        "Ein-Pixel-Lücken und eingeschnürte Striche markieren. Über eine Lücke malen, "
+        "damit Bereiche verbunden werden; an einer Einschnürung eine Ein-Pixel-Lücke "
+        "öffnen, um sie zu trennen."
     ),
+    "Zap": "Auflösen",
+    "Dissolve the clicked segment into the neighboring colors.": (
+        "Den angeklickten Bereich in die Nachbarfarben auflösen."
+    ),
+    "Clicked segment split into neighboring colors.": (
+        "Angeklickter Bereich wurde in Nachbarfarben aufgeteilt."
+    ),
+    "Nothing to zap here.": "Hier gibt es nichts aufzulösen.",
     "Fringe regions merged into their neighbors.": (
         "Randbereiche in ihre Nachbarn übernommen."
     ),
     "No pinched gaps found.": "Keine eingeschnürten Lücken gefunden.",
-    "Problem spots are marked. Paint across a pinch or gap, then retrace.": (
-        "Problemstellen sind markiert. Über eine Einschnürung oder Lücke malen, "
-        "dann neu nachzeichnen."
+    "Problem spots are marked. Paint across a one-pixel gap so regions "
+    "connect. Open a one-pixel gap on a pinch to keep those regions separate.": (
+        "Problemstellen sind markiert. Über eine Ein-Pixel-Lücke malen, damit Bereiche "
+        "verbunden werden. An einer Einschnürung eine Ein-Pixel-Lücke öffnen, damit "
+        "diese Bereiche getrennt bleiben."
     ),
     "Retrace from segmentation": "Aus Segmentierung nachzeichnen",
     "Rebuild from source…": "Aus Quelle neu aufbauen…",
@@ -463,6 +637,16 @@ _DE: dict[str, str] = {
     "{name} already exists. Replace it?": "{name} existiert bereits. Ersetzen?",
     "Width (px)": "Breite (px)",
     "Height (px)": "Höhe (px)",
+    "Scale": "Skalierung",
+    "Lock aspect ratio": "Seitenverhältnis sperren",
+    "Keep the source aspect ratio when width, height, or scale changes.": (
+        "Das Seitenverhältnis der Quelle beibehalten, wenn Breite, Höhe oder "
+        "Skalierung sich ändern."
+    ),
+    "Source {width}×{height} px": "Quelle {width}×{height} px",
+    "Export at {factor}× the source pixel size (Alt+{factor}).": (
+        "Mit {factor}× der Quellpixelgröße exportieren (Alt+{factor})."
+    ),
     "Transparent": "Transparent",
     "White": "Weiß",
     "Black": "Schwarz",
@@ -597,11 +781,11 @@ _DE: dict[str, str] = {
     "Press Cancel in the sidebar to stop.": (
         "Zum Abbrechen in der Seitenleiste auf Abbrechen klicken."
     ),
-    "Click a pixel on the original. Press Esc to cancel.": (
-        "Klicken Sie ein Pixel im Original. Esc bricht ab."
+    "Click a pixel on the original. Ctrl-drag averages a region. Press Esc to cancel.": (
+        "Klicken Sie ein Pixel im Original. Strg-Ziehen mittelt einen Bereich. Esc bricht ab."
     ),
-    "Click a pixel to add it to the trace palette. Press Esc to cancel.": (
-        "Klicken Sie ein Pixel, um es der Farbpalette hinzuzufügen. Esc bricht ab."
+    "Click a pixel to add it to the trace palette. Ctrl-drag averages a region. Press Esc to cancel.": (
+        "Klicken Sie ein Pixel, um es der Farbpalette hinzuzufügen. Strg-Ziehen mittelt einen Bereich. Esc bricht ab."
     ),
     "Click a filled shape to delete it. Press Esc to cancel.": (
         "Klicken Sie eine gefüllte Form, um sie zu löschen. Esc bricht ab."
@@ -684,13 +868,40 @@ _DE: dict[str, str] = {
     "Small limited-color image; using pixel-aligned paths.": (
         "Kleines Bild mit begrenzten Farben; pixelgenaue Pfade werden verwendet."
     ),
-    "Automatic quality: Fast — fewer paths, quicker result.": (
-        "Automatik-Qualität: Schnell — weniger Pfade, schnelleres Ergebnis."
+    "Automatic quality: Fast — fewer, larger shapes.": (
+        "Automatik-Qualität: Schnell — weniger, größere Formen."
     ),
-    "Automatic quality: High detail — finer colors and paths.": (
-        "Automatik-Qualität: Hohe Detailtiefe — feinere Farben und Pfade."
+    "Automatic quality: High detail — more, smaller shapes.": (
+        "Automatik-Qualität: Hohe Detailtiefe — mehr, kleinere Formen."
     ),
-    "Automatic quality: Balanced.": "Automatik-Qualität: Ausgewogen.",
+    "Automatic quality: Balanced — medium shape budget.": (
+        "Automatik-Qualität: Ausgewogen — mittleres Formenbudget."
+    ),
+    "Automatic quality: Fast — wider noise and blend absorption.": (
+        "Automatik-Qualität: Schnell — breitere Rausch- und Übergangsaufnahme."
+    ),
+    "Automatic quality: High detail — about 1 px of edge blend.": (
+        "Automatik-Qualität: Hohe Detailtiefe — etwa 1 px Kantenübergang."
+    ),
+    "Automatic quality: Balanced — about 2 px of edge blend.": (
+        "Automatik-Qualität: Ausgewogen — etwa 2 px Kantenübergang."
+    ),
+    "Hard 1-bit alpha (GIF-style mask). Edges blend toward white — "
+    "flatten onto white instead of keeping the mask.": (
+        "Hartes 1-Bit-Alpha (GIF-artige Maske). Kanten laufen ins Weiß — "
+        "auf Weiß ebnen statt die Maske zu behalten."
+    ),
+    "Hard 1-bit alpha (GIF-style mask) with crisp edges. "
+    "Leaving transparency is appropriate.": (
+        "Hartes 1-Bit-Alpha (GIF-artige Maske) mit scharfen Kanten. "
+        "Transparenz beizubehalten ist passend."
+    ),
+    "Soft edges blend toward white rather than transparency. Flatten onto white.": (
+        "Weiche Kanten laufen ins Weiß statt in Transparenz. Auf Weiß ebnen."
+    ),
+    "Soft edges are true transparent anti-aliasing. Leave transparency on.": (
+        "Weiche Kanten sind echtes transparentes Anti-Aliasing. Transparenz eingeschaltet lassen."
+    ),
 }
 
 

@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import replace
 from pathlib import Path
 
+import numpy as np
+
 from PySide6.QtCore import QByteArray, QEvent, QSettings, QSize, Qt, QTimer
 from PySide6.QtGui import (
     QAction,
@@ -23,14 +25,18 @@ from PySide6.QtGui import (
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QDialog,
     QDialogButtonBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QMainWindow,
     QMessageBox,
+    QPushButton,
     QSpinBox,
     QStackedWidget,
     QTabWidget,
@@ -44,15 +50,23 @@ from vectorizer import __version__
 from vectorizer.domain.settings import (
     AutomaticQuality,
     DxfCurveMode,
+    EdgeTreatment,
     TraceSettings,
     WorkflowMode,
 )
-from vectorizer.errors import ExportError, ImageLoadError, ProjectError, TraceError, VectorizerError
+from vectorizer.errors import (
+    ExportError,
+    ImageLoadError,
+    ImageOversizeError,
+    ProjectError,
+    TraceError,
+    VectorizerError,
+)
 from vectorizer.export.dxf import export_dxf
 from vectorizer.export.eps import export_eps, inkscape_available
 from vectorizer.export.pdf import export_pdf
-from vectorizer.export.png import export_png_preview
-from vectorizer.export.svg import export_svg
+from vectorizer.export.png import export_png_preview, linked_export_size
+from vectorizer.export.svg import document_has_transparent_paint, export_svg
 from vectorizer.gui.batch_dialog import BatchDialog
 from vectorizer.gui.canvas import ImageCanvas, first_drop_path
 from vectorizer.gui.compare_view import SplitCompare, SyncSideBySide
@@ -82,9 +96,14 @@ from vectorizer.gui.trace_progress import TraceProgressOverlay
 from vectorizer.gui.welcome import WelcomeView
 from vectorizer.jobs.runner import TraceJobRunner
 from vectorizer.project.io import ProjectData, load_project, save_project
-from vectorizer.raster.analyzer import analyze_image
-from vectorizer.raster.loader import LoadedImage, load_image, load_image_from_bytes
-from vectorizer.raster.palette import suggest_palettes
+from vectorizer.raster.analyzer import ContentKind, analyze_image
+from vectorizer.raster.loader import (
+    DEFAULT_MAX_PIXELS,
+    LoadedImage,
+    load_image,
+    load_image_from_bytes,
+)
+from vectorizer.raster.palette import snap_image_to_palette, suggest_palettes
 from vectorizer.raster.preprocess import preprocess_image
 from vectorizer.resources import icon_path
 from vectorizer.segmentation.build import build_segmentation
@@ -142,7 +161,10 @@ class MainWindow(QMainWindow):
         self._export_dir = prefs.resolved_export_dir()
         self._persist_sidebar = False
         self._last_content_kind: str | None = None
+        self._last_analysis = None
         self._pending_seg_rebuild: object | None = None
+        self._palette_compare_pixmap: QPixmap | None = None
+        self._vector_pixmap: QPixmap | None = None
 
         self.panel = SettingsPanel()
         self.original_canvas = ImageCanvas()
@@ -177,6 +199,22 @@ class MainWindow(QMainWindow):
         self._mode_banner.setObjectName("modeBanner")
         self._mode_banner.setWordWrap(True)
         self._mode_banner.hide()
+        self._trouble_strip = QFrame()
+        self._trouble_strip.setObjectName("troubleStrip")
+        trouble_row = QHBoxLayout(self._trouble_strip)
+        trouble_row.setContentsMargins(8, 6, 8, 6)
+        trouble_row.setSpacing(8)
+        self._trouble_artwork = QPushButton()
+        self._trouble_detail = QPushButton()
+        self._trouble_bg = QPushButton()
+        for button in (self._trouble_artwork, self._trouble_detail, self._trouble_bg):
+            button.setObjectName("troubleButton")
+            trouble_row.addWidget(button)
+        trouble_row.addStretch(1)
+        self._trouble_strip.hide()
+        self._trouble_artwork.clicked.connect(self._trace_as_artwork)
+        self._trouble_detail.clicked.connect(self._cycle_detail)
+        self._trouble_bg.clicked.connect(self._remove_result_background)
 
         self.panel.setFixedWidth(SIDEBAR_WIDTH)
         central = QWidget()
@@ -191,6 +229,7 @@ class MainWindow(QMainWindow):
         stage_layout.setContentsMargins(0, 0, 0, 0)
         stage_layout.setSpacing(0)
         stage_layout.addWidget(self._mode_banner)
+        stage_layout.addWidget(self._trouble_strip)
         stage_layout.addWidget(self._preview_stack, 1)
         # Floating overlay (not layout-managed) so it can cover the preview.
         self._trace_overlay = TraceProgressOverlay(stage)
@@ -216,6 +255,7 @@ class MainWindow(QMainWindow):
         self.panel.automatic_quality_changed.connect(self._apply_automatic_quality)
         self.panel.settings_changed.connect(self._on_sidebar_settings_changed)
         self.original_canvas.pixel_clicked.connect(self._on_original_pixel_clicked)
+        self.original_canvas.region_sampled.connect(self._on_original_region_sampled)
         self.vector_canvas.pixel_clicked.connect(self._on_vector_pixel_clicked)
         self.side_by_side.right.pixel_clicked.connect(self._on_vector_pixel_clicked)
         self.seg_editor.retrace_requested.connect(self.retrace_segmentation)
@@ -313,6 +353,10 @@ class MainWindow(QMainWindow):
         self.remove_bg_shape_act = QAction(self)
         self.remove_bg_shape_act.triggered.connect(self._remove_result_background)
         self._edit_menu.addAction(self.remove_bg_shape_act)
+        self.compare_palette_act = QAction(self)
+        self.compare_palette_act.setCheckable(True)
+        self.compare_palette_act.toggled.connect(self._toggle_palette_compare)
+        self._edit_menu.addAction(self.compare_palette_act)
 
         self._view_menu = self.menuBar().addMenu("")
         self.fit_act = QAction(self)
@@ -432,7 +476,26 @@ class MainWindow(QMainWindow):
         self.remove_bg_shape_act.setToolTip(
             t("Drop finished paths whose fill matches the background color.")
         )
+        self.compare_palette_act.setText(t("Compare &palette"))
+        self.compare_palette_act.setToolTip(
+            t("Show the bitmap snapped to the trace palette beside the vector result.")
+        )
         self._view_menu.setTitle(t("&View"))
+        self._trouble_artwork.setText(t("Trace as artwork"))
+        self._trouble_artwork.setToolTip(
+            t(
+                "Re-trace flat or logo-like art with artwork edges instead of the photograph treatment."
+            )
+        )
+        self._trouble_detail.setText(t("Cycle detail"))
+        self._trouble_detail.setToolTip(
+            t("Step Automatic quality (fast, balanced, high) and trace again.")
+        )
+        self._trouble_bg.setText(t("Make background"))
+        self._trouble_bg.setToolTip(
+            t("Remove finished shapes whose fill matches the background color.")
+        )
+        self._update_trouble_strip()
         self.fit_act.setText(t("&Fit to window"))
         self.actual_act.setText(t("&Actual size"))
         from vectorizer.gui.theme import APPEARANCE_DARK, APPEARANCE_LIGHT, APPEARANCE_SYSTEM
@@ -760,6 +823,8 @@ class MainWindow(QMainWindow):
         self.export_eps_act.setEnabled(has_result and inkscape_available())
         self.delete_shape_act.setEnabled(has_result)
         self.remove_bg_shape_act.setEnabled(has_result)
+        self.compare_palette_act.setEnabled(has_image and not busy)
+        self._update_trouble_strip()
 
     def _open_dropped_path(self, path: object) -> None:
         if self._loaded is not None:
@@ -803,20 +868,30 @@ class MainWindow(QMainWindow):
             return
         self._begin_image_loading(stage="Reading image…")
         try:
-            loaded = load_image_from_bytes(qimage_to_png_bytes(image), source_path=None)
+            loaded = self._load_respecting_size(
+                load_image_from_bytes,
+                qimage_to_png_bytes(image),
+                source_path=None,
+            )
         except ImageLoadError as exc:
             self._end_image_loading()
             self._error(str(exc))
+            return
+        if loaded is None:
+            self._end_image_loading()
             return
         self._adopt_loaded(loaded)
 
     def open_path(self, path: Path) -> None:
         self._begin_image_loading(stage="Reading image…")
         try:
-            loaded = load_image(path)
+            loaded = self._load_respecting_size(load_image, path)
         except ImageLoadError as exc:
             self._end_image_loading()
             self._error(str(exc))
+            return
+        if loaded is None:
+            self._end_image_loading()
             return
         self._settings_store.setValue("ui/last_dir", str(path.parent))
         self._remember_recent(path)
@@ -955,6 +1030,14 @@ class MainWindow(QMainWindow):
             self._begin_image_loading(stage="Preparing preview…")
         try:
             self._clear_pointer_modes()
+            self._palette_compare_pixmap = None
+            self._vector_pixmap = None
+            if hasattr(self, "compare_palette_act"):
+                self.compare_palette_act.blockSignals(True)
+                self.compare_palette_act.setChecked(False)
+                self.compare_palette_act.blockSignals(False)
+            self.side_by_side.set_left_caption(None)
+            self.split_compare.set_left_caption(None)
             self._loaded = loaded
             self._result = None
             self._history.clear()
@@ -975,6 +1058,7 @@ class MainWindow(QMainWindow):
             self._refresh_palette_suggestions()
             self._update_image_loading("Analyzing image…", fraction=0.35)
             analysis = analyze_image(loaded.image, quality=quality)
+            self._last_analysis = analysis
             self._last_content_kind = analysis.content_kind.value
             notes = list(loaded.notes) + list(analysis.notes)
             if loaded.source_path and loaded.source_format != "PROJECT":
@@ -996,10 +1080,23 @@ class MainWindow(QMainWindow):
             except Exception:
                 self.seg_editor.clear_map()
             self.panel.set_notes("\n".join(notes) if notes else "")
+            self.panel.set_analysis_hints(
+                analysis.suggested,
+                transparency_note=analysis.transparency.note,
+                transparency_recommendation=analysis.transparency.recommendation.value,
+            )
             self._idle_status = False
+            shown = f"{analysis.width}×{analysis.height}"
+            if loaded.original_width and (
+                loaded.original_width != loaded.image.width
+                or loaded.original_height != loaded.image.height
+            ):
+                shown = (
+                    f"{loaded.image.width}×{loaded.image.height} "
+                    f"(from {loaded.original_width}×{loaded.original_height})"
+                )
             self._status_info.setText(
-                f"{analysis.width}×{analysis.height}  ·  mode {loaded.original_mode}  ·  "
-                f"{loaded.source_format}"
+                f"{shown}  ·  mode {loaded.original_mode}  ·  {loaded.source_format}"
             )
             self.statusBar().showMessage(
                 t("Image loaded. Adjust settings, then press Vectorize."),
@@ -1060,9 +1157,15 @@ class MainWindow(QMainWindow):
         quality = self.panel.settings().automatic_quality
         self._refresh_palette_suggestions()
         analysis = analyze_image(self._loaded.image, quality=quality)
+        self._last_analysis = analysis
         self._last_content_kind = analysis.content_kind.value
         notes = list(self._loaded.notes) + list(analysis.notes)
         self.panel.set_notes("\n".join(notes) if notes else "")
+        self.panel.set_analysis_hints(
+            analysis.suggested,
+            transparency_note=analysis.transparency.note,
+            transparency_recommendation=analysis.transparency.recommendation.value,
+        )
         self._apply_suggested_automatic(analysis.suggested, preserve_preprocess=True)
         labels = {
             AutomaticQuality.FAST: t("Fast"),
@@ -1186,7 +1289,7 @@ class MainWindow(QMainWindow):
             export_svg(
                 self._result.document,
                 dest,
-                paint_style=self.panel.settings().svg_paint_style,
+                settings=self.panel.settings(),
             )
         except ExportError as exc:
             self._error(str(exc))
@@ -1195,6 +1298,8 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(tf("Saved {path}", path=dest), 4000)
 
     def export_pdf_dialog(self) -> None:
+        if not self._confirm_lossy_alpha_export("PDF"):
+            return
         dest = self._ask_export_path(t("Export PDF"), f"{t('PDF')} (*.pdf)", ".pdf")
         if dest is None or self._result is None:
             return
@@ -1211,12 +1316,16 @@ class MainWindow(QMainWindow):
             self._error(t("Vectorize an image before exporting."))
             return
         prefs = current_preferences()
-        default_w = prefs.png_width or int(self._result.document.width)
-        default_h = prefs.png_height or int(self._result.document.height)
+        source_w = max(1, int(self._result.document.width or 1))
+        source_h = max(1, int(self._result.document.height or 1))
+        default_w = prefs.png_width or source_w
+        default_h = prefs.png_height or source_h
         dialog = PngExportDialog(
             self,
             default_w=default_w,
             default_h=default_h,
+            source_w=source_w,
+            source_h=source_h,
             default_background=prefs.png_background_value(),
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
@@ -1247,18 +1356,28 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(tf("Saved PNG preview {path}", path=dest), 4000)
 
     def export_dxf_dialog(self) -> None:
+        if not self._confirm_lossy_alpha_export("DXF"):
+            return
         dest = self._ask_export_path(t("Export DXF"), f"{t('DXF')} (*.dxf)", ".dxf")
         if dest is None or self._result is None:
             return
         try:
-            curve_mode = self.panel.settings().dxf_curve_mode
-            export_dxf(self._result.document, dest, curve_mode=curve_mode)
+            settings = self.panel.settings()
+            curve_mode = settings.dxf_curve_mode
+            export_dxf(
+                self._result.document,
+                dest,
+                curve_mode=curve_mode,
+                line_density=settings.dxf_line_density,
+            )
         except ExportError as exc:
             self._error(str(exc))
             return
         self._remember_export_dir(dest)
         if curve_mode == DxfCurveMode.SPLINES:
             note = t("outlines only; cubics as splines; fills omitted")
+        elif curve_mode == DxfCurveMode.LINES_AND_ARCS:
+            note = t("outlines only; lines and circular arcs; fills omitted")
         else:
             note = t("outlines only; curves linearized")
         self.statusBar().showMessage(tf("Saved DXF {path} ({note})", path=dest, note=note), 5000)
@@ -1269,11 +1388,13 @@ class MainWindow(QMainWindow):
                 t("EPS export requires Inkscape on PATH or a path set in Preferences.")
             )
             return
+        if not self._confirm_lossy_alpha_export("EPS"):
+            return
         dest = self._ask_export_path(t("Export EPS"), f"{t('EPS')} (*.eps)", ".eps")
         if dest is None or self._result is None:
             return
         try:
-            export_eps(self._result.document, dest)
+            export_eps(self._result.document, dest, settings=self.panel.settings())
         except ExportError as exc:
             self._error(str(exc))
             return
@@ -1299,7 +1420,9 @@ class MainWindow(QMainWindow):
         self._picking_background = True
         self.preview_tabs.setCurrentWidget(self.original_canvas)
         self.original_canvas.set_sample_mode(True)
-        self._show_mode_banner(t("Click a pixel on the original. Press Esc to cancel."))
+        self._show_mode_banner(
+            t("Click a pixel on the original. Ctrl-drag averages a region. Press Esc to cancel.")
+        )
 
     def _start_palette_pick(self) -> None:
         if self._loaded is None:
@@ -1312,7 +1435,9 @@ class MainWindow(QMainWindow):
         self.preview_tabs.setCurrentWidget(self.original_canvas)
         self.original_canvas.set_sample_mode(True)
         self._show_mode_banner(
-            t("Click a pixel to add it to the trace palette. Press Esc to cancel.")
+            t(
+                "Click a pixel to add it to the trace palette. Ctrl-drag averages a region. Press Esc to cancel."
+            )
         )
 
     def _on_original_pixel_clicked(self, x: int, y: int) -> None:
@@ -1325,13 +1450,29 @@ class MainWindow(QMainWindow):
         if len(pixel) < 3:
             return
         color = QColor(int(pixel[0]), int(pixel[1]), int(pixel[2]))
+        self._apply_picked_color(color)
+
+    def _on_original_region_sampled(self, x0: int, y0: int, x1: int, y1: int) -> None:
+        if self._loaded is None or not (self._picking_background or self._picking_palette):
+            return
+        if abs(x1 - x0) < 2 and abs(y1 - y0) < 2:
+            x0, y0, x1, y1 = x0 - 2, y0 - 2, x0 + 2, y0 + 2
+        averaged = _average_rgb(self._loaded.image, x0, y0, x1, y1)
+        if averaged is None:
+            return
+        color, count = averaged
+        self._apply_picked_color(color, averaged_count=count)
+
+    def _apply_picked_color(self, color: QColor, *, averaged_count: int = 0) -> None:
         if self._picking_palette:
             self.panel.add_trace_color(color.name())
             self._picking_palette = False
             self.original_canvas.set_sample_mode(False)
             self._show_mode_banner(None)
             self.statusBar().showMessage(
-                tf("Added {color} to the trace palette.", color=color.name()),
+                tf("Averaged {count} pixels to {color}.", count=averaged_count, color=color.name())
+                if averaged_count > 1
+                else tf("Added {color} to the trace palette.", color=color.name()),
                 6000,
             )
             return
@@ -1340,7 +1481,11 @@ class MainWindow(QMainWindow):
         self.original_canvas.set_sample_mode(False)
         self._show_mode_banner(None)
         self.statusBar().showMessage(
-            tf("Background set to {color} — press Vectorize to apply.", color=color.name()),
+            tf("Averaged {count} pixels to {color}.", count=averaged_count, color=color.name())
+            if averaged_count > 1
+            else tf(
+                "Background set to {color} — press Vectorize to apply.", color=color.name()
+            ),
             6000,
         )
 
@@ -1566,7 +1711,12 @@ class MainWindow(QMainWindow):
             self._error(t("The SVG was generated but Qt could not render it."))
             return
         vector_pix = _svg_to_pixmap(svg, int(result.document.width), int(result.document.height))
-        self.split_compare.set_images(self._original_pixmap, vector_pix)
+        self._vector_pixmap = vector_pix
+        compare_source = self._palette_compare_pixmap or self._original_pixmap
+        if self._palette_compare_pixmap is not None:
+            self.original_canvas.show_pixmap(self._palette_compare_pixmap)
+            self.side_by_side.left.show_pixmap(self._palette_compare_pixmap)
+        self.split_compare.set_images(compare_source, vector_pix)
         palette = [
             group.palette_key
             for group in result.document.groups
@@ -1615,9 +1765,10 @@ class MainWindow(QMainWindow):
 
     def _clear_vector_views(self) -> None:
         self._result = None
+        self._vector_pixmap = None
         self.vector_canvas.clear_content()
         self.side_by_side.right.clear_content()
-        self.split_compare.set_images(self._original_pixmap, None)
+        self.split_compare.set_images(self._palette_compare_pixmap or self._original_pixmap, None)
         self.panel.set_palette([])
         self._idle_status = False
         self._status_info.setText(t("Result cleared (undo)."))
@@ -1814,24 +1965,315 @@ class MainWindow(QMainWindow):
     def current_result(self) -> TraceResult | None:
         return self._result
 
+    def _load_respecting_size(self, loader, *args, **kwargs):
+        """Load a raster, offering a shrink when it exceeds the working cap.
+
+        `max_side` on the current settings skips the prompt and shrinks.
+        Returns None when the user declines. Other load errors still raise.
+        """
+        max_side = 0
+        try:
+            max_side = int(self.panel.settings().max_side)
+        except ValueError:
+            max_side = 0
+        kwargs.setdefault("max_side", max_side)
+        kwargs.setdefault("shrink", max_side > 0)
+        try:
+            return loader(*args, **kwargs)
+        except ImageOversizeError as exc:
+            self._end_image_loading()
+            megapixels = (exc.width * exc.height) / 1_000_000.0
+            limit = DEFAULT_MAX_PIXELS / 1_000_000.0
+            answer = QMessageBox.question(
+                self,
+                t("Image is very large"),
+                tf(
+                    "This image is {width}×{height} ({megapixels:.1f} megapixels), above the "
+                    "{limit:.0f} megapixel working limit. Shrink the working copy so the long side "
+                    "is {side} px? The original file is not modified.",
+                    width=exc.width,
+                    height=exc.height,
+                    megapixels=megapixels,
+                    limit=limit,
+                    side=exc.recommended_max_side,
+                ),
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return None
+            self._begin_image_loading(stage="Reading image…")
+            kwargs["max_side"] = exc.recommended_max_side
+            kwargs["shrink"] = True
+            return loader(*args, **kwargs)
+
+    def _confirm_lossy_alpha_export(self, _kind: str) -> bool:
+        """Warn when EPS/PDF/DXF would drop transparent fills. False cancels."""
+        if self._result is None or not document_has_transparent_paint(self._result.document):
+            return True
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle(t("Transparency may be lost"))
+        box.setText(
+            t(
+                "This result has transparent fills. EPS, PDF, and DXF do not keep that alpha. "
+                "A PNG preview preserves it."
+            )
+        )
+        png_btn = box.addButton(t("Export PNG instead"), QMessageBox.ButtonRole.ActionRole)
+        cont = box.addButton(t("Continue"), QMessageBox.ButtonRole.AcceptRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is png_btn:
+            self.export_png_dialog()
+            return False
+        return clicked is cont
+
+    def _toggle_palette_compare(self, enabled: bool) -> None:
+        if not enabled:
+            self._palette_compare_pixmap = None
+            self.side_by_side.set_left_caption(None)
+            self.split_compare.set_left_caption(None)
+            if self._original_pixmap is not None:
+                self.original_canvas.show_pixmap(self._original_pixmap)
+                self.side_by_side.left.show_pixmap(self._original_pixmap)
+            self.split_compare.set_images(self._original_pixmap, self._vector_pixmap)
+            return
+        if self._loaded is None:
+            self.compare_palette_act.blockSignals(True)
+            self.compare_palette_act.setChecked(False)
+            self.compare_palette_act.blockSignals(False)
+            return
+        try:
+            settings = self.panel.settings()
+        except ValueError as exc:
+            self._error(str(exc))
+            self.compare_palette_act.blockSignals(True)
+            self.compare_palette_act.setChecked(False)
+            self.compare_palette_act.blockSignals(False)
+            return
+        palette = self._compare_palette_colors(settings)
+        if not palette:
+            self.compare_palette_act.blockSignals(True)
+            self.compare_palette_act.setChecked(False)
+            self.compare_palette_act.blockSignals(False)
+            self.statusBar().showMessage(t("No palette to compare."), 4000)
+            return
+        snapped = snap_image_to_palette(
+            self._loaded.image,
+            palette,
+            tolerance=settings.palette_tolerance,
+        )
+        pixmap = pil_to_qpixmap(snapped)
+        self._palette_compare_pixmap = pixmap
+        self.original_canvas.show_pixmap(pixmap)
+        self.side_by_side.left.show_pixmap(pixmap)
+        self.side_by_side.set_left_caption("Palette")
+        self.split_compare.set_left_caption("Palette")
+        self.split_compare.set_images(pixmap, self._vector_pixmap)
+        self.preview_tabs.setCurrentWidget(self.split_compare)
+        self.statusBar().showMessage(t("Palette compare is showing the snapped bitmap."), 4000)
+
+    def _compare_palette_colors(self, settings: TraceSettings) -> tuple[str, ...]:
+        if settings.palette:
+            return settings.palette
+        if self._result is not None:
+            seen: list[str] = []
+            for group in self._result.document.groups:
+                key = group.palette_key
+                if key and key.startswith("#") and key not in seen:
+                    seen.append(key)
+            if seen:
+                return tuple(seen[:32])
+        if self._loaded is None:
+            return ()
+        ignore = None
+        if settings.remove_background:
+            ignore = (settings.background_r, settings.background_g, settings.background_b)
+        suggestions = suggest_palettes(self._loaded.image, ignore_rgb=ignore)
+        best = suggestions.palettes.get(suggestions.best) or ()
+        return tuple(best)
+
+    def _update_trouble_strip(self) -> None:
+        if not hasattr(self, "_trouble_strip"):
+            return
+        artwork = False
+        cycle = False
+        background = False
+        if self._result is not None and self._loaded is not None and not self.runner.busy:
+            try:
+                panel = self.panel.settings()
+            except ValueError:
+                panel = self._result.settings
+            treatment = self._result.settings.edge_treatment
+            if (
+                treatment == EdgeTreatment.AUTO
+                and self._last_analysis is not None
+                and self._result.settings.workflow == WorkflowMode.AUTOMATIC
+            ):
+                treatment = self._last_analysis.suggested.edge_treatment
+            kind = None
+            if self._last_content_kind:
+                try:
+                    kind = ContentKind(self._last_content_kind)
+                except ValueError:
+                    kind = None
+            flat_like = kind in {
+                ContentKind.FLAT_LOGO,
+                ContentKind.ILLUSTRATION,
+                ContentKind.PIXEL_ART,
+                ContentKind.BINARY_MARK,
+                ContentKind.LINE_ART,
+            }
+            artwork = treatment == EdgeTreatment.PHOTO and flat_like
+            cycle = panel.workflow == WorkflowMode.AUTOMATIC
+            try:
+                edited = remove_background_shapes(
+                    self._result.document,
+                    (
+                        panel.background_r,
+                        panel.background_g,
+                        panel.background_b,
+                    ),
+                    tolerance=panel.background_tolerance,
+                )
+                background = edited.path_count < self._result.document.path_count
+            except Exception:
+                background = False
+        self._trouble_artwork.setVisible(artwork)
+        self._trouble_detail.setVisible(cycle)
+        self._trouble_bg.setVisible(background)
+        self._trouble_strip.setVisible(artwork or cycle or background)
+
+    def _trace_as_artwork(self) -> None:
+        if self._loaded is None or self.runner.busy:
+            return
+        kind = None
+        if self._last_content_kind:
+            try:
+                kind = ContentKind(self._last_content_kind)
+            except ValueError:
+                kind = None
+        treatment = EdgeTreatment.BLENDED
+        if kind in {ContentKind.PIXEL_ART, ContentKind.BINARY_MARK, ContentKind.LINE_ART}:
+            treatment = EdgeTreatment.HARD
+        try:
+            current = self.panel.settings()
+        except ValueError as exc:
+            self._error(str(exc))
+            return
+        self.panel.set_settings(replace(current, edge_treatment=treatment))
+        self.vectorize(preview_preprocess=False)
+
+    def _cycle_detail(self) -> None:
+        if self._loaded is None or self.runner.busy:
+            return
+        try:
+            current = self.panel.settings()
+        except ValueError as exc:
+            self._error(str(exc))
+            return
+        order = (
+            AutomaticQuality.FAST,
+            AutomaticQuality.BALANCED,
+            AutomaticQuality.HIGH,
+        )
+        try:
+            index = order.index(AutomaticQuality(current.automatic_quality))
+        except ValueError:
+            index = 1
+        nxt = order[(index + 1) % len(order)]
+        self.panel.set_settings(
+            replace(current, workflow=WorkflowMode.AUTOMATIC, automatic_quality=nxt)
+        )
+        self._apply_automatic_quality()
+        self.vectorize(preview_preprocess=False)
+
+
+def _average_rgb(image, x0: int, y0: int, x1: int, y1: int) -> tuple[QColor, int] | None:
+    """Mean RGB of an inclusive rectangle, ignoring nearly transparent pixels."""
+    width, height = image.size
+    left = max(0, min(width - 1, min(x0, x1)))
+    right = max(0, min(width - 1, max(x0, x1)))
+    top = max(0, min(height - 1, min(y0, y1)))
+    bottom = max(0, min(height - 1, max(y0, y1)))
+    crop = image.crop((left, top, right + 1, bottom + 1)).convert("RGBA")
+    arr = np.asarray(crop, dtype=np.float64)
+    if arr.size == 0:
+        return None
+    rgb = arr[..., :3].reshape(-1, 3)
+    alpha = arr[..., 3].reshape(-1)
+    mask = alpha >= 16.0
+    sample = rgb[mask] if bool(mask.any()) else rgb
+    if sample.size == 0:
+        return None
+    mean = sample.mean(axis=0)
+    color = QColor(int(round(mean[0])), int(round(mean[1])), int(round(mean[2])))
+    return color, int(sample.shape[0])
+
 
 class PngExportDialog(QDialog):
+    _MAX_PX = 16000
+
     def __init__(
         self,
         parent: QWidget,
         *,
         default_w: int,
         default_h: int,
+        source_w: int | None = None,
+        source_h: int | None = None,
         default_background: str | None = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle(t("Export PNG preview"))
+        self._source_w = max(1, int(source_w if source_w else default_w))
+        self._source_h = max(1, int(source_h if source_h else default_h))
+        self._link_guard = False
         self.width_spin = QSpinBox()
-        self.width_spin.setRange(1, 16000)
-        self.width_spin.setValue(max(1, default_w))
+        self.width_spin.setRange(1, self._MAX_PX)
+        self.width_spin.setValue(max(1, min(self._MAX_PX, int(default_w))))
         self.height_spin = QSpinBox()
-        self.height_spin.setRange(1, 16000)
-        self.height_spin.setValue(max(1, default_h))
+        self.height_spin.setRange(1, self._MAX_PX)
+        self.height_spin.setValue(max(1, min(self._MAX_PX, int(default_h))))
+        self.scale_spin = QDoubleSpinBox()
+        self.scale_spin.setRange(0.05, 32.0)
+        self.scale_spin.setDecimals(2)
+        self.scale_spin.setSingleStep(0.25)
+        self.scale_spin.setSuffix("×")
+        self.scale_spin.setValue(1.0)
+        preset_row = QWidget()
+        presets = QHBoxLayout(preset_row)
+        presets.setContentsMargins(0, 0, 0, 0)
+        presets.setSpacing(4)
+        self._scale_buttons: dict[int, QPushButton] = {}
+        for factor in (1, 2, 4, 8):
+            button = QPushButton(f"{factor}×")
+            button.setToolTip(
+                tf(
+                    "Export at {factor}× the source pixel size (Alt+{factor}).",
+                    factor=factor,
+                )
+            )
+            button.setShortcut(QKeySequence(f"Alt+{factor}"))
+            button.clicked.connect(
+                lambda _checked=False, value=factor: self._apply_scale(value)
+            )
+            self._scale_buttons[factor] = button
+            presets.addWidget(button)
+        presets.addWidget(self.scale_spin, 1)
+        self.lock_aspect = QCheckBox(t("Lock aspect ratio"))
+        self.lock_aspect.setChecked(True)
+        self.lock_aspect.setToolTip(
+            t("Keep the source aspect ratio when width, height, or scale changes.")
+        )
+        self._source_label = QLabel(
+            tf(
+                "Source {width}×{height} px",
+                width=self._source_w,
+                height=self._source_h,
+            )
+        )
+        self._source_label.setObjectName("inlineHint")
         self.bg = QComboBox()
         self.bg.addItem(t("Transparent"), None)
         self.bg.addItem(t("White"), "#ffffff")
@@ -1842,8 +2284,11 @@ class PngExportDialog(QDialog):
             if idx >= 0:
                 self.bg.setCurrentIndex(idx)
         form = QFormLayout(self)
+        form.addRow(self._source_label)
+        form.addRow(t("Scale"), preset_row)
         form.addRow(t("Width (px)"), self.width_spin)
         form.addRow(t("Height (px)"), self.height_spin)
+        form.addRow(self.lock_aspect)
         form.addRow(t("Background"), self.bg)
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -1851,6 +2296,86 @@ class PngExportDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         form.addRow(buttons)
+        self.width_spin.valueChanged.connect(self._on_width_changed)
+        self.height_spin.valueChanged.connect(self._on_height_changed)
+        self.scale_spin.valueChanged.connect(self._on_scale_changed)
+        self.lock_aspect.toggled.connect(self._on_lock_toggled)
+        linked_w, linked_h, scale = linked_export_size(
+            self._source_w, self._source_h, width=self.width_spin.value()
+        )
+        if abs(linked_h - self.height_spin.value()) <= 1:
+            self._apply_linked(linked_w, linked_h, scale)
+        else:
+            self.lock_aspect.setChecked(False)
+            self._link_guard = True
+            self.scale_spin.setValue(self.width_spin.value() / float(self._source_w))
+            self._link_guard = False
+
+    def _fit(self, width: int, height: int, scale: float) -> tuple[int, int, float]:
+        limit_w = self._MAX_PX / float(self._source_w)
+        limit_h = self._MAX_PX / float(self._source_h)
+        max_scale = min(32.0, limit_w, limit_h)
+        if scale > max_scale or width > self._MAX_PX or height > self._MAX_PX:
+            return linked_export_size(self._source_w, self._source_h, scale=max_scale)
+        if scale < 0.05:
+            return linked_export_size(self._source_w, self._source_h, scale=0.05)
+        return int(width), int(height), float(scale)
+
+    def _apply_linked(self, width: int, height: int, scale: float) -> None:
+        width, height, scale = self._fit(width, height, scale)
+        self._link_guard = True
+        self.width_spin.setValue(int(width))
+        self.height_spin.setValue(int(height))
+        self.scale_spin.setValue(float(scale))
+        self._link_guard = False
+
+    def _apply_scale(self, factor: float) -> None:
+        width, height, scale = linked_export_size(
+            self._source_w, self._source_h, scale=float(factor)
+        )
+        self._apply_linked(width, height, scale)
+
+    def _on_width_changed(self, value: int) -> None:
+        if self._link_guard:
+            return
+        if self.lock_aspect.isChecked():
+            width, height, scale = linked_export_size(
+                self._source_w, self._source_h, width=int(value)
+            )
+            self._apply_linked(width, height, scale)
+            return
+        self._link_guard = True
+        self.scale_spin.setValue(int(value) / float(self._source_w))
+        self._link_guard = False
+
+    def _on_height_changed(self, value: int) -> None:
+        if self._link_guard:
+            return
+        if self.lock_aspect.isChecked():
+            width, height, scale = linked_export_size(
+                self._source_w, self._source_h, height=int(value)
+            )
+            self._apply_linked(width, height, scale)
+            return
+        self._link_guard = True
+        self.scale_spin.setValue(int(value) / float(self._source_h))
+        self._link_guard = False
+
+    def _on_scale_changed(self, value: float) -> None:
+        if self._link_guard:
+            return
+        width, height, scale = linked_export_size(
+            self._source_w, self._source_h, scale=float(value)
+        )
+        self._apply_linked(width, height, scale)
+
+    def _on_lock_toggled(self, checked: bool) -> None:
+        if not checked or self._link_guard:
+            return
+        width, height, scale = linked_export_size(
+            self._source_w, self._source_h, width=self.width_spin.value()
+        )
+        self._apply_linked(width, height, scale)
 
     def values(self) -> tuple[int, int, str | None]:
         return self.width_spin.value(), self.height_spin.value(), self.bg.currentData()

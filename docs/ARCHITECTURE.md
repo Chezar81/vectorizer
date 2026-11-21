@@ -34,8 +34,8 @@ removal and cutout hierarchy for nested holes).
 | `domain` | `TraceSettings`, `VectorDocument` (paths, fills, groups, ordering) |
 | `raster` | Load, EXIF, GIF first frame, size limits, analysis, preprocess |
 | `vectorize` | Backend protocol + VTracer adapter |
-| `svg` | XML parse + fill recolor; no regex rewriting of geometry |
-| `export` | Atomic SVG, vector PDF, PNG preview |
+| `svg` | XML parse + fill recolor; gap filler / stroke-edge paint styles |
+| `export` | Atomic SVG, vector PDF, PNG preview, DXF (lines / arcs / splines) |
 | `presets` | Named JSON presets (no pickle) |
 | `segmentation` | Working map, ops, history (memory-bounded undo) |
 | `project` | `.vproj` ZIP container (manifest + PNG/SVG assets) |

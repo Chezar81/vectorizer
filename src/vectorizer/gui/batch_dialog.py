@@ -339,6 +339,7 @@ class BatchDialog(QDialog):
             formats=tuple(formats),
             collision=collision,
             continue_on_error=continue_on_error,
+            max_side=int(settings.max_side or 0),
         )
         update_preferences(
             export_svg=self.fmt_svg.isChecked(),

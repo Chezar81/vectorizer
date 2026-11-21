@@ -9,37 +9,81 @@ from vectorizer.domain.document import VectorDocument
 from vectorizer.domain.settings import SvgPaintStyle, normalize_hex
 from vectorizer.errors import SvgParseError
 from vectorizer.raster.color import hex_to_rgb, nearest_oklab, rgb_to_hex, srgb_u8_to_oklab
+from vectorizer.svg.edges import edge_to_path_d, find_shared_edges
 from vectorizer.svg.parse import parse_svg_document
 
 import numpy as np
 
 
-def snap_fills_to_palette(document: VectorDocument, palette: tuple[str, ...]) -> VectorDocument:
-    """Force every path fill onto the nearest constrained palette color."""
-    if not palette or document.path_count == 0:
+def snap_fills_to_palette(
+    document: VectorDocument,
+    palette: tuple[str, ...],
+    *,
+    tolerance: int = 255,
+    remaps: tuple[tuple[str, str], ...] = (),
+) -> VectorDocument:
+    """Snap path fills onto the palette, then apply optional remaps.
+
+    `tolerance` is max sRGB channel-ish distance (0–255). At 255 every fill
+    snaps to the nearest palette color (legacy behaviour). Lower values leave
+    unmatched fills unchanged. Remap targets of `#00000000` drop those fills.
+    """
+    if document.path_count == 0:
         return document
-    targets = tuple(normalize_hex(color) for color in palette)
     mapping: dict[str, str] = {}
-    palette_lab = srgb_u8_to_oklab(_rgb_array(targets))
-    for group in document.groups:
-        key = group.palette_key
-        if not key or not key.startswith("#"):
-            continue
+    if palette:
+        targets = tuple(normalize_hex(color) for color in palette)
+        palette_lab = srgb_u8_to_oklab(_rgb_array(targets))
+        # Approximate OKLab distance threshold from 0–255 sRGB tolerance.
+        # Full snap (255) disables the gate. Empirically ~ (t/255)^2 * 0.45.
+        limit = None if int(tolerance) >= 255 else (max(0, int(tolerance)) / 255.0) ** 2 * 0.45
+        for group in document.groups:
+            key = group.palette_key
+            if not key or not key.startswith("#"):
+                continue
+            try:
+                source = normalize_hex(key)
+            except ValueError:
+                continue
+            source_lab = srgb_u8_to_oklab(_rgb_array((source,)))
+            index, dist = nearest_oklab(source_lab.reshape(1, 1, 3), palette_lab)
+            if limit is not None and float(dist[0, 0]) > limit:
+                continue
+            nearest = targets[int(index[0, 0])]
+            if nearest != source:
+                mapping[key] = nearest
+                mapping[source] = nearest
+    for source, target in remaps:
         try:
-            source = normalize_hex(key)
+            src = normalize_hex(source)
         except ValueError:
             continue
-        source_lab = srgb_u8_to_oklab(_rgb_array((source,)))
-        index, _dist = nearest_oklab(source_lab.reshape(1, 1, 3), palette_lab)
-        nearest = targets[int(index[0, 0])]
-        if nearest != source:
-            mapping[key] = nearest
-            mapping[source] = nearest
+        mapping[src] = target
+        mapping[source] = target
     if not mapping:
         return document
+    # Drop fills remapped to transparent by deleting those shapes.
+    drop_colors = {src for src, dst in mapping.items() if dst == "#00000000"}
+    working = document
+    if drop_colors:
+        doomed: set[int] = set()
+        for group in working.groups:
+            for path in group.paths:
+                color = path.fill.color if path.fill else ""
+                try:
+                    hex_color = normalize_hex(color) if color.startswith("#") else ""
+                except ValueError:
+                    hex_color = ""
+                if hex_color in drop_colors or color in drop_colors:
+                    doomed.add(path.source_order)
+        if doomed:
+            working = _drop_path_indices(working, doomed)
+        mapping = {k: v for k, v in mapping.items() if v != "#00000000"}
+    if not mapping:
+        return working
     from vectorizer.svg.recolor import recolor_document
 
-    return recolor_document(document, mapping)
+    return recolor_document(working, mapping)
 
 
 def delete_shape_at(document: VectorDocument, x: float, y: float) -> VectorDocument | None:
@@ -79,17 +123,98 @@ def remove_background_shapes(
     return _drop_path_indices(document, doomed)
 
 
-def apply_paint_style(document: VectorDocument, style: SvgPaintStyle) -> VectorDocument:
-    """Return a document whose SVG uses fill only, or fill plus a same-color hairline stroke."""
-    if style != SvgPaintStyle.STROKE_FILL:
+# Medium cluster radius, squared OKLab. palette.py treats ~0.012 as below a
+# visible step; blend tracing treats ~0.06 (squared 0.0036) as one ramp.
+# 0.03 sits between them: near-duplicate fills merge, distinct inks stay apart.
+MEDIUM_CLUSTER_DIST2 = 0.03 * 0.03
+
+
+def cluster_similar_fills(
+    document: VectorDocument,
+    *,
+    max_dist2: float = MEDIUM_CLUSTER_DIST2,
+) -> VectorDocument:
+    """Merge near-duplicate fills onto the more common color.
+
+    Intended for unlimited / empty-palette traces. A locked palette should
+    not call this; the palette is already the color source of truth. The
+    default radius is the medium OKLab step above. Returns the same document
+    when nothing is close enough to merge.
+    """
+    counts: dict[str, int] = {}
+    for group in document.groups:
+        key = group.palette_key
+        if not key or not key.startswith("#"):
+            continue
+        try:
+            hex_color = normalize_hex(key)
+        except ValueError:
+            continue
+        counts[hex_color] = counts.get(hex_color, 0) + len(group.paths)
+    if len(counts) < 2:
         return document
+    ordered = sorted(counts, key=lambda color: (-counts[color], color))
+    labs = {color: srgb_u8_to_oklab(_rgb_array((color,)))[0] for color in ordered}
+    mapping: dict[str, str] = {}
+    kept: list[str] = []
+    limit = float(max_dist2)
+    for color in ordered:
+        lab = labs[color]
+        best: str | None = None
+        best_dist: float | None = None
+        for keeper in kept:
+            delta = lab - labs[keeper]
+            dist2 = float(delta @ delta)
+            if best_dist is None or dist2 < best_dist:
+                best = keeper
+                best_dist = dist2
+        if best is not None and best_dist is not None and best_dist <= limit and best != color:
+            mapping[color] = best
+        else:
+            kept.append(color)
+    if not mapping:
+        return document
+    from vectorizer.svg.recolor import recolor_document
+
+    return recolor_document(document, mapping)
+
+
+def apply_paint_style(
+    document: VectorDocument,
+    style: SvgPaintStyle,
+    *,
+    gap_filler_width: float = 2.0,
+    gap_filler_non_scaling: bool = True,
+) -> VectorDocument:
+    """Apply SVG paint style: fill, same-color stroke, gap filler, or edge strokes."""
+    style = SvgPaintStyle(style)
+    if style == SvgPaintStyle.FILL:
+        return document
+    if style == SvgPaintStyle.STROKE_FILL:
+        return _apply_stroke_fill(document)
+    if style == SvgPaintStyle.GAP_FILLER:
+        return _apply_gap_filler(
+            document,
+            width=gap_filler_width,
+            non_scaling=gap_filler_non_scaling,
+        )
+    if style == SvgPaintStyle.STROKE_EDGES:
+        return _apply_stroke_edges(
+            document,
+            width=gap_filler_width,
+            non_scaling=gap_filler_non_scaling,
+        )
+    return document
+
+
+def _apply_stroke_fill(document: VectorDocument) -> VectorDocument:
     try:
         root = ET.fromstring(document.raw_svg)
     except ET.ParseError as exc:
         raise SvgParseError(f"Cannot restyle SVG: {exc}") from exc
     changed = False
     for element in root.iter():
-        if _local(element.tag) != "path":
+        if _local(element.tag) not in {"path", "circle", "rect", "ellipse", "polygon"}:
             continue
         fill = element.get("fill")
         if not fill or fill.lower() == "none":
@@ -101,6 +226,111 @@ def apply_paint_style(document: VectorDocument, style: SvgPaintStyle) -> VectorD
     if not changed:
         return document
     return replace(document, raw_svg=_serialize(root))
+
+
+def _apply_gap_filler(
+    document: VectorDocument,
+    *,
+    width: float,
+    non_scaling: bool,
+) -> VectorDocument:
+    """Insert average-color understrokes along shared edges, keep fills on top."""
+    edges = find_shared_edges(document)
+    if not edges:
+        return document
+    try:
+        root = ET.fromstring(document.raw_svg)
+    except ET.ParseError as exc:
+        raise SvgParseError(f"Cannot restyle SVG: {exc}") from exc
+    ns = _svg_namespace(root)
+    group = ET.Element(_tag("g", ns))
+    group.set("id", "gap-filler")
+    stroke_width = f"{max(0.0, min(5.0, float(width))):.3g}"
+    for edge in edges:
+        d = edge_to_path_d(edge.points)
+        if not d:
+            continue
+        path = ET.Element(_tag("path", ns))
+        path.set("d", d)
+        path.set("fill", "none")
+        path.set("stroke", edge.average_color)
+        path.set("stroke-width", stroke_width)
+        path.set("stroke-linecap", "round")
+        path.set("stroke-linejoin", "round")
+        if non_scaling:
+            path.set("vector-effect", "non-scaling-stroke")
+        group.append(path)
+    if len(group) == 0:
+        return document
+    # Understrokes must paint before filled shapes.
+    root.insert(0, group)
+    return replace(document, raw_svg=_serialize(root))
+
+
+def _apply_stroke_edges(
+    document: VectorDocument,
+    *,
+    width: float,
+    non_scaling: bool,
+) -> VectorDocument:
+    """Replace fills with one stroke per shared edge (cutting / engraving)."""
+    edges = find_shared_edges(document)
+    try:
+        root = ET.fromstring(document.raw_svg)
+    except ET.ParseError as exc:
+        raise SvgParseError(f"Cannot restyle SVG: {exc}") from exc
+    # Drop filled geometry; keep only edge strokes.
+    for child in list(root):
+        root.remove(child)
+    ns = _svg_namespace(root)
+    group = ET.Element(_tag("g", ns))
+    group.set("id", "stroke-edges")
+    stroke_width = f"{max(0.0, min(5.0, float(width))):.3g}"
+    if edges:
+        for edge in edges:
+            d = edge_to_path_d(edge.points)
+            if not d:
+                continue
+            path = ET.Element(_tag("path", ns))
+            path.set("d", d)
+            path.set("fill", "none")
+            path.set("stroke", edge.average_color)
+            path.set("stroke-width", stroke_width)
+            path.set("stroke-linecap", "round")
+            path.set("stroke-linejoin", "round")
+            if non_scaling:
+                path.set("vector-effect", "non-scaling-stroke")
+            group.append(path)
+    else:
+        # Fallback: stroke every filled outline once when adjacency finds nothing.
+        from vectorizer.svg.edges import iter_filled_paths
+
+        for _order, path, color in iter_filled_paths(document):
+            element = ET.Element(_tag("path", ns))
+            element.set("d", path.d)
+            element.set("fill", "none")
+            element.set("stroke", color)
+            element.set("stroke-width", stroke_width)
+            if non_scaling:
+                element.set("vector-effect", "non-scaling-stroke")
+            group.append(element)
+    if len(group) == 0:
+        return document
+    root.append(group)
+    # Re-parse so groups/path_count match the new geometry.
+    return parse_svg_document(_serialize(root), backend_name=document.backend_name)
+
+
+def _svg_namespace(root: ET.Element) -> str | None:
+    if root.tag.startswith("{") and "}" in root.tag:
+        return root.tag[1:].split("}", 1)[0]
+    return None
+
+
+def _tag(name: str, namespace: str | None) -> str:
+    if namespace:
+        return f"{{{namespace}}}{name}"
+    return name
 
 
 def _hit_path_index(document: VectorDocument, x: float, y: float) -> int | None:

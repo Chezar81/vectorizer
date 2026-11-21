@@ -58,6 +58,8 @@ class ImageCanvas(QGraphicsView):
     view_changed = Signal()
     # Image-pixel coordinates when sampling is enabled (left click).
     pixel_clicked = Signal(int, int)
+    # Inclusive image-pixel rectangle from a Ctrl-drag (or Ctrl-click) while sampling.
+    region_sampled = Signal(int, int, int, int)
     # Local image/project path dropped while file drops are enabled.
     path_dropped = Signal(object)
 
@@ -87,6 +89,7 @@ class ImageCanvas(QGraphicsView):
         self._zoom = 1.0
         self._syncing = False
         self._sample_mode = False
+        self._region_origin: QPointF | None = None
         self._file_drop_enabled = False
         self._placeholder = ""
         self.horizontalScrollBar().valueChanged.connect(self._emit_view_changed)
@@ -106,6 +109,8 @@ class ImageCanvas(QGraphicsView):
 
     def set_sample_mode(self, enabled: bool) -> None:
         self._sample_mode = bool(enabled)
+        if not enabled:
+            self._region_origin = None
         if enabled:
             self.setDragMode(QGraphicsView.DragMode.NoDrag)
             self.setCursor(Qt.CursorShape.CrossCursor)
@@ -246,15 +251,20 @@ class ImageCanvas(QGraphicsView):
             and not self._content_rect.isNull()
         ):
             scene_pos = self.mapToScene(event.position().toPoint())
-            x = int(scene_pos.x())
-            y = int(scene_pos.y())
             if self._content_rect.contains(scene_pos):
-                self.pixel_clicked.emit(x, y)
+                if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+                    self._region_origin = event.position()
+                    event.accept()
+                    return
+                self.pixel_clicked.emit(int(scene_pos.x()), int(scene_pos.y()))
                 event.accept()
                 return
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if self._region_origin is not None:
+            event.accept()
+            return
         if self._panning:
             delta = event.position() - self._pan_start
             self._pan_start = event.position()
@@ -267,6 +277,16 @@ class ImageCanvas(QGraphicsView):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if self._region_origin is not None and event.button() == Qt.MouseButton.LeftButton:
+            origin = self._region_origin
+            self._region_origin = None
+            start = self.mapToScene(origin.toPoint())
+            end = self.mapToScene(event.position().toPoint())
+            x0, x1 = sorted((int(start.x()), int(end.x())))
+            y0, y1 = sorted((int(start.y()), int(end.y())))
+            self.region_sampled.emit(x0, y0, x1, y1)
+            event.accept()
+            return
         if event.button() == Qt.MouseButton.MiddleButton:
             self._panning = False
             self.unsetCursor()

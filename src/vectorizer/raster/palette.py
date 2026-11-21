@@ -32,16 +32,24 @@ def suggest_palettes(
     ignore_rgb: tuple[int, int, int] | None = None,
 ) -> PaletteSuggestions:
     """Build candidate palettes from a downscaled copy of `image`."""
-    rgb = image.convert("RGB")
-    width, height = rgb.size
-    probe = rgb
+    rgba = image.convert("RGBA")
+    width, height = rgba.size
+    probe_rgba = rgba
     # Keep more detail than a 180px probe so small accent colors survive.
     if max(width, height) > 320:
         scale = 320 / float(max(width, height))
-        probe = rgb.resize(
+        probe_rgba = rgba.resize(
             (max(1, int(width * scale)), max(1, int(height * scale))),
             Image.Resampling.BOX,
         )
+    probe = probe_rgba.convert("RGB")
+    # Transparent pixels store arbitrary RGB (usually black) and translucent
+    # drop shadows are black too; neither is an ink the tracer should paint.
+    probe_alpha = np.asarray(probe_rgba.getchannel("A"))
+    opaque = probe_alpha >= 128
+    if 0 < int(opaque.sum()) < opaque.size and float(opaque.mean()) <= 0.98:
+        opaque_px = np.asarray(probe, dtype=np.uint8)[opaque]
+        probe = Image.fromarray(np.ascontiguousarray(opaque_px.reshape(1, -1, 3)), "RGB")
     method = getattr(Image.Quantize, "MAXCOVERAGE", Image.Quantize.MEDIANCUT)
     palettes: dict[int, tuple[str, ...]] = {}
     errors: dict[int, float] = {}
@@ -270,6 +278,217 @@ def cel_fill_palette(
     return tuple(colors)
 
 
+def soft_ramp_palette(
+    image: Image.Image,
+    *,
+    max_colors: int = 24,
+    accents: tuple[str, ...] = (),
+    max_side: int = 512,
+) -> tuple[str, ...]:
+    """Evenly stepped inks for glossy icons (sheens, lit propellers, domes).
+
+    Quantizing the whole raster spends slots on blue↔yellow AA mixes (olive,
+    teal-grey, brown) while a wide sheen gets only two or three blues that
+    posterize into jagged shards. Here only locally smooth pixels vote, so
+    k-means places steps along the real gradients. `accents` (e.g. the
+    regular suggestion) re-adds thin distinct inks such as white linework
+    that never pass the smoothness gate, unless they are a mix of two steps.
+    """
+    from PIL import ImageFilter
+
+    rgba_img = image.convert("RGBA")
+    width, height = rgba_img.size
+    if max(width, height) > max_side:
+        scale = max_side / float(max(width, height))
+        rgba_img = rgba_img.resize(
+            (max(1, int(width * scale)), max(1, int(height * scale))),
+            Image.Resampling.BOX,
+        )
+    rgba = np.asarray(rgba_img, dtype=np.uint8)
+    # Glass icon bodies sit at alpha ≈ 240; they are still the fill, not fringe.
+    opaque = rgba[..., 3] >= 200
+    med_img = Image.fromarray(np.ascontiguousarray(rgba[..., :3]), "RGB").filter(
+        ImageFilter.MedianFilter(3)
+    )
+    med = np.asarray(med_img, dtype=np.uint8)
+    hi = np.asarray(med_img.filter(ImageFilter.MaxFilter(5)), dtype=np.int16)
+    lo = np.asarray(med_img.filter(ImageFilter.MinFilter(5)), dtype=np.int16)
+    smooth = ((hi - lo).max(axis=2) <= 28) & opaque
+    pixels = med[smooth]
+    if len(pixels) < 256:
+        return ()
+    pixels = np.ascontiguousarray(pixels[:: max(1, len(pixels) // 60_000)])
+    lab = srgb_u8_to_oklab(pixels.reshape(1, -1, 3))[0].astype(np.float64)
+
+    def _sq_dist(points: np.ndarray, centers: np.ndarray) -> np.ndarray:
+        return (
+            (points * points).sum(-1)[:, None]
+            - 2.0 * points @ centers.T
+            + (centers * centers).sum(-1)[None, :]
+        )
+
+    side = int(np.sqrt(len(pixels)))
+    square = Image.fromarray(pixels[: side * side].reshape(side, side, 3), "RGB")
+    method = getattr(Image.Quantize, "MAXCOVERAGE", Image.Quantize.MEDIANCUT)
+    seed = square.quantize(colors=max_colors, method=method, dither=Image.Dither.NONE)
+    raw = np.asarray((seed.getpalette() or [])[: max_colors * 3], dtype=np.uint8)
+    seeds = raw.reshape(-1, 3)[np.asarray(seed.histogram()[: len(raw) // 3]) > 0]
+    if len(seeds) == 0:
+        return ()
+    centers = srgb_u8_to_oklab(seeds.reshape(1, -1, 3))[0].astype(np.float64)
+    min_pixels = max(16, len(lab) // 2000)
+    for _ in range(10):
+        assign = np.argmin(_sq_dist(lab, centers), axis=1)
+        counts = np.bincount(assign, minlength=len(centers))
+        for i in np.nonzero(counts)[0]:
+            centers[i] = lab[assign == i].mean(axis=0)
+        centers = centers[counts >= min_pixels]
+        if len(centers) == 0:
+            return ()
+    # Near-twin steps waste a slot; ~0.012 OKLab is below a visible band.
+    assign = np.argmin(_sq_dist(lab, centers), axis=1)
+    counts = np.bincount(assign, minlength=len(centers))
+    order = np.argsort(-counts)
+    kept: list[int] = []
+    for i in order.tolist():
+        if counts[i] < min_pixels:
+            continue
+        if kept and float(np.sqrt(_sq_dist(centers[[i]], centers[kept]).min())) < 0.012:
+            continue
+        kept.append(i)
+    colors: list[str] = []
+    seen: set[str] = set()
+    for i in kept:
+        median = np.median(pixels[assign == i], axis=0)
+        hex_color = normalize_hex(rgb_to_hex((int(median[0]), int(median[1]), int(median[2]))))
+        if hex_color not in seen:
+            seen.add(hex_color)
+            colors.append(hex_color)
+    if not accents:
+        return tuple(colors[:max_colors])
+    step_lab = srgb_u8_to_oklab(
+        np.asarray([hex_to_rgb(c) for c in colors], dtype=np.uint8).reshape(1, -1, 3)
+    )[0].astype(np.float64)
+    known_rgb = [np.asarray(hex_to_rgb(c), dtype=np.float64) for c in colors]
+    body = rgba[..., :3][opaque].astype(np.int16)
+    min_support = max(8, int(0.001 * len(body)))
+    extras: list[str] = []
+    for accent in accents:
+        hex_color = normalize_hex(accent)
+        if hex_color in seen:
+            continue
+        rgb = np.asarray(hex_to_rgb(hex_color), dtype=np.float64)
+        # Shadow / matte inks that no opaque body pixel actually shows.
+        support = int((np.abs(body - rgb.astype(np.int16)).max(axis=1) <= 24).sum())
+        if support < min_support:
+            continue
+        point = srgb_u8_to_oklab(rgb.astype(np.uint8).reshape(1, 1, 3))[0, 0]
+        if float(np.sqrt(((step_lab - point) ** 2).sum(-1).min())) < 0.06:
+            continue
+        # AA edges blend in gamma sRGB, so test for mixes there.
+        if _is_mix_of(rgb, np.asarray(known_rgb), tol=24.0):
+            continue
+        seen.add(hex_color)
+        extras.append(hex_color)
+        known_rgb.append(rgb)
+    budget = max(0, max_colors - len(extras))
+    return tuple([*colors[:budget], *extras][:max_colors])
+
+
+def prune_aa_fringe(
+    image: Image.Image,
+    palette: tuple[str, ...],
+    *,
+    min_area: float = 0.006,
+    rescue: float = 0.0012,
+) -> tuple[str, ...]:
+    """Drop anti-aliased mix colors that have no flat interior.
+
+    A 1 px ring of pale blue between a blue fill and a white mark is a blend,
+    not an ink. Shading bands and real accents keep their slot when they own
+    a measurable flat area, or when they are not a mix of two larger inks.
+    """
+    from PIL import ImageFilter
+
+    if len(palette) <= 2:
+        return palette
+    rgba = image.convert("RGBA")
+    width, height = rgba.size
+    if max(width, height) > 360:
+        scale = 360 / float(max(width, height))
+        rgba = rgba.resize(
+            (max(1, int(width * scale)), max(1, int(height * scale))),
+            Image.Resampling.BOX,
+        )
+    arr = np.asarray(rgba, dtype=np.uint8)
+    opaque = arr[..., 3] >= 128
+    total = int(opaque.sum())
+    if total < 32:
+        return palette
+    rgb_img = Image.fromarray(np.ascontiguousarray(arr[..., :3]), "RGB")
+    hi = np.asarray(rgb_img.filter(ImageFilter.MaxFilter(5)), dtype=np.int16)
+    lo = np.asarray(rgb_img.filter(ImageFilter.MinFilter(5)), dtype=np.int16)
+    flat = ((hi - lo).max(axis=2) <= 14) & opaque
+    pixels = arr[..., :3].astype(np.int16)
+    rgbs = [hex_to_rgb(color) for color in palette]
+    shares: list[float] = []
+    covered: list[float] = []
+    for rgb in rgbs:
+        delta = np.abs(pixels - np.asarray(rgb, dtype=np.int16)).max(axis=2)
+        shares.append(float(((delta <= 12) & flat).sum()) / float(total))
+        # Any opaque support, flat or not. A shading band is wide but not flat;
+        # a 1 px ring stays under a few percent.
+        covered.append(float(((delta <= 18) & opaque).sum()) / float(total))
+    kept = [
+        index
+        for index, share in enumerate(shares)
+        if share >= min_area or covered[index] >= 0.04
+    ]
+    kept_rgb = (
+        np.asarray([rgbs[index] for index in kept], dtype=np.float64)
+        if kept
+        else np.zeros((0, 3), dtype=np.float64)
+    )
+    for index, share in enumerate(shares):
+        if index in kept:
+            continue
+        # Thin frames (a set-square, a needle) are not 5×5-flat, but they are
+        # not mixes of the big fills either. 1 px rims stay under ~1.5%.
+        if share < rescue and covered[index] < 0.015:
+            continue
+        point = np.asarray(rgbs[index], dtype=np.float64)
+        if (
+            len(kept_rgb) >= 2
+            and covered[index] < 0.04
+            and _is_mix_of(point, kept_rgb, tol=22.0)
+        ):
+            continue
+        kept.append(index)
+        kept_rgb = np.vstack([kept_rgb, point]) if len(kept_rgb) else point.reshape(1, 3)
+    if len(kept) < 2:
+        kept = sorted(range(len(shares)), key=lambda index: -shares[index])[:2]
+    chosen = set(kept)
+    pruned = tuple(palette[index] for index in range(len(palette)) if index in chosen)
+    return pruned or palette
+
+
+def _is_mix_of(point: np.ndarray, centers: np.ndarray, *, tol: float) -> bool:
+    """True when `point` lies on a segment between two of `centers` (AA blend)."""
+    n = len(centers)
+    for i in range(n):
+        a = centers[i]
+        ab = centers[i + 1 :] - a
+        if not len(ab):
+            continue
+        denom = np.maximum((ab * ab).sum(-1), 1e-12)
+        t = ((point - a) * ab).sum(-1) / denom
+        inside = (t > 0.15) & (t < 0.85)
+        resid = point - (a + ab * np.clip(t, 0.0, 1.0)[:, None])
+        if np.any(inside & (np.sqrt((resid * resid).sum(-1)) < tol)):
+            return True
+    return False
+
+
 def _prune_by_error_rise(
     pixels: np.ndarray,
     colors: list[str],
@@ -366,22 +585,66 @@ def snap_image_to_palette(
     palette: tuple[str, ...],
     *,
     chroma_weight: float = 1.0,
+    tolerance: int = 255,
+    remaps: tuple[tuple[str, str], ...] = (),
 ) -> Image.Image:
-    """Replace every pixel's RGB with the nearest palette color. Alpha is kept."""
-    if not palette:
-        return image.convert("RGBA")
+    """Replace pixels with nearest palette colors (optionally gated by tolerance).
+
+    When `tolerance` < 255, pixels farther than the gate keep their original RGB.
+    Remaps run afterward; a target of `#00000000` makes matching pixels transparent.
+    """
     rgba = np.asarray(image.convert("RGBA"), dtype=np.uint8)
-    colors = np.asarray([hex_to_rgb(color) for color in palette], dtype=np.uint8)
-    index, _dist = nearest_oklab(
-        srgb_u8_to_oklab(rgba[..., :3]),
-        srgb_u8_to_oklab(colors),
-        chroma_weight=chroma_weight,
-    )
-    snapped = colors[index]
-    out = np.empty_like(rgba)
-    out[..., :3] = snapped
-    out[..., 3] = rgba[..., 3]
+    out = rgba.copy()
+    if palette:
+        colors = np.asarray([hex_to_rgb(color) for color in palette], dtype=np.uint8)
+        index, dist = nearest_oklab(
+            srgb_u8_to_oklab(rgba[..., :3]),
+            srgb_u8_to_oklab(colors),
+            chroma_weight=chroma_weight,
+        )
+        snapped = colors[index]
+        if int(tolerance) >= 255:
+            out[..., :3] = snapped
+        else:
+            limit = (max(0, int(tolerance)) / 255.0) ** 2 * 0.45
+            mask = dist <= limit
+            out_rgb = out[..., :3].copy()
+            out_rgb[mask] = snapped[mask]
+            out[..., :3] = out_rgb
+    if remaps:
+        out = _apply_image_remaps(out, remaps)
     return Image.fromarray(out, mode="RGBA")
+
+
+def _apply_image_remaps(
+    rgba: np.ndarray,
+    remaps: tuple[tuple[str, str], ...],
+) -> np.ndarray:
+    out = rgba.copy()
+    for source, target in remaps:
+        try:
+            src = hex_to_rgb(source)
+        except ValueError:
+            continue
+        match = (
+            (out[..., 0] == src[0])
+            & (out[..., 1] == src[1])
+            & (out[..., 2] == src[2])
+            & (out[..., 3] > 0)
+        )
+        if not np.any(match):
+            continue
+        if target == "#00000000":
+            out[..., 3][match] = 0
+            continue
+        try:
+            dst = hex_to_rgb(target)
+        except ValueError:
+            continue
+        out[..., 0][match] = dst[0]
+        out[..., 1][match] = dst[1]
+        out[..., 2][match] = dst[2]
+    return out
 
 
 def refine_palette_to_image(

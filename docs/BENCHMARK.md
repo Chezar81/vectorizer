@@ -25,3 +25,18 @@ The script traces the synthetic fixtures with documented settings and writes
 
 There is **no** Vector Magic comparison dataset in this repository and no
 parity claim.
+
+## Optional Vectorizer.AI oracle
+
+`scripts/oracle_vectorizer_ai.py` can call Vectorizer.AI **test mode** (free,
+watermarked) and write local vs remote SVG + a markdown table under
+`benchmark_results/oracle/`. It is a quality reference only — the desktop app
+stays offline and does not use the API.
+
+```bash
+export VECTORIZER_API_ID=...
+export VECTORIZER_API_SECRET=...
+python scripts/oracle_vectorizer_ai.py
+# or local-only scaffolding:
+python scripts/oracle_vectorizer_ai.py --skip-remote
+```

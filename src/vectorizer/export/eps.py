@@ -8,6 +8,7 @@ import tempfile
 from pathlib import Path
 
 from vectorizer.domain.document import VectorDocument
+from vectorizer.domain.settings import EpsCompatibility, TraceSettings
 from vectorizer.errors import ExportError
 from vectorizer.export.tools import find_inkscape, run_inkscape
 
@@ -16,10 +17,30 @@ def inkscape_available() -> bool:
     return find_inkscape().available
 
 
-def export_eps(document: VectorDocument, destination: str | Path, *, timeout: float = 120.0) -> Path:
+def eps_ps_level_arg(level: EpsCompatibility | str) -> str:
+    """Inkscape `--export-ps-level` for one compatibility choice.
+
+    Level 2 maximizes compatibility. Level 3 minimizes file size.
+    Inkscape 1.0 and later accept this flag.
+    """
+    level = EpsCompatibility(level)
+    number = "2" if level == EpsCompatibility.COMPATIBLE else "3"
+    return f"--export-ps-level={number}"
+
+
+def export_eps(
+    document: VectorDocument,
+    destination: str | Path,
+    *,
+    timeout: float = 120.0,
+    ps_level: EpsCompatibility | str | None = None,
+    settings: TraceSettings | None = None,
+) -> Path:
     """Convert the document SVG to EPS using Inkscape.
 
     Requires a local Inkscape install. Uses a safe argv list and a timeout.
+    `ps_level` wins over `settings.eps_compatibility`. The default is Level 3
+    (minimize file size), matching Inkscape and previous exports.
     """
     tool = find_inkscape()
     if not tool.available or tool.path is None:
@@ -31,6 +52,12 @@ def export_eps(document: VectorDocument, destination: str | Path, *, timeout: fl
     svg = document.raw_svg
     if not svg.strip():
         raise ExportError("There is no vector document to export.")
+
+    level = EpsCompatibility.COMPACT
+    if settings is not None:
+        level = EpsCompatibility(settings.eps_compatibility)
+    if ps_level is not None:
+        level = EpsCompatibility(ps_level)
 
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_svg = tempfile.mkstemp(prefix=".vectorizer-", suffix=".svg")
@@ -45,6 +72,7 @@ def export_eps(document: VectorDocument, destination: str | Path, *, timeout: fl
                     tmp_svg,
                     "--export-type=eps",
                     f"--export-filename={tmp_eps}",
+                    eps_ps_level_arg(level),
                 ],
                 timeout=timeout,
             )
