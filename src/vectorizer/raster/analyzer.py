@@ -986,6 +986,56 @@ def _edge_for_kind(kind: ContentKind, m: ImageMetrics) -> EdgeTreatment:
     # into stacked compound fills. Hard snap once corners are merely decent.
     if kind == ContentKind.LINE_ART and m.corner_sharpness >= 0.38:
         return EdgeTreatment.HARD
+    # Flat, sharp poster art: hard VTracer snap beats soft blend iso on RMSE
+    # for saturated regions, isoluminant panels, and discrete overlaps.
+    # Soft AA logos with a tiny solid palette still hard-snap (RMSE≪blend);
+    # only leave blend when the solid palette is richer / less poster-like.
+    clean_flat = (
+        (m.unique_colors is not None and m.unique_colors <= 48)
+        or (
+            m.unique_colors is None
+            and m.noise_score < 0.15
+            and m.palette_estimate <= 20
+        )
+        or (
+            m.flat_mass >= 0.88
+            and m.palette_estimate <= 8
+            and m.corner_sharpness >= 0.55
+        )
+    )
+    if (
+        kind in {ContentKind.ILLUSTRATION, ContentKind.FLAT_LOGO}
+        and m.flat_mass >= 0.72
+        and m.corner_sharpness >= 0.42
+        and clean_flat
+        and not (m.has_alpha and m.opaque_ratio < 0.92)
+        # Ink-outlined multi-colour cels stay on blend/photo; near-binary
+        # posters (≤2 solid inks) may hard-snap even with a light ink score.
+        # Soft AI flats (uniq unknown, mid ink fringe) also hard-snap — cel
+        # JPEGs report a high unique-colour count and stay out.
+        and (
+            m.ink_outline_score < 0.008
+            or (m.palette_estimate <= 2 and m.flat_mass >= 0.88)
+            or (
+                m.unique_colors is None
+                and m.flat_mass >= 0.85
+                and m.corner_sharpness >= 0.65
+                and m.ink_outline_score < 0.012
+                and m.palette_estimate <= 12
+                and m.noise_score < 0.20
+            )
+        )
+    ):
+        return EdgeTreatment.HARD
+    # Dense patterns / stipple: posterize via VTracer instead of cel-boundary
+    # ink stacking (algo_improve Cursor/09 — photo_tc16 beat cel_boundary).
+    if (
+        kind == ContentKind.ILLUSTRATION
+        and m.edge_density >= 0.45
+        and m.ink_outline_score >= 0.05
+        and not (m.has_alpha and m.opaque_ratio < 0.92)
+    ):
+        return EdgeTreatment.PHOTO
     # Busy megapixel cel/JPEG (flat_mass often 0.6–0.8, rich palette) → VTracer.
     # Simple flat cartoons (flat_mass≈0.99, tiny palette) stay on blend.
     # Transparent badges stay blended — VTracer has no alpha channel.
@@ -1242,21 +1292,34 @@ def _classify(m: ImageMetrics) -> ContentKind:
     # colour still drifts across the frame — that is a gradient, not a logo.
     # Alpha cutouts (map badges, OpenCPN-style marks) keep sharp glyphs that
     # GradientTracer shreds — those stay on the logo/blend + soft_ramp path.
+    #
+    # Discrete multi-panel flats (isoluminant charts, flat landscapes, soft
+    # overlaps) also raise slow_ramp because colours change across ~40 px, but
+    # GradientTracer then collapses them. Require a soft, mid flat_mass field —
+    # high flat_mass + decent corners is illustration, not a mesh gradient.
     alpha_cutout_mark = bool(
         m.has_alpha and 0.50 <= m.opaque_ratio < 0.95
     )
     if (
         m.slow_ramp >= 0.12
-        and m.flat_mass < 0.93
+        and m.flat_mass < 0.55
         and effective >= 8
         # Busy marks on a ramp (white waves, ink, high edge density) are not
         # a single gradient field — GradientTracer drops the mark.
         and m.noise_score < 0.22
-        and m.corner_sharpness < 0.65
-        and m.ink_outline_score < 0.02
+        and m.corner_sharpness < 0.48
+        and m.ink_outline_score < 0.008
         and m.edge_density < 0.14
         and m.fill_ratio >= 0.70
         and not alpha_cutout_mark
+        # Limited unique colours with mid flat_mass are multi-region posters
+        # (landscapes, panels), not a single continuous wash.
+        and not (
+            m.flat_mass >= 0.40
+            and m.corner_sharpness >= 0.40
+            and unique is not None
+            and unique <= 128
+        )
     ):
         return ContentKind.GRADIENT
 
@@ -1350,12 +1413,21 @@ def _classify(m: ImageMetrics) -> ContentKind:
     # alone — photographic probes often land around 0.6–0.7.
     # Continuous-tone photos can look "flat" after aggressive quantization;
     # require ink / limited unique colours before trusting mid flat_mass.
-    continuous_tone = unique is None or unique > 256
+    # Exception: uniq=None with a small reconstruction palette + high flat
+    # mass is discrete poster art (AI flats, isoluminant panels), not a photo.
+    discrete_flat = (
+        m.flat_mass >= 0.75
+        and effective <= 24
+        and m.corner_sharpness >= 0.40
+        and m.noise_score < 0.35
+    )
+    continuous_tone = (unique is None or unique > 256) and not discrete_flat
     if (
         m.noise_score < 0.60
         and m.corner_sharpness >= 0.25
         and (
             cel_like
+            or discrete_flat
             or (
                 strong_ink
                 and m.fill_ratio >= 0.55
@@ -1370,12 +1442,30 @@ def _classify(m: ImageMetrics) -> ContentKind:
                 and effective <= 64
                 and not continuous_tone
             )
+            # Soft flat landscapes / organic poster art: mid flat_mass, low ink,
+            # limited palette — prefer illustration over GradientTracer/photo.
+            or (
+                0.35 <= m.flat_mass < 0.75
+                and effective <= 48
+                and m.ink_outline_score < 0.015
+                and m.corner_sharpness >= 0.35
+                and m.noise_score < 0.25
+                and m.fill_ratio >= 0.55
+                and (unique is None or unique <= 512)
+            )
         )
     ):
         return ContentKind.ILLUSTRATION
 
     # Continuous tone leftover (early gradient gate already caught clean ramps).
-    if m.noise_score < 0.28 and m.corner_sharpness < 0.3 and m.edge_density < 0.35:
+    # Only soft, low-flat fields stay on GradientTracer; stepped ramps and
+    # multi-region flats posterize more faithfully through the photo path.
+    if (
+        m.noise_score < 0.28
+        and m.corner_sharpness < 0.3
+        and m.edge_density < 0.35
+        and m.flat_mass < 0.45
+    ):
         return ContentKind.GRADIENT
     return ContentKind.PHOTO
 
@@ -1629,10 +1719,12 @@ def _settings_for_kind(kind: ContentKind, m: ImageMetrics) -> TraceSettings:
     if kind == ContentKind.ILLUSTRATION:
         # Cel-shaded scenes often match wall/sky to the corner colour — never
         # auto-knock those out; the user can still enable removal manually.
+        # Full-bleed borders (border_match≈1) are scene fills, not paper —
+        # knocking them out doubled RMSE on algo_improve (10).
         illustration_remove = (
             remove_bg
             and m.background_confidence >= 0.88
-            and m.border_match_ratio >= 0.7
+            and 0.7 <= m.border_match_ratio < 0.95
             and m.foreground_coverage >= 0.5
         )
         # Keep thin ink outlines; the constrained palette already limits colours
@@ -1652,51 +1744,127 @@ def _settings_for_kind(kind: ContentKind, m: ImageMetrics) -> TraceSettings:
             and (m.flat_mass < 0.85 or m.palette_estimate >= 12)
             and not (m.has_alpha and m.opaque_ratio < 0.92)
         )
+        # Hard snap for clean flat poster panels (algo_improve hard_celish).
+        hard_flat = (
+            m.flat_mass >= 0.72
+            and m.corner_sharpness >= 0.42
+            and not (m.has_alpha and m.opaque_ratio < 0.92)
+            and (
+                (m.unique_colors is not None and m.unique_colors <= 48)
+                or (
+                    m.unique_colors is None
+                    and m.noise_score < 0.15
+                    and m.palette_estimate <= 20
+                )
+                or (
+                    m.flat_mass >= 0.88
+                    and m.palette_estimate <= 8
+                    and m.corner_sharpness >= 0.55
+                )
+            )
+            and (
+                m.ink_outline_score < 0.008
+                or (m.palette_estimate <= 2 and m.flat_mass >= 0.88)
+                or (
+                    m.unique_colors is None
+                    and m.flat_mass >= 0.85
+                    and m.corner_sharpness >= 0.65
+                    and m.ink_outline_score < 0.012
+                    and m.palette_estimate <= 12
+                    and m.noise_score < 0.20
+                )
+            )
+        )
+        # Dense pattern / texture boards: quantize + VTracer (not cel ink).
+        pattern_heavy = (
+            m.edge_density >= 0.45
+            and m.ink_outline_score >= 0.05
+            and not (m.has_alpha and m.opaque_ratio < 0.92)
+        )
         # Transparent badges/crests stay on BlendTracer soft iso
         # (preserve_transparency disables hard_cel). Corner stays low so
         # letterforms keep sharp apexes; crack-edge is what caused ghost rings.
         cutout_badge = m.has_alpha and m.opaque_ratio < 0.92
         if cutout_badge:
             corner = 32
+        elif hard_flat:
+            corner = 36
+        elif pattern_heavy:
+            corner = 55
         elif routed_photo:
             corner = 60
         elif ink_heavy:
             corner = 40
         else:
-            corner = 50
+            # Slightly keener than 50: similar-hue panels and soft still shapes
+            # keep cleaner abutting boundaries (algo_improve corner_30 wins).
+            corner = 40
+        pattern_target = (
+            min(24, max(12, m.palette_estimate)) if pattern_heavy else 0
+        )
         return TraceSettings(
             workflow=WorkflowMode.AUTOMATIC,
             colormode=ColorMode.COLOR,
             hierarchical=HierarchyMode.STACKED,
-            mode=PathFitMode.SPLINE,
+            # Busy megapixel cels: polygon mode reconstructs stacked flats with
+            # fewer wobbly splines than the default cubic fit (Simpsons RMSE↓).
+            mode=(
+                PathFitMode.POLYGON
+                if (routed_photo and not pattern_heavy)
+                else PathFitMode.SPLINE
+            ),
             # Speckle is a component-area floor, not a stroke width. A continuous
             # outline stays; isolated 1 px JPEG/AA islands become micro-paths
             # and invalid arcs. Flat cel at megapixel size uses a small floor.
             # Busy photo-like cels on VTracer need a higher floor or freckles
             # become thousands of paths.
             filter_speckle=(
-                min(16, max(8, (m.width * m.height) // 200_000))
-                if routed_photo
+                2
+                if pattern_heavy
                 else (
-                    6
-                    if ink_heavy and (m.width * m.height) >= 180_000
-                    else (0 if ink_heavy else max(0, int(1 * area_scale)))
+                    # Noisy ink scenes: a high floor drops fine detail
+                    # (algo_improve (9) speckle_0). Quiet cels keep ≥8.
+                    (
+                        0
+                        if m.noise_score >= 0.30
+                        else min(16, max(8, (m.width * m.height) // 200_000))
+                    )
+                    if routed_photo
+                    else (
+                        2
+                        if hard_flat
+                        else (
+                            6
+                            if ink_heavy and (m.width * m.height) >= 180_000
+                            else (0 if ink_heavy else max(0, int(1 * area_scale)))
+                        )
+                    )
                 )
             ),
-            color_precision=6 if routed_photo else 7,
-            layer_difference=12 if routed_photo else (8 if ink_heavy else 10),
+            color_precision=6 if (routed_photo or pattern_heavy) else (8 if hard_flat else 7),
+            layer_difference=(
+                10
+                if pattern_heavy
+                else (12 if routed_photo else (8 if (ink_heavy or hard_flat) else 10))
+            ),
             corner_threshold=corner,
-            length_threshold=4.0 if routed_photo else (3.5 if ink_heavy else 3.6),
-            max_iterations=10 if routed_photo else (14 if ink_heavy else 12),
-            splice_threshold=45 if routed_photo else (28 if ink_heavy else 35),
+            length_threshold=(
+                4.0 if pattern_heavy else (4.5 if routed_photo else (3.5 if ink_heavy else 3.6))
+            ),
+            max_iterations=10 if (routed_photo or pattern_heavy) else (14 if ink_heavy else 12),
+            splice_threshold=(
+                45 if pattern_heavy else (48 if routed_photo else (28 if ink_heavy else 35))
+            ),
             path_precision=4 if ink_heavy else 3,
+            contour_smoothness=60 if pattern_heavy else (65 if routed_photo else 50),
             preserve_transparency=m.has_alpha,
             remove_background=illustration_remove,
             background_r=bg[0],
             background_g=bg[1],
             background_b=bg[2],
             background_tolerance=_bg_tolerance(m),
-            target_colors=0,
+            # target_colors>0 skips cel_boundary and posterizes patterns.
+            target_colors=pattern_target,
             smooth_noise=False,
         ).validated()
 
@@ -1704,11 +1872,38 @@ def _settings_for_kind(kind: ContentKind, m: ImageMetrics) -> TraceSettings:
     if kind == ContentKind.GRADIENT:
         target = min(36, max(12, m.palette_estimate))
         layer_diff = 12
-        filter_speckle = max(4, int(6 * area_scale))
+        # Soft still-life gradients: keep a modest floor. Speckle mostly
+        # affects the VTracer fallback path when GradientTracer is skipped.
+        filter_speckle = max(2, int(4 * area_scale))
+        corner = 50
     else:
-        target = min(48, max(16, m.palette_estimate))
-        layer_diff = 16
-        filter_speckle = max(6, int(8 * area_scale))
+        # Graphic photos (sharp, low flat): tight posterize budget beats a
+        # rich colour count (algo_improve photo_tc16_ld10_sp2).
+        graphic_photo = (
+            m.corner_sharpness >= 0.65
+            and m.flat_mass < 0.35
+            and m.noise_score < 0.30
+        )
+        # Noisy photos: a high floor erases fine texture (algo_improve
+        # speckle_0 wins on grainy Perplexity samples). Quiet photos keep a
+        # small floor so freckles do not explode into paths.
+        if graphic_photo:
+            # Match algo_improve photo_tc16: a tight posterize budget.
+            target = 16 if m.palette_estimate >= 12 else max(8, m.palette_estimate)
+            layer_diff = 10
+            filter_speckle = max(2, int(2 * area_scale))
+            corner = 55
+        else:
+            target = min(48, max(16, m.palette_estimate))
+            layer_diff = 12 if m.noise_score >= 0.55 else 16
+            if m.noise_score >= 0.75:
+                filter_speckle = 0
+            elif m.noise_score >= 0.55:
+                filter_speckle = max(0, int(2 * area_scale))
+            else:
+                filter_speckle = max(4, int(6 * area_scale))
+            # Tighter corners help when the photo is already somewhat graphic.
+            corner = 55 if m.corner_sharpness >= 0.55 else 70
 
     return TraceSettings(
         workflow=WorkflowMode.AUTOMATIC,
@@ -1716,9 +1911,9 @@ def _settings_for_kind(kind: ContentKind, m: ImageMetrics) -> TraceSettings:
         hierarchical=HierarchyMode.STACKED,
         mode=PathFitMode.SPLINE,
         filter_speckle=min(64, filter_speckle),
-        color_precision=5,
+        color_precision=5 if kind == ContentKind.PHOTO else 6,
         layer_difference=layer_diff,
-        corner_threshold=70,
+        corner_threshold=corner,
         length_threshold=4.2,
         max_iterations=8,
         splice_threshold=50,

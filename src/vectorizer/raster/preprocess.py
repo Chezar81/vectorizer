@@ -105,6 +105,39 @@ def cel_stroke_mask(rgb: Image.Image | object, *, bleed_ink: bool = False) -> ob
     return mask
 
 
+def cleanup_cel_fills(
+    image: Image.Image,
+    *,
+    ink_rgb: tuple[int, int, int] | None = None,
+) -> Image.Image:
+    """Remove JPEG/AA freckles from flat fills without rewriting ink strokes.
+
+    Full ``prepare_cel_ink`` rebakes outlines and can open gaps on megapixel
+    living-room scenes. This lighter pass only majority-cleans, despeckles, and
+    folds enclosed shade blotches — then restores the stroke mask pixels.
+    """
+    import numpy as np
+
+    rgba = image.convert("RGBA")
+    rgb = np.asarray(rgba.convert("RGB"), dtype=np.uint8).copy()
+    stroke = cel_stroke_mask(rgb, bleed_ink=True)
+    if ink_rgb is not None:
+        ink_luma = 0.299 * ink_rgb[0] + 0.587 * ink_rgb[1] + 0.114 * ink_rgb[2]
+        gray = 0.299 * rgb[..., 0] + 0.587 * rgb[..., 1] + 0.114 * rgb[..., 2]
+        # Exact near-ink flats count as stroke so cleanup cannot freckle them.
+        stroke = stroke | ((gray <= ink_luma + 8.0) & (gray <= 48.0))
+    if not np.any(stroke):
+        return rgba
+    stroke_b = np.asarray(stroke, dtype=bool)
+    cleaned = _majority_clean_fills(rgb, stroke_b, passes=2, majority=6)
+    cleaned = _despeckle_fills(cleaned, stroke_b)
+    cleaned = _flatten_enclosed_fills(cleaned, stroke_b)
+    cleaned[stroke_b] = rgb[stroke_b]
+    out = np.asarray(rgba, dtype=np.uint8).copy()
+    out[..., :3] = cleaned
+    return Image.fromarray(out, mode="RGBA")
+
+
 def prepare_cel_ink(
     image: Image.Image,
     palette: tuple[str, ...],
