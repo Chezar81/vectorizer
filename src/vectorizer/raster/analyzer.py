@@ -1047,8 +1047,42 @@ def _edge_for_kind(kind: ContentKind, m: ImageMetrics) -> EdgeTreatment:
         and not (m.has_alpha and m.opaque_ratio < 0.92)
     ):
         return EdgeTreatment.PHOTO
+    if kind == ContentKind.ILLUSTRATION and _exact_flat(m):
+        return EdgeTreatment.HARD
+    if kind == ContentKind.ILLUSTRATION and _rich_soft_flat(m):
+        return EdgeTreatment.PHOTO
     # Logos / smaller illustrations keep the blend iso-contour path.
     return EdgeTreatment.BLENDED
+
+
+def _exact_flat(m: ImageMetrics) -> bool:
+    """A handful of exact solids with no AA ramp (similar-hue panels).
+
+    The blend palette merged near-identical hues (algo_improve 03); a hard
+    trace keeps every solid exactly.
+    """
+    return (
+        m.unique_colors is not None
+        and m.unique_colors <= 24
+        and m.flat_mass >= 0.9
+        and m.ink_outline_score < 0.008
+        and not (m.has_alpha and m.opaque_ratio < 0.92)
+    )
+
+
+def _rich_soft_flat(m: ImageMetrics) -> bool:
+    """Un-inked flat scenes with more solids than the 16-ink blend palette.
+
+    Landscapes and swatch boards lost whole tiles/rings to palette merges on
+    the blend path (algo_improve 08, (6)); posterizing keeps each solid.
+    """
+    return (
+        m.ink_outline_score < 0.008
+        and m.palette_estimate >= 20
+        and m.flat_mass >= 0.45
+        and m.edge_density < 0.30
+        and not (m.has_alpha and m.opaque_ratio < 0.92)
+    )
 
 
 def _fold_background_into(
@@ -1574,11 +1608,15 @@ def _settings_for_kind(kind: ContentKind, m: ImageMetrics) -> TraceSettings:
     area_scale = _speckle_scale(m.pixel_count)
     bg = m.background_rgb or (255, 255, 255)
     remove_bg = _should_remove_background(kind, m)
-    smooth = m.noise_score >= 0.48 and kind in {
-        ContentKind.PHOTO,
-        ContentKind.GRADIENT,
-        ContentKind.ILLUSTRATION,
-    }
+    # Median smoothing only for genuinely grainy photos. Line sheets, dot
+    # grids and pattern boards also score as "noisy", and a 3×3 median erases
+    # their 1–2 px strokes (algo_improve: (2) 9.5→1.7, da328 23→7 RMSE).
+    smooth = (
+        m.noise_score >= 0.48
+        and m.edge_density < 0.30
+        and m.ink_outline_score < 0.05
+        and kind in {ContentKind.PHOTO, ContentKind.GRADIENT, ContentKind.ILLUSTRATION}
+    )
 
     if kind == ContentKind.BINARY_MARK:
         mode = PathFitMode.POLYGON if min(m.width, m.height) <= 256 else PathFitMode.SPLINE
@@ -1597,7 +1635,18 @@ def _settings_for_kind(kind: ContentKind, m: ImageMetrics) -> TraceSettings:
             colormode=ColorMode.BINARY,
             hierarchical=hierarchical,
             mode=mode,
-            filter_speckle=max(0, int(2 * area_scale) if min(m.width, m.height) < 128 else int(4 * area_scale)),
+            # Exactly two colours means no AA/JPEG specks to filter; a floor
+            # only deletes real dots and hatching (algo_improve 01: 24→0 RMSE).
+            filter_speckle=(
+                1
+                if (m.unique_colors is not None and m.unique_colors <= 2)
+                else max(
+                    0,
+                    int(2 * area_scale)
+                    if min(m.width, m.height) < 128
+                    else int(4 * area_scale),
+                )
+            ),
             color_precision=6,
             layer_difference=16,
             corner_threshold=50 if m.corner_sharpness > 0.5 else 60,
@@ -1775,6 +1824,8 @@ def _settings_for_kind(kind: ContentKind, m: ImageMetrics) -> TraceSettings:
                 )
             )
         )
+        hard_flat = hard_flat or _exact_flat(m)
+        rich_flat = _rich_soft_flat(m) and not hard_flat
         # Dense pattern / texture boards: quantize + VTracer (not cel ink).
         pattern_heavy = (
             m.edge_density >= 0.45
@@ -1802,6 +1853,8 @@ def _settings_for_kind(kind: ContentKind, m: ImageMetrics) -> TraceSettings:
         pattern_target = (
             min(24, max(12, m.palette_estimate)) if pattern_heavy else 0
         )
+        if rich_flat and not pattern_heavy:
+            pattern_target = min(48, max(32, 2 * m.palette_estimate))
         return TraceSettings(
             workflow=WorkflowMode.AUTOMATIC,
             colormode=ColorMode.COLOR,
@@ -1925,7 +1978,7 @@ def _settings_for_kind(kind: ContentKind, m: ImageMetrics) -> TraceSettings:
         background_b=bg[2],
         background_tolerance=32,
         target_colors=target,
-        smooth_noise=smooth or kind == ContentKind.PHOTO,
+        smooth_noise=smooth,
     ).validated()
 
 

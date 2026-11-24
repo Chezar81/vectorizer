@@ -27,6 +27,9 @@ from vectorizer.vectorize.gradient_trace import GradientTracer
 from vectorizer.vectorize.vtracer_backend import VTracerBackend
 
 
+_PHOTO_PIXELS_PER_PATH = 5
+
+
 def trace_prepared(
     image: Image.Image,
     settings: TraceSettings,
@@ -57,7 +60,10 @@ def trace_prepared(
     known_kind = _resolve_content_kind(content_kind, analysis)
     treatment = resolve_edge_treatment(image, validated, suggestion=auto)
     report(STAGE_COLORS, 0.18)
-    palette = resolve_palette(image, validated, treatment, suggestion=auto)
+    posterize_only = _posterize_only(validated, treatment)
+    palette = None if posterize_only else resolve_palette(
+        image, validated, treatment, suggestion=auto
+    )
 
     if treatment == EdgeTreatment.PHOTO:
         # Smooth gradients get mesh-like SVG fills; busy photos stay posterized.
@@ -100,6 +106,7 @@ def trace_prepared(
                     working,
                     validated,
                     palette,
+                    soft_source=soft_source or image,
                     on_progress=_scaled_progress(report, 0.28, 0.92),
                 )
                 if boundary.document.path_count > 0:
@@ -133,6 +140,10 @@ def trace_prepared(
                     report,
                 )
         tuned = validated
+        if posterize_only:
+            # Input is already reduced to target_colors inks; coarser VTracer
+            # precision would merge neighbouring posterize steps again.
+            tuned = replace(validated, color_precision=8)
         if palette:
             # Photo quality is an output shape budget already stored on
             # target_colors / filter_speckle / layer_difference. The caps
@@ -158,6 +169,20 @@ def trace_prepared(
         result = VTracerBackend().trace(
             working, tuned, on_progress=_scaled_progress(report, 0.30, 0.90)
         )
+        if (
+            posterize_only
+            and tuned.filter_speckle == 0
+            and result.document.path_count * _PHOTO_PIXELS_PER_PATH
+            > image.width * image.height
+        ):
+            # Pattern boards at speckle 0 keep every anti-aliased pixel as its
+            # own shape (150k paths, 15 MB). A 1 px floor costs fine hairlines
+            # but keeps the document editable.
+            result = VTracerBackend().trace(
+                working,
+                replace(tuned, filter_speckle=1),
+                on_progress=_scaled_progress(report, 0.90, 0.92),
+            )
         if palette or validated.palette_remaps:
             report(STAGE_SVG, 0.93)
             snapped = snap_fills_to_palette(
@@ -263,6 +288,21 @@ def resolve_palette(
     suggestions = suggest_palettes(image, ignore_rgb=ignore)
     colors = suggestions.palettes.get(suggestions.best) or ()
     return colors or None
+
+
+def _posterize_only(settings: TraceSettings, treatment: EdgeTreatment) -> bool:
+    """Photo posterize keeps the quantizer's own inks.
+
+    The analyzer palette is a ≤16-colour probe of a 320 px thumbnail; snapping
+    a 28–60 colour posterize onto it merged translucent overlaps (purple,
+    teal) into neighbours and banded soft photos.
+    """
+    return (
+        settings.workflow.value == "automatic"
+        and treatment == EdgeTreatment.PHOTO
+        and int(settings.target_colors) > 0
+        and not settings.palette_remaps
+    )
 
 
 def _needs_automatic(settings: TraceSettings) -> bool:

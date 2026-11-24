@@ -922,20 +922,61 @@ def _smooth_noise_rgba(image: Image.Image) -> Image.Image:
 
 
 def _quantize_rgba(image: Image.Image, colors: int) -> Image.Image:
-    """Palette-reduce RGB without dithering (dither creates fake speckles for tracers)."""
+    """Palette-reduce RGB without dithering (dither creates fake speckles for tracers).
+
+    No single Pillow quantizer wins: MAXCOVERAGE keeps saturated logo inks but
+    bands soft photos, median-cut / octree do the reverse. Keep the lowest
+    error candidate, then pull its centres to the pixel means (k-means steps)
+    so every ink sits on the colours it actually covers.
+    """
+    import numpy as np
+
     colors = max(2, min(256, int(colors)))
     alpha = image.getchannel("A")
     rgb = image.convert("RGB")
-    # MAXCOVERAGE tends to keep saturated brand colors better than median-cut alone
-    # on logos; fall back if the Pillow build lacks the enum member.
-    method = getattr(Image.Quantize, "MAXCOVERAGE", Image.Quantize.MEDIANCUT)
-    try:
-        quantized = rgb.quantize(colors=colors, method=method, dither=Image.Dither.NONE)
-    except Exception:
-        quantized = rgb.quantize(
+    arr = np.asarray(rgb, dtype=np.float32).reshape(-1, 3)
+    step = max(1, arr.shape[0] // 120_000)
+    sample = arr[::step]
+
+    best_q: Image.Image | None = None
+    best_err = float("inf")
+    for name in ("MAXCOVERAGE", "MEDIANCUT", "FASTOCTREE"):
+        method = getattr(Image.Quantize, name, None)
+        if method is None:
+            continue
+        try:
+            q = rgb.quantize(colors=colors, method=method, dither=Image.Dither.NONE)
+        except Exception:
+            continue
+        mapped = np.asarray(q.convert("RGB"), dtype=np.float32).reshape(-1, 3)
+        err = float(((mapped[::step] - sample) ** 2).mean())
+        if err < best_err:
+            best_err, best_q = err, q
+    if best_q is None:
+        best_q = rgb.quantize(
             colors=colors, method=Image.Quantize.MEDIANCUT, dither=Image.Dither.NONE
         )
-    restored = quantized.convert("RGBA")
+    used = sorted({idx for _count, idx in (best_q.getcolors(256) or [])})
+    pal = best_q.getpalette() or []
+    centers = np.asarray(
+        [pal[i * 3 : i * 3 + 3] for i in used if i * 3 + 2 < len(pal)], dtype=np.float32
+    )
+    if len(centers) >= 2:
+        for _ in range(4):
+            d = ((sample[:, None, :] - centers[None, :, :]) ** 2).sum(axis=2)
+            label = d.argmin(axis=1)
+            for k in range(len(centers)):
+                members = sample[label == k]
+                if len(members):
+                    centers[k] = members.mean(axis=0)
+        pal_img = Image.new("P", (1, 1))
+        flat = np.clip(np.rint(centers), 0, 255).astype(np.uint8).reshape(-1).tolist()
+        pal_img.putpalette(flat + flat[-3:] * (256 - len(centers)))
+        refined = rgb.quantize(palette=pal_img, dither=Image.Dither.NONE)
+        mapped = np.asarray(refined.convert("RGB"), dtype=np.float32).reshape(-1, 3)
+        if float(((mapped[::step] - sample) ** 2).mean()) <= best_err:
+            best_q = refined
+    restored = best_q.convert("RGBA")
     restored.putalpha(alpha)
     return restored
 
