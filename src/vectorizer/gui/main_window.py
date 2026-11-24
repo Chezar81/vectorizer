@@ -655,15 +655,19 @@ class MainWindow(QMainWindow):
             t("About Vectorizer"),
             tf(
                 "<b>Vectorizer {version}</b>"
-                "<p>An independent Linux application that turns bitmap images "
-                "into editable vector paths. It runs entirely on this computer: "
-                "no account, no telemetry, and no network.</p>"
+                "<p>An independent desktop application for Linux, macOS, and "
+                "Windows that turns bitmap images into editable vector paths. "
+                "It runs entirely on this computer: no account, no telemetry, "
+                "and no network.</p>"
                 "<p>Open an image or a .vproj project and vectorize it (F5). "
-                "On the Segmentation tab you can correct regions; Retrace (F6) "
-                "builds the paths from that map. Export SVG, PDF, PNG, or DXF. "
-                "EPS is available when Inkscape is installed.</p>"
-                "<p>Tracing uses the open-source VTracer engine. Photographs "
-                "become stylized color regions, not a lossless copy of the photo.</p>"
+                "Automatic mode picks a tracing path for the content; on the "
+                "Segmentation tab you can correct regions, then Retrace (F6). "
+                "Export SVG, PDF, PNG, or DXF. EPS is available when Inkscape "
+                "is installed.</p>"
+                "<p>Tracing combines open-source engines (including VTracer) "
+                "with Automatic routing for flats, cartoons, gradients, and "
+                "photos. Photographs become stylized color regions, not a "
+                "lossless copy of the photo.</p>"
                 "<p>Author: Christoph Rupprich<br>License: MIT</p>",
                 version=__version__,
             ),

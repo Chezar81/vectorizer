@@ -1,9 +1,11 @@
 # Vectorizer
 
-Independent, offline raster-to-vector desktop application (primary target:
-Linux Mint; macOS via DMG). It imports a bitmap, traces it into editable SVG
-paths, lets you inspect and correct segmentation, and exports SVG / PDF / PNG /
-DXF (plus optional EPS).
+Independent, offline raster-to-vector desktop application for **Linux**,
+**macOS**, and **Windows**. It imports a bitmap, classifies the content in
+**Automatic** mode (logos, line art, cartoons, gradients, photos, …), traces
+it into editable SVG paths, lets you inspect and correct segmentation, and
+exports SVG / PDF / PNG / DXF (plus optional EPS). No account, telemetry, or
+cloud required.
 
 **Author:** Christoph Rupprich.
 
