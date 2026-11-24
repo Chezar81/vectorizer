@@ -58,7 +58,11 @@ def test_logo_detects_white_background(fixtures: dict[str, Path]) -> None:
         ContentKind.ILLUSTRATION,
         ContentKind.BINARY_MARK,
     }
-    assert analysis.suggested.edge_treatment == EdgeTreatment.BLENDED
+    # Clean flat logos hard-snap via VTracer; soft blend iso was worse on RMSE.
+    assert analysis.suggested.edge_treatment in {
+        EdgeTreatment.HARD,
+        EdgeTreatment.BLENDED,
+    }
     assert analysis.metrics.flat_mass >= 0.9
     assert analysis.metrics.background_rgb is not None
     # White-ish corners on the AA logo fixture.
@@ -196,7 +200,7 @@ def test_cel_palette_keeps_pink_wall_off_orange_fill() -> None:
 
 def test_rich_cel_jpeg_with_many_fills_is_not_photograph() -> None:
     """Busy cel scenes can report tiny flat_mass vs a 12-ink probe; ink wins."""
-    from vectorizer.domain.settings import EdgeTreatment
+    from vectorizer.domain.settings import EdgeTreatment, PathFitMode
     from vectorizer.raster.color import hex_to_rgb
 
     image = Image.new("RGB", (960, 540), (255, 203, 213))  # pink wall
@@ -241,10 +245,34 @@ def test_rich_cel_jpeg_with_many_fills_is_not_photograph() -> None:
     assert any(sum(hex_to_rgb(c)) < 180 for c in analysis.suggested.palette)
     assert any(hex_to_rgb(c)[1] > 100 and hex_to_rgb(c)[2] > 100 for c in analysis.suggested.palette)
     assert any(hex_to_rgb(c)[0] > 180 and hex_to_rgb(c)[1] < 180 for c in analysis.suggested.palette)
+    # PHOTO-routed busy cels use polygon fit (fewer wobbly cubics than spline).
+    if analysis.suggested.edge_treatment == EdgeTreatment.PHOTO:
+        assert analysis.suggested.mode == PathFitMode.POLYGON
+        assert analysis.suggested.contour_smoothness >= 60
+
+
+def test_cleanup_cel_fills_preserves_dark_ink() -> None:
+    """Light fill cleanup must not erase near-black outline pixels."""
+    from vectorizer.raster.preprocess import cleanup_cel_fills
+
+    image = Image.new("RGB", (80, 60), (255, 200, 210))
+    draw = ImageDraw.Draw(image)
+    ink = (26, 10, 0)
+    draw.rectangle((10, 10, 70, 50), outline=ink, width=2)
+    draw.rectangle((20, 20, 40, 40), fill=(240, 140, 70))
+    # Sprinkle an orange freckle on the pink wall.
+    image.putpixel((5, 5), (240, 140, 70))
+    cleaned = cleanup_cel_fills(image.convert("RGBA"), ink_rgb=ink)
+    # Outline pixel stays dark.
+    outline = cleaned.getpixel((10, 30))[:3]
+    assert sum(outline) < 80
+    # Interior orange fill survives.
+    fill = cleaned.getpixel((30, 30))[:3]
+    assert fill[0] > fill[2] + 30
 
 
 def test_antialiased_logo_is_not_classified_as_photo() -> None:
-    """AA fringe inflates unique colors; flat_mass must still select the blend path."""
+    """AA fringe inflates unique colors; flat_mass must still avoid the photo path."""
     from vectorizer.domain.settings import EdgeTreatment
 
     image = Image.new("RGB", (256, 256), (255, 255, 255))
@@ -257,7 +285,11 @@ def test_antialiased_logo_is_not_classified_as_photo() -> None:
     analysis = analyze_image(aa)
     assert analysis.content_kind in {ContentKind.FLAT_LOGO, ContentKind.ILLUSTRATION}
     assert analysis.photo_like is False
-    assert analysis.suggested.edge_treatment == EdgeTreatment.BLENDED
+    assert analysis.suggested.edge_treatment in {
+        EdgeTreatment.HARD,
+        EdgeTreatment.BLENDED,
+    }
+    assert analysis.suggested.edge_treatment != EdgeTreatment.PHOTO
     assert analysis.metrics.flat_mass >= 0.9
     assert analysis.metrics.palette_estimate <= 16
 
