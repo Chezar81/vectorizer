@@ -105,7 +105,6 @@ from vectorizer.raster.loader import (
     load_image_from_bytes,
 )
 from vectorizer.raster.palette import snap_image_to_palette, suggest_palettes
-from vectorizer.raster.preprocess import preprocess_image
 from vectorizer.resources import icon_path
 from vectorizer.segmentation.build import build_segmentation
 from vectorizer.svg.edit import delete_shape_at, remove_background_shapes
@@ -1206,7 +1205,7 @@ class MainWindow(QMainWindow):
             3000,
         )
 
-    def vectorize(self, *, preview_preprocess: bool = True) -> None:
+    def vectorize(self) -> None:
         if self._loaded is None:
             self._error(t("Open an image before vectorizing."))
             return
@@ -1217,19 +1216,9 @@ class MainWindow(QMainWindow):
         except ValueError as exc:
             self._error(str(exc))
             return
-        # Optional preprocess preview — only for modest images so the UI thread
-        # does not freeze on megapixel knock-out/quantize (worker still does it).
-        width, height = self._loaded.image.size
-        if (
-            preview_preprocess
-            and (settings.remove_background or settings.target_colors)
-            and width * height <= 1_500_000
-        ):
-            try:
-                working = preprocess_image(self._loaded.image, settings)
-                self.side_by_side.left.show_pixmap(pil_to_qpixmap(working))
-            except Exception:
-                pass
+        # Compare left stays the true original. Quantized/knocked-out working
+        # copies used to replace it for photos with target_colors and never
+        # got restored. Explicit snapped view: Edit → Compare palette.
         self._retrace_from_segmentation = False
         try:
             handle = self.runner.start(
@@ -1788,10 +1777,8 @@ class MainWindow(QMainWindow):
             return
         vector_pix = _svg_to_pixmap(svg, int(result.document.width), int(result.document.height))
         self._vector_pixmap = vector_pix
+        self._restore_compare_source()
         compare_source = self._palette_compare_pixmap or self._original_pixmap
-        if self._palette_compare_pixmap is not None:
-            self.original_canvas.show_pixmap(self._palette_compare_pixmap)
-            self.side_by_side.left.show_pixmap(self._palette_compare_pixmap)
         self.split_compare.set_images(compare_source, vector_pix)
         palette = [
             group.palette_key
@@ -1973,12 +1960,24 @@ class MainWindow(QMainWindow):
         self._apply_result(updated, rebuild_segmentation=False, history_label="Recolor")
         self.statusBar().showMessage(t("Palette recolor applied to SVG fills."), 3000)
 
+    def _restore_compare_source(self) -> None:
+        """Show the true original (or explicit palette snap) on Compare left."""
+        source = self._palette_compare_pixmap or self._original_pixmap
+        if source is None:
+            return
+        if self._palette_compare_pixmap is not None:
+            self.original_canvas.show_pixmap(self._palette_compare_pixmap)
+        elif self._original_pixmap is not None:
+            self.original_canvas.show_pixmap(self._original_pixmap)
+        self.side_by_side.left.show_pixmap(source)
+
     def _on_job_failed(self, token: int, message: str) -> None:
         if token != self._current_token:
             return
         self._finish_job_chrome()
         self._idle_status = False
         self._status_info.setText(t("Tracing failed."))
+        self._restore_compare_source()
         # Auto-open skips the initial seg build; restore one so the tab stays usable.
         if self._loaded is not None and not self.seg_editor.has_map():
             try:
@@ -1997,6 +1996,7 @@ class MainWindow(QMainWindow):
         self._finish_job_chrome()
         self._idle_status = False
         self._status_info.setText(t("Tracing cancelled."))
+        self._restore_compare_source()
         if self._loaded is not None and not self.seg_editor.has_map():
             try:
                 self.seg_editor.set_map(
@@ -2239,7 +2239,7 @@ class MainWindow(QMainWindow):
             self._error(str(exc))
             return
         self.panel.set_settings(replace(current, edge_treatment=treatment))
-        self.vectorize(preview_preprocess=False)
+        self.vectorize()
 
     def _cycle_detail(self) -> None:
         if self._loaded is None or self.runner.busy:
@@ -2263,7 +2263,7 @@ class MainWindow(QMainWindow):
             replace(current, workflow=WorkflowMode.AUTOMATIC, automatic_quality=nxt)
         )
         self._apply_automatic_quality()
-        self.vectorize(preview_preprocess=False)
+        self.vectorize()
 
 
 def _average_rgb(image, x0: int, y0: int, x1: int, y1: int) -> tuple[QColor, int] | None:
