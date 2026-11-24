@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "vectorizer"
 version = "0.6.2"
-description = "Offline desktop application for raster-to-vector conversion"
+description = "Offline desktop raster-to-vector app (Linux, macOS, Windows) with Automatic tracing"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
